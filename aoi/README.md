@@ -13,8 +13,10 @@ project notebooks. All geometries are **EPSG:4326 (WGS84 lon/lat)**.
 | `winam_gulf_water_mask_occ05.geojson` | **Primary mask** — water where JRC GSW `occurrence ≥ 5 %`, clipped to the AOI. This is the exact "Winam water mask" applied in `Batch_Export.ipynb`. |
 | `winam_gulf_water_mask_occ30.geojson` | Stricter variant — `occurrence ≥ 30 %` (permanent water), matching `EE_WATER_OCCURRENCE_THRESHOLD` in `winam_wh_spatial_panel_test_model.ipynb`. |
 | `winam_aoi_bbox.geojson` | The AOI rectangle itself, `[34.0, -0.55, 34.9, 0.0]`. |
-| `make_winam_mask.py` | Self-contained generator (downloads the source tile and rebuilds all three files). |
-| `winam_gulf_mask_preview.png` | Side-by-side preview of the two thresholds. |
+| **`winam_gulf_planetscope_aoi.geojson`** | **Simplified ordering AOI** — single 1300-vertex polygon wrapping the gulf + adjacent Lake Victoria, for PlanetScope (see below). |
+| `make_winam_mask.py` | Self-contained generator for the masks above (downloads the source tile). |
+| `make_planetscope_aoi.py` | Generator for the simplified PlanetScope AOI (reads the `occ30` mask). |
+| `winam_gulf_mask_preview.png` / `planetscope_aoi_preview.png` | Previews. |
 
 Each mask is a single dissolved `(Multi)Polygon` feature; lake islands are
 encoded as polygon holes.
@@ -55,6 +57,24 @@ The two thresholds trace essentially the same gulf; the higher threshold just
 drops scattered ephemeral specks and thin river channels. The "water area in
 AOI" exceeds the gulf alone (~1400 km²) because the AOI's south-west corner
 opens onto the main body of Lake Victoria.
+
+## PlanetScope ordering AOI
+
+`winam_gulf_planetscope_aoi.geojson` is a **single, valid `Polygon`** (WGS84,
+right-hand rule, **1300 vertices**, under common Planet limits) intended as the
+order/clip AOI. It is built from the `occ ≥ 30 %` water mask by keeping the main
+connected water body, buffering **+300 m** outward to wrap the shoreline,
+filling island holes, simplifying to the vertex budget, and clipping to the
+study bbox.
+
+- Area ≈ **2645 km²** (water body + 300 m wrap).
+- **Contains 100 %** of the gulf water body (0.0 km² of water falls outside the
+  simplified boundary), so nothing is clipped away in the bays.
+- The open-lake (south-west) and equator (north) edges are straight because the
+  AOI is clipped to the study box `[34, -0.55, 34.9, 0]`.
+
+To change the wrap distance or vertex budget, edit `BUFFER_M` / `VERTEX_BUDGET`
+in `make_planetscope_aoi.py` and re-run.
 
 ## Reproduce
 
