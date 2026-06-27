@@ -1,0 +1,3 @@
+# Source raster fetched on demand by make_winam_mask.py (~52 MB) — do not commit
+occurrence_*.tif
+*.tif.part
