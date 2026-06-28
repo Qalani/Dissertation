@@ -14,8 +14,10 @@ project notebooks. All geometries are **EPSG:4326 (WGS84 lon/lat)**.
 | `winam_gulf_water_mask_occ30.geojson` | Stricter variant — `occurrence ≥ 30 %` (permanent water), matching `EE_WATER_OCCURRENCE_THRESHOLD` in `winam_wh_spatial_panel_test_model.ipynb`. |
 | `winam_aoi_bbox.geojson` | The AOI rectangle itself, `[34.0, -0.55, 34.9, 0.0]`. |
 | **`winam_gulf_planetscope_aoi.geojson`** | **Simplified ordering AOI** — single 1300-vertex polygon wrapping the gulf + adjacent Lake Victoria, for PlanetScope (see below). |
+| **`winam_gulf_main_lake_aoi.geojson`** | **Classifier main-lake AOI** — single polygon covering only the main water body (no smaller ponds), with the western edge clipped east to focus on the gulf. Used to restrict classification in `Classifier_Full_Stack_PostExport_TimeSeries_v4.ipynb` (see below). |
 | `make_winam_mask.py` | Self-contained generator for the masks above (downloads the source tile). |
 | `make_planetscope_aoi.py` | Generator for the simplified PlanetScope AOI (reads the `occ30` mask). |
+| `make_main_lake_aoi.py` | Generator for the classifier main-lake AOI (reads the `occ05` mask). |
 | `winam_gulf_mask_preview.png` / `planetscope_aoi_preview.png` | Previews. |
 
 Each mask is a single dissolved `(Multi)Polygon` feature; lake islands are
@@ -76,11 +78,35 @@ study bbox.
 To change the wrap distance or vertex budget, edit `BUFFER_M` / `VERTEX_BUDGET`
 in `make_planetscope_aoi.py` and re-run.
 
+## Classifier main-lake AOI
+
+`winam_gulf_main_lake_aoi.geojson` is the AOI the classifier notebook restricts
+to (`AOI_GEOJSON_NAME` in section 10 of
+`Classifier_Full_Stack_PostExport_TimeSeries_v4.ipynb`). It is built by
+`make_main_lake_aoi.py` from the `occ ≥ 5 %` water mask (matching the notebook's
+`JRC_OCCURRENCE_THRESHOLD = 5`):
+
+- **Main lake only.** The single largest connected water body is selected
+  *before* buffering, so the **484** separate ponds/specks (~12.2 km²) in the AOI
+  are dropped rather than merged into the main body.
+- **Western edge moved east.** Clipped to lon **34.2046673170698** (lining up
+  with the point lat/lon `-0.41757704207237595, 34.2046673170698`), which drops
+  the open-lake south-west arm and focuses the AOI on the gulf.
+- Single valid `Polygon`, +90 m shoreline collar, island holes filled, 1300
+  vertices, area ≈ **1552.6 km²**. It covers **100 %** of the main-lake water
+  inside the new bbox while only **0.4 %** of the remaining pond water falls
+  inside it.
+
+Edit `AOI_WEST_LON` / `BUFFER_M` / `VERTEX_BUDGET` in `make_main_lake_aoi.py` to
+change the western edge, shoreline collar, or vertex budget, then re-run.
+
 ## Reproduce
 
 ```bash
 pip install rasterio shapely numpy pyproj
-python make_winam_mask.py    # auto-downloads the ~52 MB source tile
+python make_winam_mask.py       # auto-downloads the ~52 MB source tile
+python make_planetscope_aoi.py  # reads winam_gulf_water_mask_occ30.geojson
+python make_main_lake_aoi.py    # reads winam_gulf_water_mask_occ05.geojson
 ```
 
 > Note: the source GeoTIFF (`occurrence_30E_0N_v1_4_2021.tif`) is not committed;
