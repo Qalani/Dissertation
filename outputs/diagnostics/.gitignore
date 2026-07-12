@@ -1,0 +1,6 @@
+# Generated diagnostic artifacts (regenerate by running the notebook's thin cells).
+# Keep the directory and its README/.gitignore tracked, ignore the outputs.
+*.csv
+*.png
+!README.md
+!.gitignore
