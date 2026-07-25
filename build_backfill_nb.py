@@ -225,10 +225,27 @@ S1_CV_MIN_ABS_MEAN = tb.S1_CV_MIN_ABS_MEAN           # near-zero-mean policy, on
 # Peak bytes for one block of the temporal stack. Sized for a ~12 GB runtime.
 MAX_BLOCK_BYTES = 512 * 1024 * 1024
 
+# --- Drive resilience. ---
+# Colab drops the Drive FUSE mount mid-run (OSError Errno 107, "Transport
+# endpoint is not connected"). Every input and output here lives on Drive, so the
+# only recovery is a force-remount and retry. Scanning a large archive can hit a
+# stale endpoint several times, so the budget is generous.
+MAX_DRIVE_REMOUNTS = 25
+
 # --- Phase 0 controls. ---
 PHASE0_MAX_VALIDATION_DATES = 8       # reference dates to recompute and compare
 PHASE0_MAX_CLASSIFY_PREFIXES = None   # None = resolve every multi-file prefix
 CV_EXTREME_THRESHOLD = 10.0           # |cv| above this counts as 'extreme' in the S1 report
+
+# What to do when a multi-file prefix cannot be resolved into shards-vs-copies.
+#   'abort'   — stop Phase 0 (default). Resolving this is Phase 0's whole job:
+#               treating copies as shards double-counts observations in every
+#               overlapping window, and treating shards as copies drops coverage.
+#   'exclude' — drop the unresolved snapshots from the working set and carry on.
+#               Their dates then contribute nothing to any window, which is a
+#               known, recorded loss rather than a silent miscount.
+# Never guess: there is no 'assume shards' option on purpose.
+UNRESOLVED_PREFIX_POLICY = 'abort'
 
 # --- Output controls. ---
 # Default deliverable is sidecars + a .vrt, NOT a rewrite of the source rasters.
@@ -281,10 +298,95 @@ md("""### 2a. Helpers — path layout, Drive staging, and the Phase 0 gate
 Every cell below is safe to re-run out of order: each either succeeds
 idempotently or fails loudly with a reason.""")
 
-code("""def _sensor_dir(root, sensor):
+code("""# ---------------------------------------------------------------------------
+# Drive resilience. Colab drops the Drive FUSE mount mid-run; every input and
+# output here lives on Drive, so a stale endpoint has to be recovered rather
+# than recorded as a data problem.
+# ---------------------------------------------------------------------------
+_DRIVE_REMOUNTS_REMAINING = MAX_DRIVE_REMOUNTS
+
+
+def _is_transport_endpoint_error(exc):
+    '''True for a stale Colab/Drive FUSE endpoint. Tested in temporal_backfill.'''
+    return tb.is_transport_endpoint_error(exc)
+
+
+def _looks_like_stale_drive(exc, path=None):
+    '''Transport failure, or a read error on a Drive path that no longer stats.
+
+    rasterio raises RasterioIOError, which subclasses OSError but carries
+    errno=None and a GDAL message that does NOT contain 'Transport endpoint is
+    not connected'. The errno/message test alone therefore misclassifies a dead
+    mount as an unreadable file -- which is how a whole archive scan can come
+    back reporting every prefix as corrupt. Re-probing the path settles it.
+    '''
+    return tb.looks_like_stale_mount(exc, path)
+
+
+def _remount_drive(mount_point='/content/drive'):
+    '''Force-remount Drive to recover a stale endpoint. False when unavailable.'''
+    if not IN_COLAB:
+        return False
+    try:
+        drive.mount(mount_point, force_remount=True)
+        return True
+    except Exception as exc:
+        print(f'Google Drive force-remount failed ({type(exc).__name__}: {exc}).')
+        return False
+
+
+def _remount_for_recovery(context):
+    global _DRIVE_REMOUNTS_REMAINING
+    if _DRIVE_REMOUNTS_REMAINING <= 0:
+        print(f'Drive endpoint still stale during {context}, but the remount budget '
+              f'(MAX_DRIVE_REMOUNTS={MAX_DRIVE_REMOUNTS}) is exhausted.')
+        return False
+    if not _remount_drive():
+        print('Automatic Drive remount unavailable (not in Colab?); cannot recover.')
+        return False
+    _DRIVE_REMOUNTS_REMAINING -= 1
+    used = MAX_DRIVE_REMOUNTS - _DRIVE_REMOUNTS_REMAINING
+    print(f'Force-remounted Google Drive to recover from a stale endpoint during '
+          f'{context} (remount {used}/{MAX_DRIVE_REMOUNTS}).')
+    return True
+
+
+def with_drive_retry(func, *args, context='operation', probe_path=None, **kwargs):
+    '''Run ``func``; on a stale Drive endpoint, remount and retry.
+
+    Non-transport errors and an exhausted remount budget propagate unchanged, so
+    a genuinely corrupt file still fails loudly instead of looping.
+    '''
+    while True:
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            if not _looks_like_stale_drive(exc, probe_path):
+                raise
+            print(f'WARNING: Drive endpoint went stale during {context} '
+                  f'({type(exc).__name__}: {exc}).')
+            if not _remount_for_recovery(context):
+                raise
+
+
+@contextmanager
+def retrying_open(path, *args, **kwargs):
+    '''rasterio.open with stale-Drive recovery around the open itself.'''
+    dataset = with_drive_retry(
+        rasterio.open, path, *args,
+        context=f'opening {Path(path).name}', probe_path=path, **kwargs
+    )
+    try:
+        yield dataset
+    finally:
+        dataset.close()
+
+
+def _sensor_dir(root, sensor):
     path = Path(root) / sensor
     tb.assert_not_in_readonly_dir(path, READONLY_DIRS)
-    path.mkdir(parents=True, exist_ok=True)
+    with_drive_retry(lambda: path.mkdir(parents=True, exist_ok=True),
+                     context=f'creating {path}', probe_path=path.parent)
     return path
 
 
@@ -334,13 +436,32 @@ def staged_drive_read(path):
     LOCAL_SCRATCH.mkdir(parents=True, exist_ok=True)
     local = LOCAL_SCRATCH / f'{uuid.uuid4().hex}_{path.name}'
     try:
-        shutil.copyfile(path, local)
+        # One sequential copy is the access pattern Drive's FUSE layer handles
+        # reliably; a stale endpoint mid-copy is remounted and the copy retried.
+        with_drive_retry(shutil.copyfile, path, local,
+                         context=f'staging {path.name}', probe_path=path)
         yield local
     finally:
         try:
             local.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _upsert_cache_record(record):
+    return with_drive_retry(
+        tb.upsert_manifest_record, record, CACHE_MANIFEST_PATH,
+        tb.CACHE_MANIFEST_COLUMNS, frame=CACHE_MANIFEST, readonly_dirs=READONLY_DIRS,
+        context='updating the cache manifest', probe_path=CACHE_MANIFEST_PATH.parent,
+    )
+
+
+def _upsert_run_record(record):
+    return with_drive_retry(
+        tb.upsert_manifest_record, record, RUN_MANIFEST_PATH,
+        tb.RUN_MANIFEST_COLUMNS, frame=RUN_MANIFEST, readonly_dirs=READONLY_DIRS,
+        context='updating the run manifest', probe_path=RUN_MANIFEST_PATH.parent,
+    )
 
 
 def require_phase0(phase_label):
@@ -451,37 +572,99 @@ A previous inventory saw roughly 2 files per S1 prefix. Shards and duplicates ne
 opposite handling, so this reads each file's CRS, transform and shape and reports the
 verdict per prefix rather than guessing from filenames.""")
 
-code("""multi_file = [s for s in ALL_SNAPSHOTS if len(s.paths) > 1]
+code("""RESOLUTION_CSV_PATH = REPORT_DIR / 'phase0_multi_file_resolution.csv'
+RESOLUTION_COLUMNS = ['sensor', 'prefix', 'n_files', 'kind', 'message', 'recorded_at']
+
+multi_file = [s for s in ALL_SNAPSHOTS if len(s.paths) > 1]
 print(f'Prefixes with more than one file: {len(multi_file)}')
 
-verdicts = []
-to_check = multi_file if PHASE0_MAX_CLASSIFY_PREFIXES is None else multi_file[:PHASE0_MAX_CLASSIFY_PREFIXES]
-for i, snap in enumerate(to_check, start=1):
-    if i % 25 == 0 or i == len(to_check):
-        print(f'  [{i}/{len(to_check)}] reading georeferencing...')
-    try:
-        verdicts.append(tb.classify_prefix_files(snap))
-    except Exception as exc:
-        verdicts.append({'prefix': snap.prefix, 'sensor': snap.sensor, 'n_files': len(snap.paths),
-                         'kind': 'unreadable', 'message': f'{type(exc).__name__}: {exc}'})
+# Resumable: a prefix resolved on an earlier run is not re-read. Only 'settled'
+# verdicts are reused -- a prefix that failed because the Drive mount died is
+# retried, because that is a mount problem, not a property of the data.
+SETTLED_KINDS = {'single', 'tiled', 'duplicate_grid', 'inconsistent'}
+prior = tb.load_manifest(RESOLUTION_CSV_PATH, RESOLUTION_COLUMNS)
+resolved = {}
+if len(prior):
+    for _, row in prior.iterrows():
+        if str(row['kind']) in SETTLED_KINDS:
+            resolved[str(row['prefix'])] = row.to_dict()
+    print(f'Reusing {len(resolved)} prefix resolution(s) from {RESOLUTION_CSV_PATH.name}')
 
-MULTI_FILE_VERDICTS = pd.DataFrame(
-    [{k: v for k, v in row.items() if k != 'grids'} for row in verdicts]
-) if verdicts else pd.DataFrame(columns=['sensor', 'prefix', 'n_files', 'kind', 'message'])
+to_check = multi_file if PHASE0_MAX_CLASSIFY_PREFIXES is None else multi_file[:PHASE0_MAX_CLASSIFY_PREFIXES]
+pending = [s for s in to_check if s.prefix not in resolved]
+print(f'Reading georeferencing for {len(pending)} prefix(es)...')
+
+new_rows = []
+for i, snap in enumerate(pending, start=1):
+    try:
+        # retrying_open recovers a stale Drive mount instead of recording it as
+        # a data problem; a genuinely unreadable file still raises.
+        verdict = with_drive_retry(
+            tb.classify_prefix_files, snap, opener=retrying_open,
+            context=f'resolving {snap.prefix}', probe_path=snap.paths[0],
+        )
+        row = {k: v for k, v in verdict.items() if k != 'grids'}
+    except Exception as exc:
+        stale = _looks_like_stale_drive(exc, snap.paths[0])
+        row = {
+            'sensor': snap.sensor, 'prefix': snap.prefix, 'n_files': len(snap.paths),
+            'kind': 'unreadable_drive_stale' if stale else 'unreadable',
+            'message': f'{type(exc).__name__}: {exc}',
+        }
+    row['recorded_at'] = tb.utc_now_iso()
+    new_rows.append(row)
+    resolved[snap.prefix] = row
+    if i % 25 == 0 or i == len(pending):
+        kinds = pd.Series([r['kind'] for r in new_rows]).value_counts().to_dict()
+        print(f'  [{i}/{len(pending)}] {kinds}')
+        # Checkpoint so an interrupted scan does not lose the work already done.
+        with_drive_retry(
+            tb.save_manifest,
+            pd.DataFrame(list(resolved.values())), RESOLUTION_CSV_PATH,
+            RESOLUTION_COLUMNS, readonly_dirs=READONLY_DIRS,
+            context='saving prefix resolution', probe_path=REPORT_DIR,
+        )
+
+MULTI_FILE_VERDICTS = (
+    pd.DataFrame(list(resolved.values()))[RESOLUTION_COLUMNS]
+    if resolved else pd.DataFrame(columns=RESOLUTION_COLUMNS)
+)
+if len(MULTI_FILE_VERDICTS):
+    with_drive_retry(
+        tb.save_manifest, MULTI_FILE_VERDICTS, RESOLUTION_CSV_PATH,
+        RESOLUTION_COLUMNS, readonly_dirs=READONLY_DIRS,
+        context='saving prefix resolution', probe_path=REPORT_DIR,
+    )
 
 print()
 if MULTI_FILE_VERDICTS.empty:
     print('=== Multi-file prefix resolution: every prefix maps to exactly one file. ===')
     print('Nothing to disambiguate: no tile shards and no unmarked duplicates.')
+    UNRESOLVED_PREFIXES = set()
 else:
     print('=== Multi-file prefix resolution ===')
     display(MULTI_FILE_VERDICTS.groupby(['sensor', 'kind']).size().rename('n_prefixes').reset_index())
-    for kind in ['duplicate_grid', 'inconsistent', 'unreadable']:
+    for kind in ['duplicate_grid', 'inconsistent', 'unreadable', 'unreadable_drive_stale']:
         bad = MULTI_FILE_VERDICTS[MULTI_FILE_VERDICTS['kind'] == kind]
         if len(bad):
             print()
-            print(f'!!! {len(bad)} prefix(es) resolved as {kind!r} — these need attention:')
+            print(f'!!! {len(bad)} prefix(es) resolved as {kind!r}:')
             display(bad.head(10)[['sensor', 'prefix', 'n_files', 'message']])
+            if kind == 'unreadable_drive_stale':
+                print('    These failed because the Colab Drive FUSE mount went stale, not')
+                print('    because the files are bad. Re-run this cell: settled verdicts are')
+                print('    reused from the CSV and only these are retried.')
+    tiled = MULTI_FILE_VERDICTS[MULTI_FILE_VERDICTS['kind'] == 'tiled']
+    if len(tiled):
+        print()
+        print(f'{len(tiled)} prefix(es) are genuine Earth Engine tile shards covering distinct')
+        print('grid windows. They are mosaicked onto their union grid when cached, so each')
+        print('contributes exactly ONE observation per window.')
+    UNRESOLVED_PREFIXES = set(
+        MULTI_FILE_VERDICTS.loc[
+            ~MULTI_FILE_VERDICTS['kind'].isin({'single', 'tiled'}), 'prefix'
+        ].astype(str)
+    )
 
 # Drive collision duplicates never enter the working set.
 dupes = inventory[inventory['is_drive_duplicate'].astype(bool)]
@@ -490,25 +673,57 @@ print(f'Google Drive collision duplicates found and excluded: {len(dupes)}')
 if len(dupes):
     display(dupes[['sensor', 'prefix', 'path']].head(10))
 
+# Unresolved multi-file prefixes are exactly what silently double-counts (copies
+# read as shards) or silently loses coverage (shards read as copies), so they are
+# never guessed at.
+if UNRESOLVED_PREFIXES:
+    print()
+    print(f'!!! {len(UNRESOLVED_PREFIXES)} multi-file prefix(es) are UNRESOLVED.')
+    if UNRESOLVED_PREFIX_POLICY == 'exclude':
+        before = len(ALL_SNAPSHOTS)
+        ALL_SNAPSHOTS = [s for s in ALL_SNAPSHOTS if s.prefix not in UNRESOLVED_PREFIXES]
+        print(f'UNRESOLVED_PREFIX_POLICY = \\'exclude\\': dropped {before - len(ALL_SNAPSHOTS)} '
+              'snapshot(s). Their dates contribute nothing to any window; this is a '
+              'recorded loss of coverage, not a silent miscount.')
+    else:
+        raise RuntimeError(
+            f'{len(UNRESOLVED_PREFIXES)} multi-file prefix(es) could not be resolved into '
+            'tile shards vs copies, and Phase 0 will not guess.\\n'
+            'If the kind is \\'unreadable_drive_stale\\', just re-run this cell — the Drive '
+            'mount is remounted automatically and settled verdicts are reused.\\n'
+            'If they are genuinely unreadable, inspect them, or set '
+            'UNRESOLVED_PREFIX_POLICY = \\'exclude\\' to drop those dates from the run.'
+        )
+
 # One snapshot per (sensor, acquisition date): a date re-exported under the new
 # schema while the legacy file is still on Drive must not be counted twice.
 SNAPSHOTS, DATE_COLLISIONS = tb.select_snapshots_by_date(ALL_SNAPSHOTS)
 print()
 print(f'Snapshots after de-duplicating by (sensor, acquisition date): {len(SNAPSHOTS)}')
 if DATE_COLLISIONS:
+    collisions_df = pd.DataFrame(DATE_COLLISIONS)
     print(f'{len(DATE_COLLISIONS)} date(s) had more than one export; kept the temporal-schema one:')
-    display(pd.DataFrame(DATE_COLLISIONS).head(10))
+    display(collisions_df.groupby('sensor').size().rename('n_dates').reset_index())
+    display(collisions_df.head(10))
 else:
     print('No (sensor, date) collisions.')
 
-snapshot_rows.to_csv(INVENTORY_CSV_PATH, index=False)
+with_drive_retry(snapshot_rows.to_csv, INVENTORY_CSV_PATH, index=False,
+                 context='saving inventory CSV', probe_path=REPORT_DIR)
 print()
 print('Saved inventory:', INVENTORY_CSV_PATH)
+print()
+print('=== Reference exports available for validation ===')
 for sensor in SENSORS:
     picked = [s for s in SNAPSHOTS if s.sensor == sensor]
     with_bands = [s for s in picked if s.has_temporal_bands]
     print(f'{sensor}: {len(picked)} snapshot(s); {len(with_bands)} already carry '
-          f'Earth Engine temporal bands; {len(picked) - len(with_bands)} need backfilling.')""")
+          f'Earth Engine temporal bands; {len(picked) - len(with_bands)} need backfilling.')
+    if with_bands:
+        print(f'    -> {sensor} CAN be validated against Earth Engine output in section 3c.')
+    else:
+        print(f'    -> {sensor} has no reference export; section 3c will report it '
+              f'{tb.VALIDATION_UNVALIDATED}.')""")
 
 # ---------------------------------------------------------------------------
 md("""### 3b. Manifest breakdown
@@ -625,12 +840,13 @@ def ensure_cached(snapshot, verbose=False):
                 return out_path, 'skipped_cached'
 
     started = time.time()
-    result = tb.extract_source_band(
-        snapshot, out_path, readonly_dirs=READONLY_DIRS,
+    result = with_drive_retry(
+        tb.extract_source_band, snapshot, out_path, readonly_dirs=READONLY_DIRS,
         max_block_bytes=MAX_BLOCK_BYTES, reader=staged_drive_read,
+        context=f'caching {snapshot.prefix}', probe_path=snapshot.paths[0],
     )
     grid = result['grid']
-    CACHE_MANIFEST = tb.upsert_manifest_record({
+    CACHE_MANIFEST = _upsert_cache_record({
         'sensor': snapshot.sensor,
         'prefix': snapshot.prefix,
         'start_date': snapshot.start_iso,
@@ -647,8 +863,7 @@ def ensure_cached(snapshot, verbose=False):
         'status': 'cached',
         'message': f'{result[\"n_source_files\"]} source file(s) in {time.time() - started:.1f}s',
         'recorded_at': tb.utc_now_iso(),
-    }, CACHE_MANIFEST_PATH, tb.CACHE_MANIFEST_COLUMNS, frame=CACHE_MANIFEST,
-        readonly_dirs=READONLY_DIRS)
+    })
     if verbose:
         print(f'    cached {snapshot.prefix} -> {tb.human_bytes(result[\"cache_bytes\"])}')
     return out_path, 'cached'
@@ -664,10 +879,13 @@ import matplotlib.pyplot as plt
 
 def _read_band(path, band_name, reader=staged_drive_read):
     '''Read a named band by DESCRIPTION, never by hardcoded index.'''
-    with reader(path) as local:
-        with rasterio.open(local) as src:
-            index = tb.band_index_by_description(src, band_name, label=Path(path).name)
-            return src.read(index).astype(np.float64), tb.grid_from_dataset(src)
+    def _read():
+        with reader(path) as local:
+            with rasterio.open(local) as src:
+                index = tb.band_index_by_description(src, band_name, label=Path(path).name)
+                return src.read(index).astype(np.float64), tb.grid_from_dataset(src)
+    return with_drive_retry(_read, context=f'reading {band_name} from {Path(path).name}',
+                            probe_path=path)
 
 
 def _save_comparison_figures(sensor, band_name, date_iso, local_values, gee_values, out_dir):
@@ -909,7 +1127,9 @@ PER_DATE_TABLE = pd.DataFrame(
     [row for v in VALIDATION.values() for row in v['per_date']]
 )
 if not PER_DATE_TABLE.empty:
-    PER_DATE_TABLE.to_csv(REPORT_DIR / 'phase0_per_date_comparison.csv', index=False)
+    with_drive_retry(PER_DATE_TABLE.to_csv, REPORT_DIR / 'phase0_per_date_comparison.csv',
+                     index=False, context='saving the per-date comparison',
+                     probe_path=REPORT_DIR)
     print()
     print('=== Per-date comparison (local vs Earth Engine) ===')
     display(PER_DATE_TABLE[[
@@ -1042,7 +1262,9 @@ PHASE0_REPORT = {
     'verdicts': verdict_payload,
 }
 tb.assert_not_in_readonly_dir(PHASE0_REPORT_PATH, READONLY_DIRS)
-PHASE0_REPORT_PATH.write_text(json.dumps(PHASE0_REPORT, indent=2, default=str))
+with_drive_retry(PHASE0_REPORT_PATH.write_text,
+                 json.dumps(PHASE0_REPORT, indent=2, default=str),
+                 context='saving the Phase 0 report', probe_path=REPORT_DIR)
 
 print()
 print('=' * 78)
@@ -1089,7 +1311,8 @@ realised_bytes = float(pd.to_numeric(already.get('cache_bytes'), errors='coerce'
 n_done = len(already)
 n_total = len([s for s in SNAPSHOTS if s.sensor in SENSORS])
 mean_bytes = (realised_bytes / n_done) if n_done else None
-free_bytes = tb.disk_headroom_bytes(CACHE_DIR)
+free_bytes = with_drive_retry(tb.disk_headroom_bytes, CACHE_DIR,
+                              context='checking Drive headroom', probe_path=CACHE_DIR)
 
 print()
 print(f'Snapshots to cache : {n_total} ({n_done} already cached)')
@@ -1138,7 +1361,7 @@ for index, snap in enumerate(targets_to_cache, start=1):
     except Exception as exc:
         counts['failed'] += 1
         print(f'[{index}/{len(targets_to_cache)}] FAILED {snap.prefix}: {type(exc).__name__}: {exc}')
-        CACHE_MANIFEST = tb.upsert_manifest_record({
+        CACHE_MANIFEST = _upsert_cache_record({
             'sensor': snap.sensor, 'prefix': snap.prefix,
             'start_date': snap.start_iso, 'end_date': snap.end_iso,
             'schema_token': snap.schema_token, 'source_paths': ';'.join(str(p) for p in snap.paths),
@@ -1146,8 +1369,7 @@ for index, snap in enumerate(targets_to_cache, start=1):
             'cache_bytes': None, 'width': None, 'height': None, 'crs': None,
             'status': 'failed', 'message': f'{type(exc).__name__}: {exc}',
             'recorded_at': tb.utc_now_iso(),
-        }, CACHE_MANIFEST_PATH, tb.CACHE_MANIFEST_COLUMNS, frame=CACHE_MANIFEST,
-            readonly_dirs=READONLY_DIRS)
+        })
 
 print()
 print('Phase 1 complete:', counts)
@@ -1204,7 +1426,7 @@ CACHE_MANIFEST = tb.load_manifest(CACHE_MANIFEST_PATH, tb.CACHE_MANIFEST_COLUMNS
 
 def _record(snapshot, status, n_scenes=None, valid_pixels=None, n_nonfinite_cv=None, message=''):
     global RUN_MANIFEST
-    RUN_MANIFEST = tb.upsert_manifest_record({
+    RUN_MANIFEST = _upsert_run_record({
         'sensor': snapshot.sensor,
         'prefix': snapshot.prefix,
         'target_prefix': snapshot.target_prefix(),
@@ -1218,7 +1440,7 @@ def _record(snapshot, status, n_scenes=None, valid_pixels=None, n_nonfinite_cv=N
         # never has to assume the S2 result covered S1 too.
         'message': f'{message} | ddof={TEMPORAL_DDOF} | {VALIDATION_NOTE}'.strip(' |'),
         'recorded_at': tb.utc_now_iso(),
-    }, RUN_MANIFEST_PATH, tb.RUN_MANIFEST_COLUMNS, frame=RUN_MANIFEST, readonly_dirs=READONLY_DIRS)
+    })
 
 
 def _already_done(snapshot):
@@ -1268,10 +1490,13 @@ for index, target in enumerate(TARGETS, start=1):
             ensure_cached(snap)
 
         out_paths = sidecar_paths_for(target)
-        result = tb.compute_temporal_bands(
+        # Safe to retry: partial .tmp outputs are cleaned up on any failure.
+        result = with_drive_retry(
+            tb.compute_temporal_bands,
             target, contributors, cache_path_for, out_paths,
             readonly_dirs=READONLY_DIRS, ddof=TEMPORAL_DDOF, min_obs=spec.min_obs,
             min_abs_mean=S1_CV_MIN_ABS_MEAN, max_block_bytes=MAX_BLOCK_BYTES,
+            context=f'computing {target.prefix}', probe_path=cache_path_for(target),
         )
         if result['status'] != 'completed':
             outcomes['skipped_min_obs'] += 1
@@ -1280,9 +1505,11 @@ for index, target in enumerate(TARGETS, start=1):
             continue
 
         if WRITE_VRT:
-            tb.write_snapshot_vrt(
+            with_drive_retry(
+                tb.write_snapshot_vrt,
                 target, {band: out_paths[band] for band in spec.new_bands},
                 vrt_path_for(target), readonly_dirs=READONLY_DIRS,
+                context=f'writing VRT for {target.prefix}', probe_path=target.paths[0],
             )
 
         outcomes['completed'] += 1
@@ -1372,9 +1599,11 @@ else:
             failed += 1
             continue
         try:
-            tb.rewrite_snapshot_geotiff(
+            with_drive_retry(
+                tb.rewrite_snapshot_geotiff,
                 target, sidecars, out_path, readonly_dirs=READONLY_DIRS,
                 reader=staged_drive_read, max_block_bytes=MAX_BLOCK_BYTES,
+                context=f'rewriting {target.prefix}', probe_path=target.paths[0],
             )
             rewritten += 1
             print(f'[{index}/{len(rewrite_targets)}] wrote and verified {out_path.name} '
@@ -1512,7 +1741,8 @@ def methods_summary_markdown(report, run_manifest):
 SUMMARY_MD = methods_summary_markdown(PHASE0, RUN_MANIFEST)
 summary_path = REPORT_DIR / 'phase0_validation_summary.md'
 tb.assert_not_in_readonly_dir(summary_path, READONLY_DIRS)
-summary_path.write_text(SUMMARY_MD)
+with_drive_retry(summary_path.write_text, SUMMARY_MD,
+                 context='saving the validation summary', probe_path=REPORT_DIR)
 if UPDATE_REPO_VALIDATION_SUMMARY:
     try:
         repo_copy = REPO_ROOT / 'docs' / 'temporal_backfill_validation_summary.md'

@@ -44,29 +44,37 @@ standard deviation formed over the identical valid-observation set.
 - Masking disagreement, both directions: _pending_
 - Reducer convention (ddof=0 vs ddof=1): _pending — Phase 0 reports both and reports which fits_
 
-## Sentinel-1 — status: **UNVALIDATED**
+## Sentinel-1 — status: determined at runtime, `UNVALIDATED` unless a reference exists
 
 - Bands reconstructed: `vh_temporal_std_w90`, `vh_temporal_cv_w90` (from `VH_corrected`)
 
-**No validation of the Sentinel-1 bands is possible at present, and none has been
-performed.** `EXPORT_S1` is `False` in `Batch_Export.ipynb`, so no Sentinel-1 snapshot
-has ever been exported carrying the temporal bands. There is therefore nothing in Drive
-to compare the local reconstruction against, and the backfill notebook must not export
-one to create a reference.
+Sentinel-1 validation depends on whether any S1 snapshot in the export folder carries
+Earth Engine's own temporal bands, i.e. was exported under the `s1_scc_temporal_v1`
+schema. The comparison harness is **sensor-generic** and decides this by inspection, not
+by assumption; section 3 of the notebook now prints, per sensor, whether a reference
+export exists and therefore whether validation is possible.
 
-**The Sentinel-2 result does not transfer to Sentinel-1.** The two sensors differ in
-revisit interval, in swath coverage across the AOI, and in the distribution of the
-source band, so agreement measured for one says nothing about the other. Sentinel-1
-outputs are reported as `UNVALIDATED` in the Phase 0 report, in the run manifest
-(carried in the `message` column of every row), and here.
-
-The comparison harness is written to be **sensor-generic**: if `s1_scc_temporal_v1`
-files ever appear in the export folder from a separate run, Sentinel-1 validation
-happens automatically with no further work, including the two S1-specific comparisons
-that are dormant until then — behaviour where the window mean approaches zero (count and
+**The original premise for this work was that none existed** (`EXPORT_S1` was `False` in
+`Batch_Export.ipynb`, so no S1 snapshot had been exported with the temporal bands, and
+this notebook must not export one to create a reference). **The first inventory run
+against the real archive contradicts that**: `winam_s1_scc_temporal_v1_*` files are
+present in `GEE_Exports_validated_snapshots`, appearing as the preferred export on S1
+dates that also still hold a legacy `winam_s1_scc_predictors_*` file. If those files
+carry the full 5-band stack with complete band descriptions, S1 **can** be validated,
+and the harness will do so automatically with no further work — including the two
+S1-specific comparisons: behaviour where the window mean approaches zero (count and
 spatial distribution of non-finite or extreme CV values in both versions), and agreement
 in per-pixel observation support, which varies far more across the AOI for S1 than S2
 because of swath coverage.
+
+Where no reference is found, the sensor reports `UNVALIDATED` — not passing, and not
+silently omitted — in the Phase 0 report, in the run manifest (carried in the `message`
+column of every row), and here.
+
+**A Sentinel-2 result never transfers to Sentinel-1.** The two sensors differ in revisit
+interval, in swath coverage across the AOI, and in the distribution of the source band,
+so agreement measured for one says nothing about the other. Read each sensor's status on
+its own terms.
 
 ---
 
