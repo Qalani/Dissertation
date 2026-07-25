@@ -423,7 +423,44 @@ interval, swath coverage and source-band distribution. See
 
 ---
 
-## 9. Suggested rollout
+## 9. Stale Drive mounts are a data-integrity issue, not just an annoyance
+
+Colab drops the Drive FUSE mount mid-run; every Drive path then raises `OSError` Errno
+107. The classifier already handles this for its own reads via
+`_is_transport_endpoint_error` / `_run_with_drive_remount_retry`. Two things are worth
+carrying across, because the obvious implementation is wrong in a way that produces
+confident nonsense rather than an error.
+
+**The errno/message test alone is insufficient.** `rasterio` raises `RasterioIOError`,
+which subclasses `OSError` but carries `errno=None` and a GDAL message such as
+`…/scene.tif: not recognized as a supported file format` — no Errno 107, and none of the
+phrases `_is_transport_endpoint_error` looks for. So a dead mount is reported as an
+unreadable file. On a first real Phase 0 run this presented as **all 814 multi-file
+prefixes resolving to `unreadable`**, which reads like archive corruption but was a
+mount that had gone away a few seconds earlier.
+
+The fix is to re-probe the path. It was listed successfully moments before, so:
+
+- path no longer `stat`s → the mount died → remount and retry;
+- path still `stat`s → the file really is unreadable → fail loudly.
+
+That logic is `winam_diagnostics.temporal_backfill.looks_like_stale_mount`, unit-tested
+in `tests/test_temporal_backfill.py`, and is what the backfill notebook uses. If the
+classifier ever gains VRT staging (section 3), it should use the same test rather than
+`_is_transport_endpoint_error` alone, since staging a VRT means opening several rasters
+where a mid-sequence mount loss is likely.
+
+**Never let an unresolved read become a silent assumption.** A multi-file prefix is
+either genuine Earth Engine tile shards or copies of one scene. Reading copies as shards
+double-counts that observation in every overlapping window; reading shards as copies
+drops coverage. When the resolution cannot be obtained, the backfill refuses to guess —
+it aborts Phase 0 by default, or, under `UNRESOLVED_PREFIX_POLICY = 'exclude'`, drops
+those snapshots and records the loss. There is deliberately no "assume shards" option.
+Any equivalent ambiguity on the classifier side deserves the same treatment.
+
+---
+
+## 10. Suggested rollout
 
 1. Run Phase 0 of the backfill notebook against the real archive and read the verdict.
 2. Run Phases 1–3 for S2 only (`SENSORS = ['S2']`), which has a validated estimator.

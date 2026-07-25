@@ -130,6 +130,9 @@ __all__ = [
     "utc_now_iso",
     # safety
     "assert_not_in_readonly_dir",
+    "is_transport_endpoint_error",
+    "looks_like_stale_mount",
+    "DRIVE_MOUNT_PREFIX",
     "disk_headroom_bytes",
     "human_bytes",
 ]
@@ -1001,6 +1004,73 @@ def assert_not_in_readonly_dir(path, readonly_dirs: Sequence[Path]) -> Path:
                 f"  read-only: {readonly_resolved}"
             )
     return target
+
+
+# ---------------------------------------------------------------------------
+# Stale-mount detection.
+#
+# Colab drops the Drive FUSE mount mid-run and every Drive path then raises
+# OSError Errno 107. The remount itself is Colab-specific and lives in the
+# notebook; the *detection* lives here so it is unit-tested.
+# ---------------------------------------------------------------------------
+
+DRIVE_MOUNT_PREFIX = "/content/drive"
+
+
+def is_transport_endpoint_error(exc: BaseException) -> bool:
+    """True for a stale Colab/Drive FUSE endpoint (Errno 107).
+
+    Errno 107 can be wrapped by helper functions, so the cause/context chain is
+    walked rather than just the outermost exception.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current)
+        if isinstance(current, OSError) and (
+            getattr(current, "errno", None) == 107
+            or "Transport endpoint is not connected" in message
+            or "Drive FUSE endpoint is stale" in message
+        ):
+            return True
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+    return False
+
+
+def looks_like_stale_mount(
+    exc: BaseException,
+    path=None,
+    mount_prefix: str = DRIVE_MOUNT_PREFIX,
+    stat_probe=None,
+) -> bool:
+    """True when ``exc`` is better explained by a dead mount than by bad data.
+
+    The errno/message test alone is not enough. ``rasterio`` raises
+    ``RasterioIOError``, which subclasses :class:`OSError` but carries
+    ``errno=None`` and a GDAL message that does **not** contain "Transport
+    endpoint is not connected". So a dead mount is otherwise misreported as an
+    unreadable file — which is how an archive scan can come back claiming every
+    single prefix is corrupt.
+
+    When ``path`` was listed successfully moments earlier, re-probing it settles
+    the question: a path that no longer stats means the mount went away, while a
+    path that still stats means the file really is unreadable.
+
+    ``stat_probe`` is injectable for tests; it defaults to ``Path.stat``.
+    """
+    if is_transport_endpoint_error(exc):
+        return True
+    if path is None or not isinstance(exc, OSError):
+        return False
+    if not str(Path(path)).startswith(str(mount_prefix)):
+        return False
+    probe = stat_probe if stat_probe is not None else (lambda p: Path(p).stat())
+    try:
+        probe(path)
+    except OSError:
+        return True
+    return False
 
 
 def disk_headroom_bytes(path) -> int:

@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 rasterio = pytest.importorskip("rasterio")
+import rasterio.errors  # noqa: E402
 from rasterio.transform import Affine  # noqa: E402
 
 from winam_diagnostics import temporal_backfill as tb  # noqa: E402
@@ -757,6 +758,105 @@ def test_unvalidated_is_a_distinct_status_from_pass():
     assert tb.VALIDATION_UNVALIDATED != tb.VALIDATION_PASS
     # No S1 ground truth exists, so the harness must return no dates to compare.
     assert tb.aggregate_comparisons([])["n_dates"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Stale Drive mount vs genuinely unreadable file.
+#
+# Regression cover for a real failure: a whole-archive Phase 0 scan reported all
+# 814 multi-file prefixes as 'unreadable' when in fact the Colab Drive FUSE mount
+# had gone stale. rasterio's RasterioIOError subclasses OSError but carries
+# errno=None and a GDAL message without the transport phrase, so the errno/message
+# test alone silently misreports a dead mount as corrupt data.
+# ---------------------------------------------------------------------------
+
+def test_errno_107_is_detected_directly_and_when_wrapped():
+    stale = OSError(107, "Transport endpoint is not connected")
+    assert tb.is_transport_endpoint_error(stale)
+
+    try:
+        try:
+            raise stale
+        except OSError as exc:
+            raise RuntimeError("failed while staging a raster") from exc
+    except RuntimeError as wrapped:
+        assert tb.is_transport_endpoint_error(wrapped)
+
+
+def test_transport_phrase_without_errno_is_detected():
+    assert tb.is_transport_endpoint_error(OSError("Transport endpoint is not connected"))
+    assert tb.is_transport_endpoint_error(OSError("Drive FUSE endpoint is stale"))
+
+
+def test_ordinary_errors_are_not_transport_failures():
+    assert not tb.is_transport_endpoint_error(ValueError("nope"))
+    assert not tb.is_transport_endpoint_error(FileNotFoundError("missing.tif"))
+
+
+def test_rasterio_error_carries_no_errno_and_no_transport_phrase(tmp_path):
+    """The property that made the errno/message test insufficient."""
+    broken = tmp_path / "broken.tif"
+    broken.write_bytes(b"definitely not a GeoTIFF")
+    with pytest.raises(OSError) as excinfo:
+        rasterio.open(broken)
+    exc = excinfo.value
+    assert isinstance(exc, OSError)
+    assert getattr(exc, "errno", None) is None
+    assert "Transport endpoint is not connected" not in str(exc)
+    # ...so the errno/message test alone would not flag it either way.
+    assert not tb.is_transport_endpoint_error(exc)
+
+
+def test_read_error_on_a_vanished_drive_path_is_treated_as_a_stale_mount():
+    """A Drive path that no longer stats means the mount died, not bad data."""
+    drive_path = Path(tb.DRIVE_MOUNT_PREFIX) / "MyDrive" / "exports" / "scene.tif"
+
+    def _vanished(_path):
+        raise OSError(107, "Transport endpoint is not connected")
+
+    exc = rasterio.errors.RasterioIOError(f"{drive_path}: not recognized as a supported file format")
+    assert tb.looks_like_stale_mount(exc, drive_path, stat_probe=_vanished)
+
+
+def test_read_error_on_a_healthy_drive_path_is_a_real_unreadable_file():
+    """If the path still stats, the file really is bad and must not be retried."""
+    drive_path = Path(tb.DRIVE_MOUNT_PREFIX) / "MyDrive" / "exports" / "scene.tif"
+    exc = rasterio.errors.RasterioIOError(f"{drive_path}: not recognized as a supported file format")
+    assert not tb.looks_like_stale_mount(exc, drive_path, stat_probe=lambda _p: None)
+
+
+def test_non_drive_paths_are_never_blamed_on_the_mount(tmp_path):
+    broken = tmp_path / "broken.tif"
+    broken.write_bytes(b"definitely not a GeoTIFF")
+    with pytest.raises(OSError) as excinfo:
+        rasterio.open(broken)
+    assert not tb.looks_like_stale_mount(excinfo.value, broken)
+
+
+def test_stale_mount_check_ignores_non_oserror():
+    drive_path = Path(tb.DRIVE_MOUNT_PREFIX) / "MyDrive" / "x.tif"
+
+    def _vanished(_path):
+        raise OSError(107, "Transport endpoint is not connected")
+
+    assert not tb.looks_like_stale_mount(ValueError("bug"), drive_path, stat_probe=_vanished)
+
+
+def test_classify_prefix_files_propagates_read_errors_for_the_caller_to_classify(tmp_path):
+    """classify_prefix_files must not swallow a read failure into a verdict."""
+    export_dir = tmp_path / "exports"
+    write_s2_snapshot(export_dir, "2020-06-01", np.full((HEIGHT, WIDTH), 0.2),
+                      suffix="-0000000000-0000000000")
+    corrupt = export_dir / (
+        "winam_s2_predictors_s2_whlev_texture_v1_2020-06-01_to_2020-06-02"
+        "-0000000000-0000000008.tif"
+    )
+    corrupt.write_bytes(b"not a GeoTIFF")
+
+    snapshot = tb.group_snapshot_files(tb.discover_predictor_files(export_dir))[0]
+    assert len(snapshot.paths) == 2
+    with pytest.raises(OSError):
+        tb.classify_prefix_files(snapshot)
 
 
 def test_import_pulls_in_no_earth_engine():
