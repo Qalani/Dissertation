@@ -12,6 +12,14 @@ package holds the *diagnostic* extensions the notebook wires in through thin cel
 * :mod:`winam_diagnostics.area_envelope` — hard vs confidence-weighted (soft) WH
   area envelope per date.
 
+One further submodule is deliberately *not* imported here, so that this package
+keeps importing without a raster stack installed:
+
+* :mod:`winam_diagnostics.temporal_backfill` — offline reconstruction of the
+  90-day temporal-persistence predictor bands from already-exported snapshots,
+  wired in by ``Backfill_Temporal_Bands_Local.ipynb``. It needs ``rasterio``, so
+  import it explicitly with ``from winam_diagnostics import temporal_backfill``.
+
 Nothing here imports Earth Engine, mounts Google Drive, or hits the network, so
 the whole package imports and is unit-tested offline. It never retrains or changes
 which model the notebook deploys — these are read-only measurements alongside it.
