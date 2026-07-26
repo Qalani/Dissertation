@@ -2,11 +2,20 @@
 
 `Backfill_Temporal_Bands_Local.ipynb` reconstructs the snapshot-relative 90-day
 temporal-persistence bands for every already-exported snapshot, without any Earth
-Engine calls. This document describes **precisely what would change** in
-`Classifier_Full_Stack_PostExport_TimeSeries_v4.ipynb` to consume them.
+Engine calls. This document describes how
+`Classifier_Full_Stack_PostExport_TimeSeries_v4.ipynb` consumes them.
 
-**No change has been made to the classifier notebook.** Everything below is a
-specification, not an applied diff.
+**Status: applied.** Sections 2, 3 and 5 below are now implemented in the classifier
+notebook, behind `USE_BACKFILLED_TEMPORAL_BANDS`, which **defaults to `False`** — so
+discovery behaves exactly as before until it is switched on. The behaviour is covered
+by `tests/test_classifier_backfill_discovery.py`, which extracts the functions straight
+out of the notebook JSON so the tests cannot drift from the code they describe.
+
+Before switching the flag on, note what is actually on Drive: the 2026-07-26 run
+completed **155 S1 dates and zero S2 dates** (all 14 S2 targets failed, along with 8
+S1 ones, against a stale `winam_diagnostics`). With the default
+`BATCH_SENSOR_FILTER = ['S2']` the flag therefore changes nothing until either the S2
+backfill is re-run or the filter includes S1.
 
 ---
 
@@ -53,43 +62,26 @@ Keeping sidecars in a separate folder avoids corrupting that resume state.
 
 ---
 
-## 2. `_corr_discover_predictor_tifs` would accept `.vrt`
+## 2. `_corr_discover_predictor_tifs` accepts `.vrt` — applied
 
-Current implementation (section 2c of the classifier):
-
-```python
-if path.suffix.lower() not in {'.tif', '.tiff', ''}:
-    continue
-```
-
-The change is to add `.vrt` to the accepted suffixes and to search a second,
-configurable directory:
+`PREDICTOR_READ_SUFFIXES` (`{'.tif', '.tiff', '.vrt', ''}`) replaces the inline suffix
+set, and the function takes an `extra_dirs` argument that defaults to the backfill VRT
+folder for the prefix's sensor:
 
 ```python
-BACKFILL_VRT_DIR = Path('/content/drive/MyDrive/Winam_Temporal_Backfill/vrt')
-PREDICTOR_SUFFIXES = {'.tif', '.tiff', '.vrt', ''}
-
-def _corr_discover_predictor_tifs(prefix, export_dir, extra_dirs=()):
-    search_dirs = [Path(export_dir)] + [Path(d) for d in extra_dirs]
-    paths = []
-    for directory in search_dirs:
-        if not directory.exists():
-            continue
-        for path in sorted(directory.iterdir(), key=lambda p: p.name):
-            if not path.is_file():
-                continue
-            if path.suffix.lower() not in PREDICTOR_SUFFIXES:
-                continue
-            if _CORR_DRIVE_COLLISION_RE.search(path.name):
-                continue
-            stem = path.stem
-            if stem != prefix and not stem.startswith(prefix + '-'):
-                continue
-            paths.append(path)
+def _corr_discover_predictor_tifs(prefix, export_dir, extra_dirs=None):
     ...
+    if extra_dirs is None:
+        extra_dirs = backfill_vrt_dirs_for_sensor(sensor_from_predictor_prefix(prefix))
 ```
 
-Three constraints on this change:
+Defaulting rather than requiring the argument is deliberate: all four call sites pass
+`(prefix, export_dir)` positionally and none of them needed editing. `sensor_from_predictor_prefix`
+keys off `winam_s1_` because of the S1 naming asymmetry in section 4, and
+`backfill_vrt_dirs_for_sensor` returns `()` whenever `USE_BACKFILLED_TEMPORAL_BANDS`
+is `False`, which is what makes the flag a true no-op.
+
+Three constraints on this change, all of them now pinned by tests:
 
 1. **A `.vrt` and a real `.tif` for the same prefix must never both be returned.**
    They describe the same scene, so returning both would double-sample every point in
@@ -112,7 +104,7 @@ Three constraints on this change:
 
 ---
 
-## 3. `staged_drive_read` must stage sources *and* sidecars for a VRT
+## 3. `staged_drive_read` stages sources *and* sidecars for a VRT — applied
 
 This is the subtle one, and getting it wrong turns a performance optimisation into a
 correctness bug.
@@ -137,42 +129,11 @@ It still *works* (the paths resolve while Drive is mounted), but it is slow, and
 breaks outright if the Drive endpoint goes stale mid-read, because the retry logic in
 `_run_with_drive_remount_retry` is wrapped around the staged copy, not the inner reads.
 
-The fix is to make staging VRT-aware: stage every referenced source, then rewrite the
-XML to point at the local copies.
-
-```python
-import xml.etree.ElementTree as ET
-
-@contextmanager
-def staged_drive_read(path):
-    path = Path(path)
-    if path.suffix.lower() == '.vrt':
-        with _staged_vrt(path) as local_vrt:
-            yield local_vrt
-        return
-    ...  # existing behaviour unchanged
-
-
-@contextmanager
-def _staged_vrt(vrt_path):
-    """Stage a VRT and every raster it references, rewriting the paths."""
-    tree = ET.parse(vrt_path)
-    root = tree.getroot()
-    with ExitStack() as stack:
-        for node in root.iter('SourceFilename'):
-            source = Path(node.text)
-            if not source.is_absolute():
-                source = (vrt_path.parent / source).resolve()
-            local = stack.enter_context(staged_drive_read(source))
-            node.text = str(local)
-            node.set('relativeToVRT', '0')
-        local_vrt = _local_scratch_path(vrt_path.name)
-        tree.write(local_vrt)
-        try:
-            yield local_vrt
-        finally:
-            _safe_remove(local_vrt)
-```
+Staging is therefore VRT-aware: `staged_drive_read` dispatches any `.vrt` to
+`_staged_vrt_read`, which stages every referenced source and rewrites the XML to point
+at the local copies before yielding it. The implementation matches the sketch this
+document previously carried; `test_staging_a_vrt_repoints_it_at_the_staged_sources`
+asserts that no `SourceFilename` still points outside local scratch after staging.
 
 Notes:
 
@@ -254,14 +215,38 @@ verified at write time. So:
   `ndvi_temporal_std_w90`; it is only a fallback for rasters with no descriptions, which
   a backfill VRT never is.
 
-The one genuinely new constant is where to find the VRTs:
+The one genuinely new constant is where to find the VRTs. As applied, in the batch
+configuration cell alongside the schema tokens:
 
 ```python
+USE_BACKFILLED_TEMPORAL_BANDS = False  # True enables backfill discovery
 BACKFILL_ROOT = Path('/content/drive/MyDrive/Winam_Temporal_Backfill')
 BACKFILL_VRT_DIRS = {'S2': BACKFILL_ROOT / 'vrt' / 'S2',
                      'S1': BACKFILL_ROOT / 'vrt' / 'S1'}
-USE_BACKFILLED_TEMPORAL_BANDS = True   # False restores export-folder-only discovery
+PREDICTOR_READ_SUFFIXES = {'.tif', '.tiff', '.vrt', ''}
 ```
+
+`discover_exported_predictor_sets` appends the backfill folder for each sensor that
+survives `BATCH_SENSOR_FILTER`, scanning the export folder first so that
+`export_prefixes` is populated before any VRT is considered. A VRT whose prefix already
+has a genuine export is recorded as `skipped_backfill_superseded` rather than grouped
+with it — without that ordering the two would look like tile shards of one scene and be
+mosaicked together. Rows carry an `is_backfilled` column so the inventory distinguishes
+reconstructions from genuine exports.
+
+### One caveat: the validation cache cannot see through a VRT
+
+`REUSE_VALIDATION_LOG` keys on `_export_identity`, which is `(name, size, mtime)` of the
+file itself. For a real GeoTIFF that identifies the pixels. For a VRT it identifies only
+a few kB of XML, so **regenerating a sidecar without changing the VRT leaves the cached
+"validated" verdict in place**, and the scene is accepted on the strength of a check that
+ran against different pixels.
+
+Not fixed here, because the fix — hashing every referenced source — means reading them
+from Drive, which is exactly the I/O the cache exists to avoid. It only bites if you
+re-run the backfill over dates already classified (for example after changing
+`TEMPORAL_DDOF`). If you do, either set `REUSE_VALIDATION_LOG = False` for that pass or
+delete the validation log first.
 
 ### Provenance in the outputs
 
@@ -359,12 +344,17 @@ spatially structured signal.
 
 ## 7. The near-zero-mean policy for `vh_temporal_cv_w90`
 
-`vh_temporal_cv_w90 = std / abs(mean)` is undefined as `abs(mean) -> 0`. Earth Engine's
-behaviour there **cannot currently be observed**, because `EXPORT_S1` is `False` and no
-S1 snapshot has ever been exported with the temporal bands, so there is nothing in Drive
-to compare against — and the backfill notebook must not export one to find out.
+`vh_temporal_cv_w90 = std / abs(mean)` is undefined as `abs(mean) -> 0`.
 
-A policy therefore had to be chosen rather than measured:
+The original premise here was that Earth Engine's behaviour could not be observed at all,
+because `EXPORT_S1` was `False` and no S1 snapshot had ever been exported with the temporal
+bands. **That is no longer true.** The 2026-07-26 inventory found 562 snapshots already
+present under `s1_scc_temporal_v1`, and Phase 0 validated S1 against 16 of them.
+
+What still has not been observed is this specific corner, because it does not arise in this
+archive: the run recorded `near_zero_mean_pixels_total = 0` across all 155 completed S1
+backfills. The policy below therefore remains chosen rather than measured — but it governs a
+case that has never yet occurred, rather than papering over a known difference.
 
 > **Pixels whose `abs(mean)` falls below `S1_CV_MIN_ABS_MEAN` (default `1e-6`) are
 > written as NoData (`-9999`), not as ±Inf.**
@@ -385,8 +375,8 @@ infinities propagate through any intermediate arithmetic.
 Affected pixels are recorded per date in the run manifest column `n_nonfinite_cv`.
 
 It is a **single named constant** in `winam_diagnostics/temporal_backfill.py`,
-changeable in one place if a reference S1 export with Earth Engine's own temporal bands
-ever becomes available. In practice the threshold should almost never bind:
+changeable in one place should a date ever turn up where the threshold actually binds and
+Earth Engine's own value can be compared against it. In practice it should almost never bind:
 `VH_corrected` over water is around −20 dB, so a 90-day window mean within 1e-6 of zero
 implies something already pathological.
 
@@ -415,10 +405,18 @@ recomputing dates that Earth Engine itself exported with the temporal bands, and
 reporting correlation, bias, RMSE, difference percentiles and masking disagreement on
 water pixels.
 
-**Sensor coverage of that validation is asymmetric and must not be glossed over.** S2 has
-reference exports and can be validated. S1 has none, so it reports `UNVALIDATED` — not
-passing, not omitted. The S2 agreement does not transfer: the sensors differ in revisit
-interval, swath coverage and source-band distribution. See
+**Both sensors have reference exports, and both were validated.** This corrects the premise
+the work started from, which was that S1 had none and would have to report `UNVALIDATED`.
+The 2026-07-26 run compared S1 on 16 dates (166.5M water pixels, r = 0.99994, RMSE
+0.000261) and S2 on 8 dates (116.0M water pixels, r = 0.98762, RMSE 0.012764). Both
+returned PASS, with zero masking disagreement in either direction.
+
+Neither result transfers to the other sensor — they differ in revisit interval, swath
+coverage and source-band distribution — and the two **disagree on the reducer convention**:
+S1 fits `ddof=0`, S2 fits `ddof=1`. The bulk run takes the majority fit, so S2 sidecars are
+written under `ddof=0`, the convention that fits S2 slightly worse. The cost is small
+(RMSE 0.012785 against 0.012764; bias −0.003491 against +0.001456) and well inside the
+coverage-driven difference that dominates S2 anyway, but it is a choice, not a wash. See
 `docs/temporal_backfill_validation_summary.md`.
 
 ---
@@ -445,10 +443,24 @@ The fix is to re-probe the path. It was listed successfully moments before, so:
 - path still `stat`s → the file really is unreadable → fail loudly.
 
 That logic is `winam_diagnostics.temporal_backfill.looks_like_stale_mount`, unit-tested
-in `tests/test_temporal_backfill.py`, and is what the backfill notebook uses. If the
-classifier ever gains VRT staging (section 3), it should use the same test rather than
-`_is_transport_endpoint_error` alone, since staging a VRT means opening several rasters
-where a mid-sequence mount loss is likely.
+in `tests/test_temporal_backfill.py`, and is what the backfill notebook uses.
+
+Now that the classifier does VRT staging (section 3), every read it performs on a
+backfilled scene — the XML and each referenced raster — goes through
+`_copy_whole_file_through_drive`, so all of them sit behind
+`_run_with_drive_remount_retry`. **This is still worth revisiting.** That retry path
+decides what counts as a stale mount using `_is_transport_endpoint_error` alone, which
+is exactly the insufficient test described above; adopting `looks_like_stale_mount`
+there would make the classifier fail loudly on genuinely unreadable files and recover
+from dead mounts, instead of conflating the two. Staging a VRT opens several rasters in
+sequence, so a mid-sequence mount loss is more likely there than anywhere else in the
+notebook. **Not done — it is a change to shared retry behaviour that deserves its own
+pass.**
+
+That gap has a concrete cost on record: the 2026-07-26 backfill run lost 22 dates to an
+exception handler that called `looks_like_stale_mount` on a package too old to have it,
+so every one of them reported `AttributeError` instead of whatever actually failed. The
+underlying read errors on those dates are still unknown.
 
 **Never let an unresolved read become a silent assumption.** A multi-file prefix is
 either genuine Earth Engine tile shards or copies of one scene. Reading copies as shards
@@ -460,13 +472,21 @@ Any equivalent ambiguity on the classifier side deserves the same treatment.
 
 ---
 
-## 10. Suggested rollout
+## 10. Rollout
 
-1. Run Phase 0 of the backfill notebook against the real archive and read the verdict.
-2. Run Phases 1–3 for S2 only (`SENSORS = ['S2']`), which has a validated estimator.
-3. Add `USE_BACKFILLED_TEMPORAL_BANDS` and the discovery/staging changes in sections 2–3
-   above to the classifier, behind the flag, defaulting to off.
+1. ~~Run Phase 0 against the real archive and read the verdict.~~ **Done** — both
+   sensors PASS (section 8).
+2. ~~Add `USE_BACKFILLED_TEMPORAL_BANDS` and the discovery/staging changes to the
+   classifier, behind the flag, defaulting to off.~~ **Done** — sections 2, 3, 5.
+3. **Re-run Phases 2–3.** The 2026-07-26 run completed 155 S1 dates and failed 22,
+   including every S2 target, so there are currently **no S2 VRTs on Drive at all**.
+   Phase 1 is fully cached (1114 snapshots, 0 failures) and completed dates are skipped,
+   so the re-run is cheap. The capability guard added to section 1 of the backfill
+   notebook now aborts at setup if the package is stale, and the clone it manages is
+   fast-forwarded on every run, so the specific failure cannot repeat silently.
 4. Classify a handful of backfilled dates with `BATCH_MAX_DATASETS = 3` and compare area
    tables against the same dates classified from genuine Earth Engine exports, if any
-   overlap exists.
-5. Only then enable S1, and carry its `UNVALIDATED` status into anything reported from it.
+   overlap exists. Note that with `BATCH_SENSOR_FILTER = ['S2']` the flag has no effect
+   until step 3 produces S2 VRTs.
+5. Only then enable S1 — and carry the ddof caveat in section 8 into anything reported
+   from either sensor.
