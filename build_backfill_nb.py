@@ -97,11 +97,16 @@ code("""# Mount Google Drive (Colab). Outside Colab this is skipped and you can 
 # DRIVE_MYDRIVE at any folder mirroring the Drive layout.
 try:
     from google.colab import drive
-    drive.mount('/content/drive')
     IN_COLAB = True
-except Exception as exc:
-    print('Google Drive not mounted automatically (not in Colab?):', exc)
+except ImportError:
+    print('Not running in Colab; Drive will not be mounted.')
     IN_COLAB = False
+
+if IN_COLAB:
+    # Deliberately not wrapped in try/except. A swallowed mount failure used to
+    # surface five cells later as 'Predictor export folder does not exist', which
+    # reads like the archive is gone rather than like Drive never came up.
+    drive.mount('/content/drive')
 
 import json
 import os
@@ -338,6 +343,52 @@ UPDATE_REPO_VALIDATION_SUMMARY = True
 SKIP_CACHED = True
 SKIP_COMPLETED = True
 MAX_TARGETS_PER_RUN = None            # set an int for a smoke test
+
+def require_drive_archive():
+    '''Verify the Drive mount and the export archive before anything is created.
+
+    This runs BEFORE the mkdir loop below, and the ordering is the whole point.
+    Those mkdir calls are `parents=True`, so with Drive unmounted they happily
+    create /content/drive/MyDrive/Winam_Temporal_Backfill as ordinary local
+    directories. That is bad twice over: outputs land on ephemeral storage that
+    dies with the runtime, and the mountpoint is left non-empty, which makes
+    Colab refuse to mount Drive there at all. One run without a mount then breaks
+    every later run until the stray directories are deleted by hand.
+    '''
+    if IN_COLAB:
+        mydrive = Path('/content/drive/MyDrive')
+        if not mydrive.is_dir():
+            raise RuntimeError(
+                f'Google Drive is not mounted ({mydrive} is missing). Re-run the setup '
+                'cell in section 1 and complete the authorisation prompt. If a previous '
+                'run created files under /content/drive before mounting, Colab will '
+                'refuse to mount there at all: remove /content/drive first. Nothing has '
+                'been created on disk by this cell.'
+            )
+        try:
+            drive_populated = any(mydrive.iterdir())
+        except OSError as exc:
+            raise RuntimeError(
+                f'Google Drive is mounted but unreadable ({exc}). That is a stale FUSE '
+                "endpoint, not missing data. Run drive.mount('/content/drive', "
+                "force_remount=True) and re-run this cell."
+            ) from exc
+        if not drive_populated:
+            raise RuntimeError(
+                f'{mydrive} is empty, which means the Drive endpoint is stale rather than '
+                "that your files are gone. Run drive.mount('/content/drive', "
+                'force_remount=True) and re-run this cell.'
+            )
+    if not GEE_EXPORT_DIR.is_dir():
+        raise FileNotFoundError(
+            f'Export archive not found: {GEE_EXPORT_DIR}\\n'
+            'Drive itself looks fine, so check EE_EXPORT_FOLDER '
+            f'({EE_EXPORT_FOLDER!r}) against the folder name in MyDrive. Nothing has '
+            'been created on disk by this cell.'
+        )
+
+
+require_drive_archive()
 
 for _dir in [BACKFILL_ROOT, CACHE_DIR, SIDECAR_DIR, VRT_DIR, REPORT_DIR, LOCAL_SCRATCH]:
     tb.assert_not_in_readonly_dir(_dir, READONLY_DIRS)
