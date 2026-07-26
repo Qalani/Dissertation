@@ -8,6 +8,7 @@ The notebook is a thin wiring layer: every piece of logic it runs lives in
 ``tests/test_temporal_backfill.py``.
 """
 import json
+import re
 
 cells = []
 
@@ -96,15 +97,21 @@ code("""# Mount Google Drive (Colab). Outside Colab this is skipped and you can 
 # DRIVE_MYDRIVE at any folder mirroring the Drive layout.
 try:
     from google.colab import drive
-    drive.mount('/content/drive')
     IN_COLAB = True
-except Exception as exc:
-    print('Google Drive not mounted automatically (not in Colab?):', exc)
+except ImportError:
+    print('Not running in Colab; Drive will not be mounted.')
     IN_COLAB = False
+
+if IN_COLAB:
+    # Deliberately not wrapped in try/except. A swallowed mount failure used to
+    # surface five cells later as 'Predictor export folder does not exist', which
+    # reads like the archive is gone rather than like Drive never came up.
+    drive.mount('/content/drive')
 
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -116,30 +123,83 @@ import pandas as pd
 import rasterio
 from IPython.display import display
 
+# The clone this notebook makes for itself when no checkout is already present.
+# It is fast-forwarded on every run: a --depth 1 clone otherwise stays pinned to
+# whatever commit created it, and /content survives runtime restarts, so a clone
+# made weeks ago gets silently reused.
+NOTEBOOK_CLONE_DIR = Path('/content/Dissertation_diagnostics')
+NOTEBOOK_CLONE_URL = 'https://github.com/Qalani/Dissertation.git'
+
+
+def _git(args, cwd=None):
+    '''Run a git command, returning stdout on success and None otherwise.'''
+    try:
+        done = subprocess.run(['git'] + args, cwd=(str(cwd) if cwd else None),
+                              capture_output=True, text=True, timeout=180)
+    except Exception as exc:
+        print('  git', ' '.join(args), 'could not run:', exc)
+        return None
+    if done.returncode != 0:
+        print('  git', ' '.join(args), 'failed:', done.stderr.strip()[:200])
+        return None
+    return done.stdout.strip()
+
+
+def _has_package(directory):
+    return (Path(directory) / 'winam_diagnostics' / '__init__.py').exists()
+
+
+def _forget_winam_diagnostics():
+    '''Drop an already-imported copy so refreshed files on disk are really loaded.'''
+    for name in [n for n in list(sys.modules)
+                 if n == 'winam_diagnostics' or n.startswith('winam_diagnostics.')]:
+        del sys.modules[name]
+
+
+def _refresh_notebook_clone():
+    '''Fast-forward the notebook's own clone. Best effort, never fatal.
+
+    Only ever touches NOTEBOOK_CLONE_DIR. A checkout you manage yourself is used
+    exactly as it stands, because resetting it would discard your own work.
+    '''
+    if not (NOTEBOOK_CLONE_DIR / '.git').is_dir():
+        return
+    print('Refreshing', NOTEBOOK_CLONE_DIR, 'from origin...')
+    if _git(['fetch', '--depth', '1', 'origin', 'HEAD'], cwd=NOTEBOOK_CLONE_DIR) is None:
+        print('  continuing with the copy already on disk')
+        return
+    if _git(['reset', '--hard', 'FETCH_HEAD'], cwd=NOTEBOOK_CLONE_DIR) is not None:
+        _forget_winam_diagnostics()
+
 
 def _ensure_winam_diagnostics():
     '''Make the winam_diagnostics package importable (no Drive, no Earth Engine).'''
+    # A copy importable from anywhere other than our own clone is one you manage,
+    # so take it as it stands. Our own clone falls through to the refresh below.
     try:
-        import winam_diagnostics  # noqa: F401
-        return True
+        import winam_diagnostics
     except ModuleNotFoundError:
         pass
-    for cand in ['/content/Dissertation', str(Path.cwd()), str(Path.cwd().parent),
-                 '/content/Dissertation_diagnostics']:
-        if (Path(cand) / 'winam_diagnostics' / '__init__.py').exists():
+    else:
+        if NOTEBOOK_CLONE_DIR.resolve() not in Path(winam_diagnostics.__file__).resolve().parents:
+            return True
+        _forget_winam_diagnostics()
+
+    for cand in ['/content/Dissertation', str(Path.cwd()), str(Path.cwd().parent)]:
+        if _has_package(cand):
             sys.path.insert(0, cand)
             try:
                 import winam_diagnostics  # noqa: F401
                 return True
             except ModuleNotFoundError:
                 continue
-    clone = '/content/Dissertation_diagnostics'
-    if not (Path(clone) / 'winam_diagnostics' / '__init__.py').exists():
-        import subprocess
-        subprocess.run(['git', 'clone', '--depth', '1',
-                        'https://github.com/Qalani/Dissertation.git', clone], check=False)
-    if (Path(clone) / 'winam_diagnostics' / '__init__.py').exists():
-        sys.path.insert(0, clone)
+
+    if _has_package(NOTEBOOK_CLONE_DIR):
+        _refresh_notebook_clone()
+    else:
+        _git(['clone', '--depth', '1', NOTEBOOK_CLONE_URL, str(NOTEBOOK_CLONE_DIR)])
+    if _has_package(NOTEBOOK_CLONE_DIR):
+        sys.path.insert(0, str(NOTEBOOK_CLONE_DIR))
         import winam_diagnostics  # noqa: F401
         return True
     return False
@@ -155,6 +215,22 @@ from winam_diagnostics import temporal_backfill as tb
 
 REPO_ROOT = Path(tb.__file__).resolve().parent.parent
 
+# Every attribute the later cells call on the module, derived from the notebook
+# source at build time so it cannot drift. Checked here because the alternative
+# failure mode is silent and expensive: a stale package first bites inside an
+# exception handler, where a missing helper masks the very error it exists to
+# classify. That is how the 2026-07-26 run lost 22 dates in Phase 3, every one of
+# them reporting AttributeError instead of whatever had actually gone wrong.
+REQUIRED_TB_SYMBOLS = (__TB_REQUIRED_SYMBOLS__)
+_missing_tb = [name for name in REQUIRED_TB_SYMBOLS if not hasattr(tb, name)]
+if _missing_tb:
+    raise ImportError(
+        'winam_diagnostics at {} is out of date: missing {}. Delete {} and re-run '
+        'this cell to re-clone it, or pull in the checkout you are pointing at, '
+        'then restart the runtime.'.format(
+            Path(tb.__file__).resolve().parent, ', '.join(_missing_tb), NOTEBOOK_CLONE_DIR)
+    )
+
 # Hard constraint: this notebook must never touch Earth Engine. Importing ee would
 # also mean an authentication prompt and network calls, so fail loudly if anything
 # in the import chain pulled it in.
@@ -166,7 +242,7 @@ assert not _leaked_ee, f'Earth Engine modules leaked into this runtime: {_leaked
 SESSION_ID = uuid.uuid4().hex
 
 print('winam_diagnostics loaded from:', Path(tb.__file__).resolve().parent)
-print('Repo root:', REPO_ROOT)
+print('Repo root:', REPO_ROOT, '@', _git(['rev-parse', '--short', 'HEAD'], cwd=REPO_ROOT) or 'unknown commit')
 print('rasterio:', rasterio.__version__, '| numpy:', np.__version__)
 print('Earth Engine imported:', bool(_leaked_ee), '(must be False)')
 print('Session id:', SESSION_ID)""")
@@ -267,6 +343,52 @@ UPDATE_REPO_VALIDATION_SUMMARY = True
 SKIP_CACHED = True
 SKIP_COMPLETED = True
 MAX_TARGETS_PER_RUN = None            # set an int for a smoke test
+
+def require_drive_archive():
+    '''Verify the Drive mount and the export archive before anything is created.
+
+    This runs BEFORE the mkdir loop below, and the ordering is the whole point.
+    Those mkdir calls are `parents=True`, so with Drive unmounted they happily
+    create /content/drive/MyDrive/Winam_Temporal_Backfill as ordinary local
+    directories. That is bad twice over: outputs land on ephemeral storage that
+    dies with the runtime, and the mountpoint is left non-empty, which makes
+    Colab refuse to mount Drive there at all. One run without a mount then breaks
+    every later run until the stray directories are deleted by hand.
+    '''
+    if IN_COLAB:
+        mydrive = Path('/content/drive/MyDrive')
+        if not mydrive.is_dir():
+            raise RuntimeError(
+                f'Google Drive is not mounted ({mydrive} is missing). Re-run the setup '
+                'cell in section 1 and complete the authorisation prompt. If a previous '
+                'run created files under /content/drive before mounting, Colab will '
+                'refuse to mount there at all: remove /content/drive first. Nothing has '
+                'been created on disk by this cell.'
+            )
+        try:
+            drive_populated = any(mydrive.iterdir())
+        except OSError as exc:
+            raise RuntimeError(
+                f'Google Drive is mounted but unreadable ({exc}). That is a stale FUSE '
+                "endpoint, not missing data. Run drive.mount('/content/drive', "
+                "force_remount=True) and re-run this cell."
+            ) from exc
+        if not drive_populated:
+            raise RuntimeError(
+                f'{mydrive} is empty, which means the Drive endpoint is stale rather than '
+                "that your files are gone. Run drive.mount('/content/drive', "
+                'force_remount=True) and re-run this cell.'
+            )
+    if not GEE_EXPORT_DIR.is_dir():
+        raise FileNotFoundError(
+            f'Export archive not found: {GEE_EXPORT_DIR}\\n'
+            'Drive itself looks fine, so check EE_EXPORT_FOLDER '
+            f'({EE_EXPORT_FOLDER!r}) against the folder name in MyDrive. Nothing has '
+            'been created on disk by this cell.'
+        )
+
+
+require_drive_archive()
 
 for _dir in [BACKFILL_ROOT, CACHE_DIR, SIDECAR_DIR, VRT_DIR, REPORT_DIR, LOCAL_SCRATCH]:
     tb.assert_not_in_readonly_dir(_dir, READONLY_DIRS)
@@ -1660,6 +1782,11 @@ def methods_summary_markdown(report, run_manifest):
         '',
         f'Generated {tb.utc_now_iso()} from `{PHASE0_REPORT_PATH.name}`.',
         '',
+        ('> Regenerated by `Backfill_Temporal_Bands_Local.ipynb` section 7 on every run '
+         '(`UPDATE_REPO_VALIDATION_SUMMARY`), so edit the generator in `build_backfill_nb.py` '
+         'rather than this file. A copy is always written to '
+         '`MyDrive/Winam_Temporal_Backfill/reports/phase0_validation_summary.md`.'),
+        '',
         ('The 90-day temporal-persistence bands were reconstructed locally from the '
          'source band already present in every exported snapshot (`NDVI` for Sentinel-2, '
          '`VH_corrected` for Sentinel-1), with no Earth Engine calls. The lookback window '
@@ -1721,6 +1848,35 @@ def methods_summary_markdown(report, run_manifest):
             )
             lines.append('')
     lines += [
+        '## Coverage, and what the per-sensor figures do not cover',
+        '',
+        ('Earth Engine reduced over every scene passing the source-collection filters. This '
+         'reconstruction sees only snapshots that passed the export coverage gate and reached '
+         'Drive, and one median-composited observation per acquisition date where Earth Engine '
+         'saw each granule separately. Fewer observations per window means a noisier standard '
+         'deviation and more pixels falling below the minimum-observation mask. That is a '
+         'property of reconstructing from exports rather than from source imagery, not a defect '
+         'in the estimator, and the per-sensor figures above measure its combined effect '
+         'directly.'),
+        '',
+        ('**A result for one sensor never transfers to the other.** The two differ in revisit '
+         'interval, in swath coverage across the AOI, and in the distribution of the source '
+         'band, so agreement measured for one says nothing about the other. Read each sensor on '
+         'its own terms.'),
+        '',
+        '## Estimator correctness, isolated from coverage',
+        '',
+        ('The reconstruction logic was verified end-to-end against a synthetic archive in which '
+         'the reference Earth Engine band was computed from an identical set of input '
+         'observations (`tests/test_temporal_backfill.py`, plus a full notebook execution over a '
+         '69-snapshot synthetic Drive tree). Under identical inputs the local estimator '
+         'reproduces the reference exactly - Pearson r = 1.000000, mean bias 0.000000, RMSE '
+         '0.000000, zero masking disagreement - and Phase 0 ddof selection correctly identifies '
+         'the sample convention. That isolates the estimator from the coverage difference: it '
+         'shows the window semantics, NoData handling, min-obs masking and reducer convention '
+         'are right, and says nothing about how far the reduced observation count shifts values '
+         'on the real archive. Only the per-sensor numbers above answer that.'),
+        '',
         '## Known issues preserved deliberately',
         '',
         ('1. `vh_temporal_cv_w90` divides by `abs(mean)` of a dB quantity, so it is not the '
@@ -1731,6 +1887,12 @@ def methods_summary_markdown(report, run_manifest):
         ('3. Sentinel-1 swath coverage is uneven across the AOI, so per-pixel observation counts '
          'and the minimum-observation mask are strongly spatially structured. The observation-'
          'count band is retained as an output so this can be checked.'),
+        '',
+        ('A fourth point is a local policy choice rather than a reproduction: where the S1 window '
+         'mean approaches zero, `vh_temporal_cv_w90` is written as NoData rather than as a signed '
+         'infinity. Earth Engine behaviour there cannot currently be observed, so it was chosen '
+         'rather than measured. Affected pixels are counted per date in the run manifest column '
+         '`n_nonfinite_cv`. See `docs/temporal_backfill_integration.md` section 7.'),
         '',
         'See `docs/temporal_backfill_integration.md` for detail and for classifier integration.',
         '',
@@ -1819,6 +1981,22 @@ policy, grid-mismatch detection, Drive collision duplicates and tiled shards, an
 cross-sensor contamination. Run with `pytest tests/test_temporal_backfill.py`. No Drive, no
 network.
 """)
+
+# The capability guard in section 1 has to list exactly what the notebook calls,
+# so derive it from the assembled cells instead of maintaining it by hand.
+_tb_used = sorted({
+    name
+    for cell in cells if cell["cell_type"] == "code"
+    for name in re.findall(r"\btb\.([A-Za-z_][A-Za-z0-9_]*)", cell["source"])
+    if not name.startswith("__")
+})
+_symbol_literal = "\n" + "".join(f"    {name!r},\n" for name in _tb_used)
+for _cell in cells:
+    if _cell["cell_type"] == "code" and "__TB_REQUIRED_SYMBOLS__" in _cell["source"]:
+        _cell["source"] = _cell["source"].replace("__TB_REQUIRED_SYMBOLS__", _symbol_literal)
+        break
+else:
+    raise SystemExit("setup cell no longer holds the __TB_REQUIRED_SYMBOLS__ placeholder")
 
 notebook = {
     "cells": cells,
