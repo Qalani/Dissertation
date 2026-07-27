@@ -93,20 +93,16 @@ Engine output rather than assuming it away.
 # ---------------------------------------------------------------------------
 md("## 1. Setup — Drive, imports, and the offline logic package")
 
-code("""# Mount Google Drive (Colab). Outside Colab this is skipped and you can point
-# DRIVE_MYDRIVE at any folder mirroring the Drive layout.
+code("""# Detect Colab, load the offline logic package, then mount Drive -- in that
+# order. Mounting last means reset_drive_mount() below is already defined if the
+# mount fails, which is exactly when it is needed. Outside Colab nothing is
+# mounted and you can point DRIVE_MYDRIVE at any folder mirroring the layout.
 try:
     from google.colab import drive
     IN_COLAB = True
 except ImportError:
     print('Not running in Colab; Drive will not be mounted.')
     IN_COLAB = False
-
-if IN_COLAB:
-    # Deliberately not wrapped in try/except. A swallowed mount failure used to
-    # surface five cells later as 'Predictor export folder does not exist', which
-    # reads like the archive is gone rather than like Drive never came up.
-    drive.mount('/content/drive')
 
 import json
 import os
@@ -241,6 +237,48 @@ assert not _leaked_ee, f'Earth Engine modules leaked into this runtime: {_leaked
 # phases can refuse to run in the same session (see require_phase0).
 SESSION_ID = uuid.uuid4().hex
 
+
+def reset_drive_mount():
+    '''Clear a poisoned mount point and mount Drive. The ONLY supported repair.
+
+    A run that starts without Drive mounted leaves ordinary local directories at
+    /content/drive, and Colab then refuses to mount over them ('Mountpoint must
+    not already contain files'). Clearing those directories is the fix.
+
+    Do not do it by hand. `rm -rf /content/drive` is correct in that state and
+    catastrophic in the other one: when the mount is live it deletes straight
+    through FUSE into real Drive data, and the two states are indistinguishable
+    from a file listing. That is not hypothetical -- it has already emptied a
+    Drive on this project.
+
+    This checks os.path.ismount before removing anything and refuses outright
+    when Drive is mounted, so it is safe to call in either state. The check lives
+    in winam_diagnostics.temporal_backfill and is unit-tested offline in
+    tests/test_drive_removal_safety.py.
+    '''
+    if not IN_COLAB:
+        print('Not in Colab; nothing to mount.')
+        return
+    try:
+        removed = tb.remove_stray_mount_dirs()
+    except tb.UnsafeRemovalError as exc:
+        # Drive is live, so nothing was deleted. Treat it as a stale endpoint.
+        print(exc)
+        print('\\nNothing was removed. Forcing a remount instead...')
+        drive.mount('/content/drive', force_remount=True)
+        return
+    print('Removed stray local directories at /content/drive' if removed
+          else 'Nothing to clear at /content/drive')
+    drive.mount('/content/drive')
+
+
+if IN_COLAB:
+    # Deliberately not wrapped in try/except. A swallowed mount failure used to
+    # surface five cells later as 'Predictor export folder does not exist', which
+    # reads like the archive is gone rather than like Drive never came up. If this
+    # raises 'Mountpoint must not already contain files', call reset_drive_mount().
+    drive.mount('/content/drive')
+
 print('winam_diagnostics loaded from:', Path(tb.__file__).resolve().parent)
 print('Repo root:', REPO_ROOT, '@', _git(['rev-parse', '--short', 'HEAD'], cwd=REPO_ROOT) or 'unknown commit')
 print('rasterio:', rasterio.__version__, '| numpy:', np.__version__)
@@ -356,14 +394,38 @@ def require_drive_archive():
     every later run until the stray directories are deleted by hand.
     '''
     if IN_COLAB:
-        mydrive = Path('/content/drive/MyDrive')
+        mount_root = Path('/content/drive')
+        mydrive = mount_root / 'MyDrive'
+        # os.path.ismount is the load-bearing test. Without it "MyDrive is empty"
+        # is ambiguous between a real mount serving nothing and plain local
+        # directories sitting where the mount should be, and those two need
+        # opposite responses: deleting the path is the fix for the second and
+        # DESTROYS DATA on the first, because rm follows the FUSE mount straight
+        # into your actual Drive.
+        really_mounted = os.path.ismount(mount_root)
+        # Never spell out a recursive delete here, not even a correct one. This
+        # message is read by someone whose run just failed, and a copy-pasteable
+        # rm is exactly how a live mount gets deleted through. reset_drive_mount()
+        # re-checks the mount itself, so it is safe whichever state you are in.
+        remove_hint = (
+            'Clear it with the guarded helper, which refuses to touch anything that '
+            'is actually mounted:\\n'
+            '    reset_drive_mount()'
+        )
+        if not really_mounted:
+            raise RuntimeError(
+                f'Google Drive is not mounted at {mount_root}.\\n\\n'
+                f'If {mount_root} exists, it holds ordinary local directories left by a '
+                'run that started without a mount, and Colab will refuse to mount over '
+                f'them.\\n{remove_hint}\\n\\n'
+                'Nothing has been created on disk by this cell.'
+            )
         if not mydrive.is_dir():
             raise RuntimeError(
-                f'Google Drive is not mounted ({mydrive} is missing). Re-run the setup '
-                'cell in section 1 and complete the authorisation prompt. If a previous '
-                'run created files under /content/drive before mounting, Colab will '
-                'refuse to mount there at all: remove /content/drive first. Nothing has '
-                'been created on disk by this cell.'
+                f'{mount_root} is mounted but {mydrive} is missing. Run '
+                "drive.mount('/content/drive', force_remount=True) and re-run this cell. "
+                f'Do NOT delete {mount_root} while it is mounted: rm would follow the '
+                'mount into your real Drive.'
             )
         try:
             drive_populated = any(mydrive.iterdir())
@@ -371,13 +433,16 @@ def require_drive_archive():
             raise RuntimeError(
                 f'Google Drive is mounted but unreadable ({exc}). That is a stale FUSE '
                 "endpoint, not missing data. Run drive.mount('/content/drive', "
-                "force_remount=True) and re-run this cell."
+                'force_remount=True) and re-run this cell.'
             ) from exc
         if not drive_populated:
             raise RuntimeError(
-                f'{mydrive} is empty, which means the Drive endpoint is stale rather than '
-                "that your files are gone. Run drive.mount('/content/drive', "
-                'force_remount=True) and re-run this cell.'
+                f'{mydrive} is a live mount but lists no entries at all.\\n'
+                'Most often the endpoint is stale, so try first:\\n'
+                "    drive.mount('/content/drive', force_remount=True)\\n"
+                'If it is still empty after that, the mount is fine and the Drive root '
+                'really is empty — check https://drive.google.com and its Trash before '
+                f'assuming anything. Do NOT delete {mount_root} while it is mounted.'
             )
     if not GEE_EXPORT_DIR.is_dir():
         raise FileNotFoundError(
@@ -1924,6 +1989,31 @@ print('Saved summary:', summary_path)""")
 
 # ---------------------------------------------------------------------------
 md("""## 8. Notes and caveats
+
+### Never delete anything under `/content/drive` by hand
+
+If a run starts before Drive is mounted, `mkdir(parents=True)` creates ordinary local
+directories at `/content/drive/MyDrive/...`. Colab then refuses to mount over them
+(`Mountpoint must not already contain files`), so every later run fails too. Clearing
+those directories is the correct repair.
+
+**Use `reset_drive_mount()` from section 1. Do not clear them by hand.**
+
+`rm -rf /content/drive` is right in that state and catastrophic in the other one: when
+the mount is live it deletes straight through FUSE into real Drive data, and the two
+states are indistinguishable from a file listing. That is not a hypothetical — it has
+already sent an entire Drive to the bin on this project. (Recoverable: FUSE deletions go
+to Drive's Trash and are restorable for 30 days at
+[drive.google.com/drive/trash](https://drive.google.com/drive/trash).)
+
+`reset_drive_mount()` checks `os.path.ismount` before touching anything and refuses when
+Drive is mounted, so it is safe to call in either state. The check is
+`winam_diagnostics.temporal_backfill.assert_safe_to_remove`, unit-tested offline in
+`tests/test_drive_removal_safety.py`, which also enforces repo-wide that nothing else
+performs a recursive delete.
+
+Section 2 additionally verifies the mount *before* creating any output directory, so the
+poisoned-mountpoint state cannot be created by this notebook in the first place.
 
 ### Known issues preserved faithfully, not fixed
 
