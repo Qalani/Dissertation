@@ -356,14 +356,32 @@ def require_drive_archive():
     every later run until the stray directories are deleted by hand.
     '''
     if IN_COLAB:
-        mydrive = Path('/content/drive/MyDrive')
+        mount_root = Path('/content/drive')
+        mydrive = mount_root / 'MyDrive'
+        # os.path.ismount is the load-bearing test. Without it "MyDrive is empty"
+        # is ambiguous between a real mount serving nothing and plain local
+        # directories sitting where the mount should be, and those two need
+        # opposite responses: deleting the path is the fix for the second and
+        # DESTROYS DATA on the first, because rm follows the FUSE mount straight
+        # into your actual Drive.
+        really_mounted = os.path.ismount(mount_root)
+        remove_hint = (
+            f'{mount_root} is NOT a mount, just ordinary local directories, so removing '
+            f'it touches nothing in your real Drive:\\n'
+            f'    import shutil; shutil.rmtree({str(mount_root)!r}, ignore_errors=True)\\n'
+            '    drive.mount(\\'/content/drive\\')'
+        )
+        if not really_mounted:
+            raise RuntimeError(
+                f'Google Drive is not mounted at {mount_root}.\\n\\n{remove_hint}\\n\\n'
+                'Nothing has been created on disk by this cell.'
+            )
         if not mydrive.is_dir():
             raise RuntimeError(
-                f'Google Drive is not mounted ({mydrive} is missing). Re-run the setup '
-                'cell in section 1 and complete the authorisation prompt. If a previous '
-                'run created files under /content/drive before mounting, Colab will '
-                'refuse to mount there at all: remove /content/drive first. Nothing has '
-                'been created on disk by this cell.'
+                f'{mount_root} is mounted but {mydrive} is missing. Run '
+                "drive.mount('/content/drive', force_remount=True) and re-run this cell. "
+                f'Do NOT delete {mount_root} while it is mounted: rm would follow the '
+                'mount into your real Drive.'
             )
         try:
             drive_populated = any(mydrive.iterdir())
@@ -371,13 +389,16 @@ def require_drive_archive():
             raise RuntimeError(
                 f'Google Drive is mounted but unreadable ({exc}). That is a stale FUSE '
                 "endpoint, not missing data. Run drive.mount('/content/drive', "
-                "force_remount=True) and re-run this cell."
+                'force_remount=True) and re-run this cell.'
             ) from exc
         if not drive_populated:
             raise RuntimeError(
-                f'{mydrive} is empty, which means the Drive endpoint is stale rather than '
-                "that your files are gone. Run drive.mount('/content/drive', "
-                'force_remount=True) and re-run this cell.'
+                f'{mydrive} is a live mount but lists no entries at all.\\n'
+                'Most often the endpoint is stale, so try first:\\n'
+                "    drive.mount('/content/drive', force_remount=True)\\n"
+                'If it is still empty after that, the mount is fine and the Drive root '
+                'really is empty — check https://drive.google.com and its Trash before '
+                f'assuming anything. Do NOT delete {mount_root} while it is mounted.'
             )
     if not GEE_EXPORT_DIR.is_dir():
         raise FileNotFoundError(
