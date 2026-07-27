@@ -90,6 +90,41 @@ def test_compute_area_envelope_without_proba_collapses_to_hard():
         assert col in env.columns
 
 
+def test_compute_area_envelope_tolerates_nan_paths():
+    # Reading the batch area CSV turns empty path cells into float NaN. NaN is
+    # truthy, so the default path check must not hand it to pathlib (which raises
+    # "argument should be a str or an os.PathLike object ... not 'float'"). Such
+    # rows collapse to soft = hard instead of crashing the whole cell.
+    rows = pd.DataFrame([
+        {"sensor": "S2", "method": "RF", "start_date": "2020-01-01",
+         "end_date": "2020-01-02", "area_ha": 12.5,
+         "classification_output": np.nan, "probability_output": np.nan},
+        {"sensor": "S2", "method": "RF", "start_date": "2020-02-01",
+         "end_date": "2020-02-02", "area_ha": 20.0,
+         "classification_output": "/nope/class.tif", "probability_output": np.nan},
+    ])
+    # Default path_exists (the one that crashed in the notebook) must be safe here.
+    env = ae.compute_area_envelope(rows, verbose=False)
+    assert len(env) == 2
+    assert (~env["has_proba"]).all()
+    assert (env["soft_area_ha"] == env["hard_area_ha"]).all()
+    assert (env["gap_ha"] == 0.0).all()
+    # Hard area is carried through from the area_ha column for the NaN-path rows.
+    assert set(env["hard_area_ha"]) == {12.5, 20.0}
+
+
+def test_clean_path_normalizes_bad_and_good_values():
+    from pathlib import Path
+
+    assert ae._clean_path(np.nan) is None
+    assert ae._clean_path(None) is None
+    assert ae._clean_path("") is None
+    assert ae._clean_path("   ") is None
+    assert ae._clean_path(3.0) is None
+    assert ae._clean_path("  /data/class.tif  ") == "/data/class.tif"
+    assert ae._clean_path(Path("/data/class.tif")) == "/data/class.tif"
+
+
 def test_compute_area_envelope_reads_rasters_when_available(tmp_path):
     rasterio = pytest.importorskip("rasterio")
     from rasterio.transform import from_origin

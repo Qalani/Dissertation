@@ -23,6 +23,8 @@ function is left intact. The envelope is a separate, additive output.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 
@@ -162,6 +164,30 @@ ENVELOPE_COLUMNS = [
 ]
 
 
+def _clean_path(value):
+    """Coerce a raw area-table cell into a usable path string, or ``None``.
+
+    Reading the batch area CSV with ``pd.read_csv`` turns an empty
+    ``classification_output`` / ``probability_output`` cell into float ``NaN``.
+    ``NaN`` is truthy, so a naive ``bool(p) and Path(p).exists()`` hands the float
+    straight to :class:`pathlib.Path`, which raises
+    ``TypeError: argument should be a str or an os.PathLike object ... not 'float'``.
+    Anything that is not a non-empty string / :class:`os.PathLike` (``None``, ``NaN``,
+    other scalars, whitespace-only strings) collapses to ``None`` — treated
+    downstream as "no raster for this date", so the envelope simply falls back to
+    hard = soft for that row instead of crashing the whole notebook cell.
+    """
+    if value is None:
+        return None
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
+    # Any non-string scalar (float NaN from a CSV, numbers, ...) is not a path.
+    return None
+
+
 def compute_area_envelope(
     area_rows,
     floating_class_code=FLOATING_CLASS_CODE,
@@ -197,8 +223,8 @@ def compute_area_envelope(
     records = []
     for row in iterator:
         get = row.get if hasattr(row, "get") else (lambda k, d=None: row[k] if k in row else d)
-        class_tif = get(class_tif_col)
-        proba_tif = get(proba_tif_col)
+        class_tif = _clean_path(get(class_tif_col))
+        proba_tif = _clean_path(get(proba_tif_col))
         hard_area_ha = get(hard_area_col)
         base = {
             "sensor": get("sensor"),
@@ -207,7 +233,12 @@ def compute_area_envelope(
             "end_date": get("end_date"),
         }
 
-        has_proba = path_exists(proba_tif) and path_exists(class_tif)
+        has_proba = (
+            proba_tif is not None
+            and class_tif is not None
+            and path_exists(proba_tif)
+            and path_exists(class_tif)
+        )
         if has_proba:
             env = accumulate_soft_hard_from_geotiffs(
                 class_tif, proba_tif, floating_class_code=floating_class_code,
