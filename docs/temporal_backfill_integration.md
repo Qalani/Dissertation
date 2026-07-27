@@ -472,6 +472,64 @@ Any equivalent ambiguity on the classifier side deserves the same treatment.
 
 ---
 
+## 9a. A gate nobody can pass is not a safety feature
+
+Phase 0 is a blocking gate: nothing should backfill 610 GB of derived bands without a
+human having read what the inventory and the validation against Earth Engine actually
+found. The first implementation enforced that by requiring the report to have been
+written by a **different Python session**, which is not the same property, and the
+difference made the notebook unusable from section 4 onwards.
+
+Running the cells in order always leaves the report stamped with the current session, so
+`require_phase0` raised every time. The only way through was to re-run the heavy section 1
+setup cell purely so `uuid4()` would return a different `SESSION_ID` — a step the error
+message described as "start a fresh run", which nobody reads as "re-run cell 1 and then
+carefully do not re-run section 3". The 2026-07-27 run hit it at execution count 22 and
+stopped there.
+
+Two lessons worth carrying into any similar gate:
+
+- **Gate on the thing you mean.** The property wanted was "a human read this verdict", so
+  that is what is now recorded: `acknowledge_phase0()` in section 3e, keyed to a digest of
+  the report's content so it covers one specific verdict and lapses when Phase 0 is re-run.
+  A `FAIL` verdict still cannot be acknowledged at all.
+- **A blocked message must name the action that unblocks it.** The new one prints the exact
+  call to make. The old one described a state.
+
+Also note what the session check bought in exchange: nothing. Churning a UUID requires no
+one to read anything, so the gate was simultaneously impassable in practice and vacuous in
+principle.
+
+## 9b. A shrinking archive is silent, and therefore worse than a crash
+
+The same run scanned `GEE_Exports_validated_snapshots` and found **1 parsable file where an
+earlier run had found 3121**. Nothing failed. Phase 0 reported both sensors `UNVALIDATED`
+with zero snapshots to backfill, wrote a valid report, and the bulk phases would have run
+to "completion" having done nothing at all.
+
+Worse than the no-op: had the archive been *partly* truncated, the rolling 90-day windows
+would have been recomputed over whatever remained. Missing dates do not raise — they change
+every statistic that depended on them, and any sidecar already on Drive for an overlapping
+window silently stops matching its own inputs.
+
+Section 3 of the backfill notebook now compares every scan against the largest count any
+earlier run recorded and stops Phase 0 on a shortfall. Three details matter:
+
+- **Retry before believing it.** A partial FUSE listing and real data loss are
+  indistinguishable from a file listing, so the scan is repeated after a force-remount
+  first — the same reasoning as `looks_like_stale_mount` in section 9.
+- **Do not trust a baseline that the failure itself overwrites.** The saved inventory CSV is
+  rewritten wholesale by every Phase 0 run, so the truncated scan destroyed the only record
+  that the archive had ever been bigger. The cache manifest is upsert-only and still names
+  every source file Phase 1 has read, so the baseline is the larger of the two.
+- **Leave an honest override.** `ARCHIVE_SHRINK_POLICY = 'accept'` exists for an archive
+  pruned on purpose, and says in the output what that costs.
+
+Same shape as the unresolved-prefix rule above: when the data cannot be trusted and the
+notebook cannot tell why, it stops and says what it saw.
+
+---
+
 ## 10. Rollout
 
 1. ~~Run Phase 0 against the real archive and read the verdict.~~ **Done** — both

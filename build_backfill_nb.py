@@ -56,7 +56,7 @@ zero Earth Engine cost.
 
 | Phase | What | Output |
 |---|---|---|
-| **0** | Inventory, manifest breakdown, estimator validation against Earth Engine's own values. **Blocking** — must finish and print its verdict before any bulk work, and not in the same run. | `phase0_report.json`, diagnostics figures |
+| **0** | Inventory, manifest breakdown, estimator validation against Earth Engine's own values. **Blocking** — must finish, print its verdict, and have that verdict acknowledged in section 3e before any bulk work runs. | `phase0_report.json`, diagnostics figures |
 | **1** | Extract `NDVI` / `VH_corrected` once per snapshot into a compressed single-band cache | cache GeoTIFFs + cache manifest |
 | **2** | Rolling 90-day statistics per snapshot, in windowed blocks | in memory |
 | **3** | Write sidecar GeoTIFFs + a `.vrt` per snapshot in the new-schema band order | sidecars, VRTs, run manifest |
@@ -125,6 +125,13 @@ from IPython.display import display
 # made weeks ago gets silently reused.
 NOTEBOOK_CLONE_DIR = Path('/content/Dissertation_diagnostics')
 NOTEBOOK_CLONE_URL = 'https://github.com/Qalani/Dissertation.git'
+# Which ref the clone is fast-forwarded to. 'HEAD' is the repo's default branch.
+# Set this to a branch name when you have opened this notebook from a branch whose
+# winam_diagnostics changes are not merged yet: the notebook and the package are
+# fetched separately, so a notebook from a branch otherwise pairs with the package
+# from main, and the capability guard below then aborts setup saying the package is
+# out of date -- which is true, and re-cloning cannot fix it.
+NOTEBOOK_CLONE_REF = 'HEAD'
 
 
 def _git(args, cwd=None):
@@ -160,8 +167,9 @@ def _refresh_notebook_clone():
     '''
     if not (NOTEBOOK_CLONE_DIR / '.git').is_dir():
         return
-    print('Refreshing', NOTEBOOK_CLONE_DIR, 'from origin...')
-    if _git(['fetch', '--depth', '1', 'origin', 'HEAD'], cwd=NOTEBOOK_CLONE_DIR) is None:
+    print('Refreshing', NOTEBOOK_CLONE_DIR, f'from origin/{NOTEBOOK_CLONE_REF}...')
+    if _git(['fetch', '--depth', '1', 'origin', NOTEBOOK_CLONE_REF],
+            cwd=NOTEBOOK_CLONE_DIR) is None:
         print('  continuing with the copy already on disk')
         return
     if _git(['reset', '--hard', 'FETCH_HEAD'], cwd=NOTEBOOK_CLONE_DIR) is not None:
@@ -193,7 +201,10 @@ def _ensure_winam_diagnostics():
     if _has_package(NOTEBOOK_CLONE_DIR):
         _refresh_notebook_clone()
     else:
-        _git(['clone', '--depth', '1', NOTEBOOK_CLONE_URL, str(NOTEBOOK_CLONE_DIR)])
+        clone_args = ['clone', '--depth', '1']
+        if NOTEBOOK_CLONE_REF != 'HEAD':
+            clone_args += ['--branch', NOTEBOOK_CLONE_REF]
+        _git(clone_args + [NOTEBOOK_CLONE_URL, str(NOTEBOOK_CLONE_DIR)])
     if _has_package(NOTEBOOK_CLONE_DIR):
         sys.path.insert(0, str(NOTEBOOK_CLONE_DIR))
         import winam_diagnostics  # noqa: F401
@@ -221,10 +232,14 @@ REQUIRED_TB_SYMBOLS = (__TB_REQUIRED_SYMBOLS__)
 _missing_tb = [name for name in REQUIRED_TB_SYMBOLS if not hasattr(tb, name)]
 if _missing_tb:
     raise ImportError(
-        'winam_diagnostics at {} is out of date: missing {}. Delete {} and re-run '
-        'this cell to re-clone it, or pull in the checkout you are pointing at, '
-        'then restart the runtime.'.format(
-            Path(tb.__file__).resolve().parent, ', '.join(_missing_tb), NOTEBOOK_CLONE_DIR)
+        'winam_diagnostics at {} is out of date: missing {}.\\n'
+        'If you opened this notebook from a branch, its package changes are probably '
+        'not on {} yet: set NOTEBOOK_CLONE_REF to that branch above and re-run this '
+        'cell. Re-cloning will not help while the ref is wrong.\\n'
+        'Otherwise delete {} and re-run this cell to re-clone it, or pull in the '
+        'checkout you are pointing at, then restart the runtime.'.format(
+            Path(tb.__file__).resolve().parent, ', '.join(_missing_tb),
+            NOTEBOOK_CLONE_REF, NOTEBOOK_CLONE_DIR)
     )
 
 # Hard constraint: this notebook must never touch Earth Engine. Importing ee would
@@ -233,8 +248,9 @@ if _missing_tb:
 _leaked_ee = sorted(m for m in sys.modules if m == 'ee' or m.startswith('ee.'))
 assert not _leaked_ee, f'Earth Engine modules leaked into this runtime: {_leaked_ee}'
 
-# Identifies this notebook run. Phase 0 stamps its report with it so the later
-# phases can refuse to run in the same session (see require_phase0).
+# Identifies this notebook run. Phase 0 stamps its report with it so require_phase0
+# can tell 'this run wrote the verdict' (needs acknowledging in section 3e) from
+# 'an earlier run wrote it' (already read, in that run).
 SESSION_ID = uuid.uuid4().hex
 
 
@@ -360,6 +376,20 @@ CV_EXTREME_THRESHOLD = 10.0           # |cv| above this counts as 'extreme' in t
 #               known, recorded loss rather than a silent miscount.
 # Never guess: there is no 'assume shards' option on purpose.
 UNRESOLVED_PREFIX_POLICY = 'abort'
+
+# What to do when the export archive holds FEWER files than the last inventory
+# recorded. The archive is read-only and append-only here, so that never happens
+# routinely -- it means either a Drive mount serving a partial listing (the scan
+# is retried after a force-remount before this policy is consulted) or files that
+# are genuinely gone.
+#   'abort'  — stop Phase 0 (default). Missing dates do not fail the rolling
+#              windows, they silently change every statistic computed over them,
+#              and any sidecar already on Drive for an overlapping window becomes
+#              inconsistent with its own inputs.
+#   'accept' — carry on with what is present. Correct only when you deliberately
+#              pruned the archive and accept that windows spanning the removed
+#              dates are now computed over fewer observations.
+ARCHIVE_SHRINK_POLICY = 'abort'
 
 # --- Output controls. ---
 # Default deliverable is sidecars + a .vrt, NOT a rewrite of the source rasters.
@@ -662,54 +692,160 @@ def _dir_state(path):
         return False, 0
 
 
-def require_phase0(phase_label):
-    '''Refuse to run bulk work until Phase 0 has completed in an earlier run.'''
+#: Digest of the Phase 0 verdict the operator has acknowledged in this session.
+#: Set by acknowledge_phase0() in section 3e; nothing else may write it.
+PHASE0_ACK_DIGEST = None
+
+
+def _phase0_missing_message(phase_label):
+    '''Explain a missing report by what else is (or is not) on Drive.'''
+    # The report lives on Drive, so a missing file means either Phase 0 was
+    # never run here or the folder was lost. Those want different responses,
+    # and the sibling outputs tell them apart -- so report them rather than
+    # asserting 'has not been run' and sending someone to restart a runtime
+    # that was never the problem.
+    state = {label: _dir_state(path) for label, path in (
+        ('source band cache', CACHE_DIR),
+        ('sidecars', SIDECAR_DIR),
+        ('VRTs', VRT_DIR),
+        ('reports', REPORT_DIR),
+    )}
+    listing = '\\n'.join(
+        f'    {label:18s}: ' + (f'{n} entr(y/ies)' if exists else 'missing')
+        for label, (exists, n) in state.items()
+    )
+    if any(n for _exists, n in state.values()):
+        hint = ('Other backfill outputs ARE present, so this looks like a lost or '
+                'partly restored reports folder rather than a first run. Check '
+                'Drive\\'s Trash before re-running anything.')
+    else:
+        hint = 'No backfill outputs are present at all, consistent with a first run.'
+    return (
+        f'{phase_label} is blocked: {PHASE0_REPORT_PATH} does not exist.\\n'
+        f'{hint}\\n'
+        f'  under {BACKFILL_ROOT}:\\n{listing}\\n'
+        'Restarting the runtime will not change this -- the gate is a file on '
+        'Drive, not session state. Phase 0 is cheap to repeat (it makes no Earth '
+        'Engine calls): run sections 3-3d to completion, then acknowledge the '
+        'verdict in section 3e.'
+    )
+
+
+def _phase0_failures(report):
+    return sorted(
+        sensor for sensor, verdict in report.get('verdicts', {}).items()
+        if verdict.get('status') == tb.VALIDATION_FAIL
+    )
+
+
+def acknowledge_phase0():
+    '''Record that the operator has read THIS Phase 0 verdict, unlocking phases 1+.
+
+    This is the whole gate. It used to be spelled 'the report must have been
+    written by a different Python session', which is not the same property and
+    made the notebook impossible to finish in one pass: running the cells in
+    order always writes the report in the current session, so Phase 1 refused
+    every time, and the only way through was to re-run the section 1 setup cell
+    purely so that uuid4() would produce a different SESSION_ID. Nobody had to
+    read anything for that to work, and the error message did not say it was what
+    the gate wanted.
+
+    The acknowledgement is keyed to a digest of the report's content, so it
+    covers one specific verdict: re-run Phase 0 and the digest changes, this
+    acknowledgement stops applying, and the verdict has to be read again.
+    '''
+    global PHASE0_ACK_DIGEST
     if not PHASE0_REPORT_PATH.exists():
-        # The report lives on Drive, so a missing file means either Phase 0 was
-        # never run here or the folder was lost. Those want different responses,
-        # and the sibling outputs tell them apart -- so report them rather than
-        # asserting 'has not been run' and sending someone to restart a runtime
-        # that was never the problem.
-        state = {label: _dir_state(path) for label, path in (
-            ('source band cache', CACHE_DIR),
-            ('sidecars', SIDECAR_DIR),
-            ('VRTs', VRT_DIR),
-            ('reports', REPORT_DIR),
-        )}
-        inventory = '\\n'.join(
-            f'    {label:18s}: ' + (f'{n} entr(y/ies)' if exists else 'missing')
-            for label, (exists, n) in state.items()
-        )
-        if any(n for _exists, n in state.values()):
-            hint = ('Other backfill outputs ARE present, so this looks like a lost or '
-                    'partly restored reports folder rather than a first run. Check '
-                    'Drive\\'s Trash before re-running anything.')
-        else:
-            hint = 'No backfill outputs are present at all, consistent with a first run.'
-        raise RuntimeError(
-            f'{phase_label} is blocked: {PHASE0_REPORT_PATH} does not exist.\\n'
-            f'{hint}\\n'
-            f'  under {BACKFILL_ROOT}:\\n{inventory}\\n'
-            'Restarting the runtime will not change this -- the gate is a file on '
-            'Drive, not session state. Phase 0 is cheap to repeat (it makes no Earth '
-            'Engine calls): run sections 3-3d to completion, then start a fresh run '
-            'before the bulk phases.'
-        )
+        raise RuntimeError(_phase0_missing_message('Acknowledging Phase 0'))
     report = json.loads(PHASE0_REPORT_PATH.read_text())
-    if report.get('session_id') == SESSION_ID:
+    failed = _phase0_failures(report)
+    if failed:
+        # A FAILED verdict is not something to acknowledge past. It means the
+        # local reconstruction disagreed with Earth Engine's own output on the
+        # very dates where both exist.
         raise RuntimeError(
-            f'{phase_label} is blocked: Phase 0 completed in THIS run.\\n'
-            'Phase 0 is a blocking gate — read its report, then start a fresh run '
-            '(restart the runtime, or re-run the setup cell in section 1) before '
-            'running the bulk phases.'
+            f'Phase 0 validation FAILED for {failed}, which cannot be acknowledged '
+            'away: the reconstruction disagreed with Earth Engine on dates where '
+            'both values exist. Investigate before backfilling anything.'
         )
-    failed = [s for s, v in report.get('verdicts', {}).items() if v.get('status') == tb.VALIDATION_FAIL]
+
+    verdicts = report.get('verdicts', {})
+    print('=' * 78)
+    print('PHASE 0 ACKNOWLEDGEMENT')
+    print('=' * 78)
+    print('Report          :', PHASE0_REPORT_PATH)
+    print('Recorded at     :', report.get('recorded_at'))
+    print('ddof for the run:', report.get('settled_ddof'), '-', report.get('settled_ddof_note'))
+    print()
+    for sensor in sorted(verdicts):
+        v = verdicts[sensor]
+        print(f'  {sensor}: {v.get(\"status\")} | {v.get(\"n_snapshots\", 0)} snapshot(s), '
+              f'{v.get(\"n_to_backfill\", 0)} to backfill')
+        print(f'      {v.get(\"message\", \"\")}')
+    unvalidated = sorted(s for s, v in verdicts.items()
+                         if v.get('status') == tb.VALIDATION_UNVALIDATED)
+    if unvalidated:
+        print()
+        print(f'!!! {\", \".join(unvalidated)} could NOT be validated against Earth Engine.')
+        print('    Proceeding is allowed -- there is nothing in Drive to compare against --')
+        print('    but the bands written for those sensors are unvalidated, and that status')
+        print('    is carried into every run-manifest row and the methods summary.')
+    nothing_to_do = verdicts and not any(
+        int(v.get('n_to_backfill') or 0) for v in verdicts.values())
+    if nothing_to_do:
+        print()
+        print('!!! Every discovered snapshot already carries Earth Engine\\'s own temporal')
+        print('    bands, so phases 1-3 have nothing to backfill. If you expected work')
+        print('    here, the archive scan in section 3 is what to check, not this gate.')
+
+    PHASE0_ACK_DIGEST = tb.phase0_report_digest(report)
+    print()
+    print('Acknowledged verdict', PHASE0_ACK_DIGEST[:12], '- phases 1+ are unlocked for')
+    print('this report. Re-running Phase 0 replaces the report and revokes this')
+    print('acknowledgement, because the verdict you read would no longer be the one on')
+    print('disk.')
+    print('=' * 78)
+    return report
+
+
+def require_phase0(phase_label):
+    '''Refuse to run bulk work until this run's Phase 0 verdict has been read.'''
+    if not PHASE0_REPORT_PATH.exists():
+        raise RuntimeError(_phase0_missing_message(phase_label))
+    report = json.loads(PHASE0_REPORT_PATH.read_text())
+
+    failed = _phase0_failures(report)
     if failed:
         raise RuntimeError(
             f'{phase_label} is blocked: Phase 0 validation FAILED for {failed}. '
             'Investigate before backfilling.'
         )
-    return report
+
+    digest = tb.phase0_report_digest(report)
+    if PHASE0_ACK_DIGEST == digest:
+        return report
+    # A report written by an earlier run has already been read in that run --
+    # that is what the operator restarted for -- so it still counts.
+    if report.get('session_id') != SESSION_ID:
+        return report
+
+    if PHASE0_ACK_DIGEST is None:
+        raise RuntimeError(
+            f'{phase_label} is blocked: the Phase 0 verdict has not been acknowledged.\\n'
+            f'Phase 0 finished in this run at {report.get(\"recorded_at\")} and is a '
+            'blocking gate: read the verdict printed by section 3d, then run the ONE '
+            'cell in section 3e:\\n'
+            '    acknowledge_phase0()\\n'
+            'That unlocks phases 1+ for this verdict. (Starting a fresh run also works '
+            'and is unchanged, but is no longer required.)'
+        )
+    raise RuntimeError(
+        f'{phase_label} is blocked: Phase 0 has been re-run since you acknowledged it, '
+        f'so the report on disk ({digest[:12]}) is not the verdict you read '
+        f'({PHASE0_ACK_DIGEST[:12]}).\\n'
+        'Read the new verdict in section 3d, then re-run section 3e:\\n'
+        '    acknowledge_phase0()'
+    )
 
 
 def load_phase0_report():
@@ -731,7 +867,8 @@ def validation_status_note(report=None):
 
 
 print('Helpers defined. Phase 0 report path:', PHASE0_REPORT_PATH,
-      '(exists:', PHASE0_REPORT_PATH.exists(), ')')""")
+      '(exists:', PHASE0_REPORT_PATH.exists(), ')')
+print('Phase 0 gate: phases 1+ need a verdict acknowledged with acknowledge_phase0()')""")
 
 # ---------------------------------------------------------------------------
 md("""## 3. Phase 0 — inventory (blocking)
@@ -746,8 +883,113 @@ observations in every window. Filenames alone are not conclusive, so each multi-
 prefix has its files' georeferencing read and compared — distinct grid windows are
 genuine tile shards, identical grid windows are copies.""")
 
-code("""inventory = tb.discover_predictor_files(GEE_EXPORT_DIR, sensors=SENSORS)
+code("""def _scan_export_archive():
+    return with_drive_retry(tb.discover_predictor_files, GEE_EXPORT_DIR, sensors=SENSORS,
+                            context='scanning the export archive', probe_path=GEE_EXPORT_DIR)
+
+
+def _live_file_count(frame):
+    '''Parsable files excluding Drive collision duplicates.
+
+    Counted this way on both sides of the comparison below: the saved inventory
+    records non-duplicate files per snapshot, so comparing it against a raw
+    len(inventory) would read a new `foo (1).tif` as archive growth.
+    '''
+    if frame is None or frame.empty:
+        return 0
+    return int((~frame['is_drive_duplicate'].astype(bool)).sum())
+
+
+def _archive_baseline():
+    '''The largest file count any earlier run recorded for this archive.
+
+    Two independent baselines, because they fail differently:
+
+    * the saved inventory CSV is rewritten wholesale by every Phase 0 run, so a
+      single scan of a truncated archive destroys the evidence that the archive
+      was ever bigger -- which is exactly what happened on 2026-07-27;
+    * the cache manifest is only ever upserted row by row, so it still names
+      every source file Phase 1 has ever read, and survives that.
+
+    The larger of the two wins. Both count non-duplicate source files, matching
+    _live_file_count.
+    '''
+    candidates = []
+    if INVENTORY_CSV_PATH.exists():
+        prior = with_drive_retry(pd.read_csv, INVENTORY_CSV_PATH,
+                                 context='reading the previous inventory',
+                                 probe_path=INVENTORY_CSV_PATH)
+        if not prior.empty and 'n_files' in prior.columns:
+            candidates.append((
+                int(pd.to_numeric(prior['n_files'], errors='coerce').fillna(0).sum()),
+                f'{INVENTORY_CSV_PATH.name} (saved {tb.mtime_iso(INVENTORY_CSV_PATH)})',
+            ))
+    if CACHE_MANIFEST_PATH.exists():
+        cached = with_drive_retry(tb.load_manifest, CACHE_MANIFEST_PATH,
+                                  tb.CACHE_MANIFEST_COLUMNS,
+                                  context='reading the cache manifest',
+                                  probe_path=CACHE_MANIFEST_PATH)
+        candidates.append((
+            tb.count_cached_source_files(cached),
+            f'{CACHE_MANIFEST_PATH.name} (saved {tb.mtime_iso(CACHE_MANIFEST_PATH)})',
+        ))
+    if not candidates:
+        return 0, None
+    return max(candidates)
+
+
+inventory = _scan_export_archive()
 print(f'Parsable predictor files found: {len(inventory)}')
+
+# --- Did the archive shrink since the last run? ---
+# The export folder is read-only and append-only here, so a smaller scan is never
+# routine. It has two causes that a file listing cannot tell apart: a Drive FUSE
+# mount serving a partial listing, or files that are actually gone. The first is
+# fixed by remounting; the second is dangerous precisely because it does NOT
+# fail -- the rolling 90-day windows are recomputed over whatever is present, so
+# missing dates silently change every statistic that depended on them, and any
+# sidecar already on Drive for an overlapping window stops matching its inputs.
+_n_prior, _prior_source = _archive_baseline()
+ARCHIVE_CHECK = tb.assess_archive_shrinkage(_live_file_count(inventory), _n_prior)
+if ARCHIVE_CHECK['verdict'] in (tb.ARCHIVE_SHRANK, tb.ARCHIVE_COLLAPSED):
+    print()
+    print('!!! Archive smaller than the last inventory:', ARCHIVE_CHECK['message'])
+    print(f'    baseline from {_prior_source}')
+    print('    Re-scanning after a force-remount, in case the mount served a partial')
+    print('    listing rather than the archive really having lost files...')
+    if _remount_for_recovery('re-scanning a shrunken export archive'):
+        inventory = _scan_export_archive()
+        ARCHIVE_CHECK = tb.assess_archive_shrinkage(_live_file_count(inventory), _n_prior)
+        print(f'    After remount: {ARCHIVE_CHECK[\"message\"]}')
+    else:
+        print('    Remount unavailable, so the shrunken listing cannot be re-tested.')
+
+if ARCHIVE_CHECK['verdict'] in (tb.ARCHIVE_SHRANK, tb.ARCHIVE_COLLAPSED):
+    detail = (
+        f'{ARCHIVE_CHECK[\"message\"]}\\n'
+        f'  archive        : {GEE_EXPORT_DIR}\\n'
+        f'  baseline       : {_prior_source}\\n'
+        'A remount did not bring the missing files back, so this is not a stale mount.\\n'
+        'Check, in this order:\\n'
+        '  1. Google Drive Trash — deleted exports are recoverable from there;\\n'
+        f'  2. EE_EXPORT_FOLDER ({EE_EXPORT_FOLDER!r}) against the real folder name, in\\n'
+        '     case the archive was renamed or moved rather than emptied;\\n'
+        '  3. whether the files were moved into subfolders — the scan is deliberately\\n'
+        '     non-recursive, matching the classifier\\'s discovery.\\n'
+    )
+    if ARCHIVE_SHRINK_POLICY == 'accept':
+        print()
+        print('!!! ARCHIVE_SHRINK_POLICY = \\'accept\\'; continuing anyway.')
+        print(detail)
+        print('Windows spanning the missing dates are now computed over fewer')
+        print('observations than the run that produced the earlier inventory.')
+    else:
+        raise RuntimeError(
+            'Phase 0 stopped: the export archive is missing files it had before.\\n'
+            + detail +
+            'Nothing has been written. If you pruned the archive deliberately, set\\n'
+            "ARCHIVE_SHRINK_POLICY = 'accept' in section 2 and re-run."
+        )
 
 if inventory.empty:
     raise RuntimeError(f'No parsable predictor GeoTIFFs in {GEE_EXPORT_DIR}. Check the path.')
@@ -807,12 +1049,24 @@ print(f'Prefixes with more than one file: {len(multi_file)}')
 # retried, because that is a mount problem, not a property of the data.
 SETTLED_KINDS = {'single', 'tiled', 'duplicate_grid', 'inconsistent'}
 prior = tb.load_manifest(RESOLUTION_CSV_PATH, RESOLUTION_COLUMNS)
+CURRENT_PREFIXES = {s.prefix for s in ALL_SNAPSHOTS}
 resolved = {}
 if len(prior):
     for _, row in prior.iterrows():
         if str(row['kind']) in SETTLED_KINDS:
             resolved[str(row['prefix'])] = row.to_dict()
-    print(f'Reusing {len(resolved)} prefix resolution(s) from {RESOLUTION_CSV_PATH.name}')
+    # Verdicts for prefixes that are no longer in the archive are KEPT in the CSV
+    # (they are still valid resume state if those files come back) but must never
+    # be reported as this run's findings. Conflating the two is how a run that
+    # scanned one file printed '814 prefixes are genuine tile shards' and wrote
+    # that into phase0_report.json as its own provenance.
+    stale_prefixes = [p for p in resolved if p not in CURRENT_PREFIXES]
+    print(f'Reusing {len(resolved) - len(stale_prefixes)} prefix resolution(s) from '
+          f'{RESOLUTION_CSV_PATH.name}')
+    if stale_prefixes:
+        print(f'  ({len(stale_prefixes)} further cached verdict(s) are for prefixes not in '
+              'the current archive scan; retained as resume state, excluded from this '
+              "run's report)")
 
 to_check = multi_file if PHASE0_MAX_CLASSIFY_PREFIXES is None else multi_file[:PHASE0_MAX_CLASSIFY_PREFIXES]
 pending = [s for s in to_check if s.prefix not in resolved]
@@ -849,16 +1103,23 @@ for i, snap in enumerate(pending, start=1):
             context='saving prefix resolution', probe_path=REPORT_DIR,
         )
 
-MULTI_FILE_VERDICTS = (
+# The CSV keeps every settled verdict (resume state); MULTI_FILE_VERDICTS holds
+# only the prefixes this run actually scanned, and is what gets displayed and
+# recorded in phase0_report.json.
+RESOLUTION_ALL = (
     pd.DataFrame(list(resolved.values()))[RESOLUTION_COLUMNS]
     if resolved else pd.DataFrame(columns=RESOLUTION_COLUMNS)
 )
-if len(MULTI_FILE_VERDICTS):
+if len(RESOLUTION_ALL):
     with_drive_retry(
-        tb.save_manifest, MULTI_FILE_VERDICTS, RESOLUTION_CSV_PATH,
+        tb.save_manifest, RESOLUTION_ALL, RESOLUTION_CSV_PATH,
         RESOLUTION_COLUMNS, readonly_dirs=READONLY_DIRS,
         context='saving prefix resolution', probe_path=REPORT_DIR,
     )
+MULTI_FILE_VERDICTS = (
+    RESOLUTION_ALL[RESOLUTION_ALL['prefix'].astype(str).isin(CURRENT_PREFIXES)]
+    .reset_index(drop=True) if len(RESOLUTION_ALL) else RESOLUTION_ALL
+)
 
 print()
 if MULTI_FILE_VERDICTS.empty:
@@ -1369,11 +1630,19 @@ else:
 md("""### 3d. Phase 0 verdict (blocking gate)
 
 Prints a clear verdict block per sensor with the numbers behind it, then writes
-`phase0_report.json`. The later phases refuse to run until this file exists **and was
-written by an earlier run**.
+`phase0_report.json`. The later phases refuse to run until that report exists and its
+verdict has been **acknowledged in section 3e** (or was written by an earlier run, which
+is the same thing one restart later).
 
 S1 will read `UNVALIDATED` on a first run. That status is carried through to the run
-manifest and the methods summary rather than dropped.""")
+manifest and the methods summary rather than dropped.
+
+The ddof for the bulk run is settled here from the per-sensor fits. When the sensors
+disagree the tie goes to whichever sensor's fit is most decisive, and when *nothing*
+could be validated this run, an empirical fit from an earlier validated run is carried
+forward rather than reset to the documented default — writing S1 bands under `ddof=1`
+into an output set built under `ddof=0` is a ~270x error in `vh_temporal_std_w90` that
+nothing downstream can detect.""")
 
 code("""def _fmt(value, spec='.6g'):
     if value is None:
@@ -1449,19 +1718,30 @@ for sensor in SENSORS:
         'figures': result['figures'],
     }
 
-# The ddof used for the bulk run: taken from whichever sensor was actually
-# validated. If none was, the documented default stands and says so.
-fitted = [v['ddof_choice'] for v in verdict_payload.values() if v['ddof_choice'] is not None]
-if fitted and len(set(fitted)) == 1:
-    SETTLED_DDOF = int(fitted[0])
-    ddof_note = f'fitted empirically against Earth Engine output (ddof={SETTLED_DDOF})'
-elif fitted:
-    SETTLED_DDOF = int(max(set(fitted), key=fitted.count))
-    ddof_note = f'sensors disagreed {fitted}; using the majority fit ddof={SETTLED_DDOF}'
-else:
-    SETTLED_DDOF = int(tb.TEMPORAL_DDOF)
-    ddof_note = (f'no sensor could be validated; keeping the documented default '
-                 f'ddof={SETTLED_DDOF} (ee.Reducer.stdDev is a sample std dev)')
+# The ddof used for the bulk run, settled from whichever sensors were actually
+# validated. tb.settle_ddof owns the three awkward cases: sensors that disagree
+# (the tie goes to the sensor whose fit is most decisive, never to set iteration
+# order), a run that could validate nothing (the previous run's empirical fit is
+# carried forward rather than silently reset to the default, so this run cannot
+# write bands under a different convention than the outputs already on Drive),
+# and a genuinely first run (documented default, stated as such).
+DDOF_FITS = [{
+    'sensor': sensor,
+    'ddof': payload['ddof_choice'],
+    'rmse_by_ddof': {
+        0: payload.get('aggregate', {}).get('ddof0', {}).get('rmse'),
+        1: payload.get('aggregate', {}).get('ddof1', {}).get('rmse'),
+    },
+} for sensor, payload in verdict_payload.items()]
+
+PREVIOUS_PHASE0 = load_phase0_report()
+_previous_ddof = None
+if PREVIOUS_PHASE0.get('settled_ddof') is not None and any(
+        v.get('status') == tb.VALIDATION_PASS
+        for v in PREVIOUS_PHASE0.get('verdicts', {}).values()):
+    _previous_ddof = int(PREVIOUS_PHASE0['settled_ddof'])
+
+SETTLED_DDOF, ddof_note = tb.settle_ddof(DDOF_FITS, previous_ddof=_previous_ddof)
 
 PHASE0_REPORT = {
     'session_id': SESSION_ID,
@@ -1495,10 +1775,30 @@ print('=' * 78)
 print('ddof for the bulk run:', SETTLED_DDOF, '-', ddof_note)
 print('Wrote Phase 0 report:', PHASE0_REPORT_PATH)
 print()
-print('PHASE 0 IS A BLOCKING GATE. Read the verdict above, then START A FRESH RUN')
-print('(restart the runtime, or re-run the setup cell in section 1) before running')
-print('Phase 1 and beyond. The bulk cells will refuse to run in this same session.')
+print('PHASE 0 IS A BLOCKING GATE. Read the verdict above, then run section 3e')
+print('(acknowledge_phase0()) to unlock phases 1+. Phases 1-3 refuse to run until')
+print('this verdict has been acknowledged.')
 print('=' * 78)""")
+
+# ---------------------------------------------------------------------------
+md("""### 3e. Acknowledge the verdict (unlocks phases 1+)
+
+The gate is here so that nobody backfills 610 GB of derived bands without having read
+what Phase 0 found. Running this cell records that you have read **this** verdict, and
+prints the summary it is recording so there is no doubt what was agreed to.
+
+The acknowledgement is keyed to the report's content. Re-run Phase 0 and it no longer
+applies — you will be sent back here to read the new verdict. A `FAIL` verdict cannot be
+acknowledged at all.
+
+> Earlier versions required a *different Python session* instead, which is not the same
+> thing and made the notebook impossible to finish in one pass: running the cells in
+> order always wrote the report in the current session, so Phase 1 refused every time
+> and the only way through was to re-run the section 1 setup cell so `uuid4()` would
+> return something new. Starting a fresh run still works, and is still what you want
+> after a restart, but it is no longer the only way through.""")
+
+code("""PHASE0 = acknowledge_phase0()""")
 
 # ---------------------------------------------------------------------------
 md("""## 4. Phase 1 — source-band cache
@@ -2052,6 +2352,46 @@ performs a recursive delete.
 Section 2 additionally verifies the mount *before* creating any output directory, so the
 poisoned-mountpoint state cannot be created by this notebook in the first place.
 
+### The Phase 0 gate, and how to get past it
+
+Phases 1-3 refuse to run until `phase0_report.json` exists, carries no `FAIL` verdict, and
+its verdict has been acknowledged — either by running section 3e in this session, or by
+having been written in an earlier one.
+
+**Run section 3e.** That is the whole answer. Earlier versions of this notebook demanded a
+*different Python session* instead, and the two are not the same property: running the
+cells in order always writes the report in the current session, so Phase 1 refused every
+single time, and the only way through was to re-run the heavy section 1 setup cell purely
+so `uuid4()` would hand back a different `SESSION_ID`. Nobody had to read anything for
+that to work and the error message never said it was what the gate wanted, so the notebook
+read as simply broken from section 4 onwards. It was.
+
+The acknowledgement is keyed to a digest of the report's content, so it covers one
+specific verdict: re-run Phase 0 and it lapses, and you are sent back to read the new one.
+A `FAIL` verdict cannot be acknowledged at all — that is the reconstruction disagreeing
+with Earth Engine on dates where both values exist, which is the one thing this gate is
+really for.
+
+### The archive-shrinkage guard
+
+Section 3 compares each scan of `GEE_Exports_validated_snapshots` against the largest file
+count any earlier run recorded, and stops Phase 0 if files have gone missing. This matters
+because a shrunken archive does not fail anything: the rolling 90-day windows are simply
+recomputed over whatever is present, so missing dates silently change every statistic that
+depended on them, and sidecars already on Drive for overlapping windows stop matching
+their own inputs.
+
+A smaller listing has two causes that a file listing cannot tell apart — a Drive FUSE mount
+serving a partial listing, or files that are genuinely gone — so the scan is retried after a
+force-remount before anything is reported. Only a shortfall that survives the remount stops
+the run, pointing at Drive's Trash, `EE_EXPORT_FOLDER` and the non-recursive scan, in that
+order. `ARCHIVE_SHRINK_POLICY = 'accept'` is there for an archive you pruned on purpose.
+
+The baseline comes from the cache manifest as well as the saved inventory CSV, and the
+larger wins, because the inventory CSV is rewritten wholesale by every Phase 0 run: one
+scan of a truncated archive overwrites the only record that it was ever bigger. That is not
+hypothetical either — the 2026-07-27 run did exactly that before this guard existed.
+
 ### Known issues preserved faithfully, not fixed
 
 Earth Engine's behaviour is reproduced exactly even where it is questionable; consistency
@@ -2103,10 +2443,19 @@ Engine output for whichever sensors have reference exports.
 
 `tests/test_temporal_backfill.py` covers window membership (including the boundary at
 exactly −90 days and inclusion of the target's own date), NoData handling, min-obs-3 masking
-at counts of 2/3/4, ddof against a hand-computed fixture, the S1 CV rules and near-zero-mean
-policy, grid-mismatch detection, Drive collision duplicates and tiled shards, and
-cross-sensor contamination. Run with `pytest tests/test_temporal_backfill.py`. No Drive, no
-network.
+at counts of 2/3/4, ddof against a hand-computed fixture, how the per-sensor ddof fits are
+settled into one value, the S1 CV rules and near-zero-mean policy, grid-mismatch detection,
+Drive collision duplicates and tiled shards, and cross-sensor contamination.
+
+`tests/test_backfill_notebook_gate.py` covers the two blocking checks that live in the
+notebook's own cells rather than in the module — the Phase 0 acknowledgement gate and the
+archive-shrinkage guard — by `exec`-ing those cells straight out of this notebook, so they
+cannot drift from what you are running. It also parses every code cell, which is the only
+thing standing between a quoting slip in `build_backfill_nb.py` and a `SyntaxError` on your
+first run.
+
+Run both with `pytest tests/test_temporal_backfill.py tests/test_backfill_notebook_gate.py`.
+No Drive, no Colab, no network.
 """)
 
 # The capability guard in section 1 has to list exactly what the notebook calls,

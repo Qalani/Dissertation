@@ -12,6 +12,7 @@ import datetime as dt
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 rasterio = pytest.importorskip("rasterio")
@@ -863,3 +864,178 @@ def test_import_pulls_in_no_earth_engine():
     import sys
     banned = [m for m in sys.modules if m == "ee" or m.startswith("ee.")]
     assert not banned, f"temporal_backfill import leaked Earth Engine modules: {banned}"
+
+
+# ---------------------------------------------------------------------------
+# Settling the ddof for the bulk run.
+# ---------------------------------------------------------------------------
+
+def test_settle_ddof_agreeing_sensors():
+    ddof, note = tb.settle_ddof([
+        {"sensor": "S1", "ddof": 0},
+        {"sensor": "S2", "ddof": 0},
+    ])
+    assert ddof == 0
+    assert "S1, S2" in note
+
+
+def test_settle_ddof_majority_wins():
+    ddof, note = tb.settle_ddof([
+        {"sensor": "S1", "ddof": 0},
+        {"sensor": "S2", "ddof": 0},
+        {"sensor": "S3", "ddof": 1},
+    ])
+    assert ddof == 0
+    assert "majority" in note
+
+
+def test_settle_ddof_tie_goes_to_the_most_decisive_fit():
+    """The real 2026-07-25 numbers: S1's fit differs by 270x between the two
+    conventions, S2's by 0.16%. S1 must decide, and the old
+    max(set(...), key=count) tie-break decided on set iteration order instead."""
+    ddof, note = tb.settle_ddof([
+        {"sensor": "S2", "ddof": 1, "rmse_by_ddof": {0: 0.012785, 1: 0.012764}},
+        {"sensor": "S1", "ddof": 0, "rmse_by_ddof": {0: 0.000260761, 1: 0.0703581}},
+    ])
+    assert ddof == 0
+    assert "S1" in note and "decisive" in note
+
+
+def test_settle_ddof_tie_is_deterministic_whatever_the_input_order():
+    fits = [
+        {"sensor": "S2", "ddof": 1, "rmse_by_ddof": {0: 0.012785, 1: 0.012764}},
+        {"sensor": "S1", "ddof": 0, "rmse_by_ddof": {0: 0.000260761, 1: 0.0703581}},
+    ]
+    assert tb.settle_ddof(fits)[0] == tb.settle_ddof(list(reversed(fits)))[0]
+
+
+def test_settle_ddof_tie_with_no_usable_fit_quality_says_so():
+    ddof, note = tb.settle_ddof([
+        {"sensor": "S1", "ddof": 0},
+        {"sensor": "S2", "ddof": 1},
+    ])
+    assert ddof == 0
+    assert "could not be settled" in note
+
+
+def test_settle_ddof_carries_a_previous_fit_forward_when_nothing_validates():
+    """A run that can validate nothing must not silently flip the convention: the
+    outputs already on Drive were written under the earlier fit, and mixing
+    ddof=0 and ddof=1 vh_temporal_std_w90 values is undetectable downstream."""
+    ddof, note = tb.settle_ddof([], previous_ddof=0)
+    assert ddof == 0
+    assert "carrying forward" in note
+
+
+def test_settle_ddof_falls_back_to_the_documented_default_on_a_first_run():
+    ddof, note = tb.settle_ddof([], previous_ddof=None)
+    assert ddof == tb.TEMPORAL_DDOF
+    assert "documented default" in note
+
+
+def test_settle_ddof_ignores_sensors_without_a_fit():
+    ddof, _ = tb.settle_ddof([{"sensor": "S1", "ddof": None}, {"sensor": "S2", "ddof": 1}])
+    assert ddof == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 report digest: what an acknowledgement is keyed to.
+# ---------------------------------------------------------------------------
+
+def test_digest_ignores_the_session_that_wrote_the_report():
+    base = {"recorded_at": "2026-07-27T12:00:00+00:00", "settled_ddof": 0, "verdicts": {}}
+    assert (tb.phase0_report_digest({**base, "session_id": "a"})
+            == tb.phase0_report_digest({**base, "session_id": "b"}))
+
+
+def test_digest_is_key_order_independent():
+    a = {"recorded_at": "t", "settled_ddof": 0, "verdicts": {"S1": {"status": "PASS"}}}
+    b = {"verdicts": {"S1": {"status": "PASS"}}, "settled_ddof": 0, "recorded_at": "t"}
+    assert tb.phase0_report_digest(a) == tb.phase0_report_digest(b)
+
+
+@pytest.mark.parametrize("change", [
+    {"settled_ddof": 1},
+    {"recorded_at": "2026-07-28T09:00:00+00:00"},
+    {"verdicts": {"S1": {"status": "UNVALIDATED"}}},
+    {"n_files_discovered": 1},
+])
+def test_digest_changes_when_the_verdict_changes(change):
+    base = {
+        "session_id": "same",
+        "recorded_at": "2026-07-27T12:00:00+00:00",
+        "settled_ddof": 0,
+        "n_files_discovered": 3121,
+        "verdicts": {"S1": {"status": "PASS"}},
+    }
+    assert tb.phase0_report_digest(base) != tb.phase0_report_digest({**base, **change})
+
+
+def test_digest_survives_values_json_cannot_serialise():
+    """Reports carry numpy scalars and Paths; the digest must not raise on them."""
+    report = {"recorded_at": Path("/x"), "settled_ddof": np.int64(0)}
+    assert tb.phase0_report_digest(report)
+
+
+# ---------------------------------------------------------------------------
+# Archive-shrinkage guard.
+# ---------------------------------------------------------------------------
+
+def test_archive_intact_when_nothing_is_missing():
+    assert tb.assess_archive_shrinkage(3121, 3121)["verdict"] == tb.ARCHIVE_INTACT
+
+
+def test_archive_intact_when_it_grew():
+    result = tb.assess_archive_shrinkage(3200, 3121)
+    assert result["verdict"] == tb.ARCHIVE_INTACT
+    assert "79 more" in result["message"]
+
+
+def test_archive_with_no_baseline_is_not_an_error():
+    assert tb.assess_archive_shrinkage(1, 0)["verdict"] == tb.ARCHIVE_NO_BASELINE
+
+
+def test_archive_collapse_is_detected():
+    """The 2026-07-27 run: 3121 files recorded, 1 file found, and it proceeded to
+    report every sensor UNVALIDATED with nothing to backfill."""
+    result = tb.assess_archive_shrinkage(1, 3121)
+    assert result["verdict"] == tb.ARCHIVE_COLLAPSED
+    assert result["n_missing"] == 3120
+    assert "3121" in result["message"]
+
+
+def test_small_shrink_is_flagged_separately_from_a_collapse():
+    result = tb.assess_archive_shrinkage(3100, 3121)
+    assert result["verdict"] == tb.ARCHIVE_SHRANK
+    assert result["n_missing"] == 21
+
+
+def test_shrink_threshold_is_configurable():
+    assert tb.assess_archive_shrinkage(50, 100, collapse_ratio=0.4)["verdict"] == tb.ARCHIVE_SHRANK
+    assert tb.assess_archive_shrinkage(50, 100, collapse_ratio=0.6)["verdict"] == tb.ARCHIVE_COLLAPSED
+
+
+def test_cached_source_file_count_is_distinct_across_tiled_shards():
+    frame = pd.DataFrame([
+        {"status": "cached", "source_paths": "/d/a-0-0.tif;/d/a-0-8.tif"},
+        {"status": "cached", "source_paths": "/d/b.tif"},
+        # A re-cached prefix repeats its sources; they must not be double-counted.
+        {"status": "cached", "source_paths": "/d/b.tif"},
+        {"status": "failed", "source_paths": "/d/c.tif"},
+    ])
+    assert tb.count_cached_source_files(frame) == 3
+
+
+def test_cached_source_file_count_tolerates_an_empty_or_absent_manifest():
+    assert tb.count_cached_source_files(None) == 0
+    assert tb.count_cached_source_files(pd.DataFrame()) == 0
+    assert tb.count_cached_source_files(
+        tb.empty_manifest(tb.CACHE_MANIFEST_COLUMNS)) == 0
+
+
+def test_mtime_iso_reads_a_real_file_and_tolerates_a_missing_one(tmp_path):
+    path = tmp_path / "f.csv"
+    path.write_text("x")
+    stamp = tb.mtime_iso(path)
+    assert stamp and stamp.endswith("+00:00")
+    assert tb.mtime_iso(tmp_path / "gone.csv") is None

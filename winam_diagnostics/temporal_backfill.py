@@ -49,6 +49,8 @@ The AOI metric CRS is **EPSG:32736 (UTM 36S)** - Lake Victoria, not the UK.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
+import json
 import math
 import os
 import re
@@ -1735,6 +1737,19 @@ def utc_now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
+def mtime_iso(path) -> str | None:
+    """A file's modification time in the same shape as :func:`utc_now_iso`.
+
+    ``None`` when the file is gone or unreadable, so it can be printed in a
+    diagnostic message without the message itself becoming the failure.
+    """
+    try:
+        stamp = Path(path).stat().st_mtime
+    except OSError:
+        return None
+    return _dt.datetime.fromtimestamp(stamp, _dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
 def empty_manifest(columns: Sequence[str]) -> pd.DataFrame:
     return pd.DataFrame(columns=list(columns))
 
@@ -1917,3 +1932,228 @@ def choose_ddof(ddof0: Mapping, ddof1: Mapping) -> tuple[int, str]:
     if score1 <= score0:
         return 1, f"ddof=1 fits better (RMSE {score1:.6g} vs {score0:.6g} for ddof=0)"
     return 0, f"ddof=0 fits better (RMSE {score0:.6g} vs {score1:.6g} for ddof=1)"
+
+
+def _relative_fit_gap(rmse_by_ddof: Mapping | None) -> float:
+    """How decisive one sensor's ddof fit is: |r0 - r1| / min(r0, r1).
+
+    Returns ``0.0`` when the two conventions are indistinguishable or the RMSEs
+    are unusable, so an uninformative sensor never wins a tie-break.
+    """
+    if not rmse_by_ddof:
+        return 0.0
+    try:
+        r0 = float(rmse_by_ddof.get(0, rmse_by_ddof.get("0", np.nan)))
+        r1 = float(rmse_by_ddof.get(1, rmse_by_ddof.get("1", np.nan)))
+    except (TypeError, ValueError):
+        return 0.0
+    if not (np.isfinite(r0) and np.isfinite(r1)):
+        return 0.0
+    floor = min(abs(r0), abs(r1))
+    if floor <= 0.0:
+        return 0.0 if r0 == r1 else float("inf")
+    return abs(r0 - r1) / floor
+
+
+def settle_ddof(
+    fits: Sequence[Mapping],
+    previous_ddof: int | None = None,
+    default_ddof: int = TEMPORAL_DDOF,
+) -> tuple[int, str]:
+    """Collapse the per-sensor ddof fits into the single ddof the bulk run uses.
+
+    ``fits`` holds one mapping per sensor that could be validated, with keys
+    ``sensor``, ``ddof`` and (optionally) ``rmse_by_ddof`` -- a ``{0: rmse,
+    1: rmse}`` mapping used only to break a tie.
+
+    Three things this deliberately does not do:
+
+    * **Never picks arbitrarily.** The previous implementation resolved a tie
+      with ``max(set(fitted), key=fitted.count)``, whose answer depends on set
+      iteration order -- a silent, order-dependent choice of a parameter that
+      changes the published numbers. A tie is instead settled by the sensor
+      whose fit is most decisive (largest relative RMSE gap between the two
+      conventions), because the sensor where ddof barely matters should not
+      outvote the sensor where it matters by orders of magnitude.
+    * **Never silently resets a fitted value.** When no sensor can be validated
+      in this run but an earlier run fitted a ddof empirically, that fit is
+      carried forward. Resetting to ``default_ddof`` instead would write bands
+      under one convention into an output set built under the other, which is
+      exactly the mix nothing downstream can detect.
+    * **Never hides which of these happened.** The returned note is recorded in
+      ``phase0_report.json`` and travels into every run-manifest row.
+    """
+    rows = [dict(f) for f in fits if f is not None and f.get("ddof") is not None]
+    if not rows:
+        if previous_ddof is not None:
+            return int(previous_ddof), (
+                f"no sensor could be validated in this run; carrying forward "
+                f"ddof={int(previous_ddof)} fitted by an earlier validated run, so this "
+                "run cannot write bands under a different convention than the outputs "
+                "already on Drive"
+            )
+        return int(default_ddof), (
+            f"no sensor could be validated and no earlier run fitted one; keeping the "
+            f"documented default ddof={int(default_ddof)} (ee.Reducer.stdDev is a sample "
+            "std dev)"
+        )
+
+    votes: dict[int, list[str]] = {}
+    for row in rows:
+        votes.setdefault(int(row["ddof"]), []).append(str(row.get("sensor", "?")))
+
+    if len(votes) == 1:
+        settled = next(iter(votes))
+        return settled, (
+            f"fitted empirically against Earth Engine output (ddof={settled}, "
+            f"agreed by {', '.join(sorted(votes[settled]))})"
+        )
+
+    tally = {ddof: len(sensors) for ddof, sensors in votes.items()}
+    best = max(tally.values())
+    leaders = sorted(d for d, n in tally.items() if n == best)
+    summary = ', '.join(f'{d}:{"/".join(sorted(votes[d]))}' for d in sorted(votes))
+
+    if len(leaders) == 1:
+        settled = leaders[0]
+        return settled, (
+            f"sensors disagreed ({summary}); using the majority fit ddof={settled}"
+        )
+
+    # Tie. Let the sensor whose fit is most decisive decide, and say so.
+    ranked = sorted(
+        rows,
+        key=lambda row: (_relative_fit_gap(row.get("rmse_by_ddof")), str(row.get("sensor", ""))),
+        reverse=True,
+    )
+    decisive = ranked[0]
+    gap = _relative_fit_gap(decisive.get("rmse_by_ddof"))
+    settled = int(decisive["ddof"])
+    if gap <= 0.0:
+        settled = min(leaders)
+        return settled, (
+            f"sensors disagreed ({summary}) and no fit distinguishes the two "
+            f"conventions; using ddof={settled} and recording that the tie could not "
+            "be settled on fit quality"
+        )
+    return settled, (
+        f"sensors disagreed ({summary}); tie settled by {decisive.get('sensor', '?')}, "
+        f"whose fit is the most decisive (RMSE differs by {gap:.3g}x between the two "
+        f"conventions), giving ddof={settled}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 0: the blocking gate.
+#
+# Phase 0 is only a gate if a human has actually read its verdict. The original
+# implementation approximated 'a human read it' with 'the report was written by a
+# different Python session', which is not the same property and is what made the
+# notebook impossible to finish: running the cells in order always writes the
+# report in the current session, so Phase 1 refused every time and the only
+# escape was to re-run the heavy setup cell purely to churn a UUID. The digest
+# below lets the operator acknowledge one specific verdict instead, and
+# invalidates that acknowledgement the moment Phase 0 is re-run.
+# ---------------------------------------------------------------------------
+
+#: Keys excluded from :func:`phase0_report_digest`. ``session_id`` identifies the
+#: run, not the verdict, and the acknowledgement bookkeeping must not feed back
+#: into the digest it is keyed by.
+PHASE0_DIGEST_EXCLUDED_KEYS = frozenset({"session_id", "acknowledged_digest"})
+
+
+def phase0_report_digest(report: Mapping) -> str:
+    """Stable digest of a Phase 0 report's decision-relevant content.
+
+    Two reports share a digest exactly when they say the same thing about what
+    was found and what the bulk phases should do -- including ``recorded_at``, so
+    re-running Phase 0 always produces a new digest and invalidates any
+    acknowledgement of the old one.
+    """
+    payload = {
+        key: value
+        for key, value in dict(report).items()
+        if key not in PHASE0_DIGEST_EXCLUDED_KEYS
+    }
+    canonical = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def count_cached_source_files(frame: pd.DataFrame | None, status: str = "cached") -> int:
+    """Distinct source files recorded by a cache manifest.
+
+    Used as a baseline for :func:`assess_archive_shrinkage`. The cache manifest is
+    the more durable of the two available baselines: the saved inventory CSV is
+    rewritten wholesale by every Phase 0 run -- so one scan of a truncated archive
+    destroys the evidence that the archive was ever bigger -- whereas the cache
+    manifest is only ever upserted row by row.
+    """
+    if frame is None or len(frame) == 0 or "source_paths" not in frame.columns:
+        return 0
+    rows = frame
+    if status is not None and "status" in frame.columns:
+        rows = frame[frame["status"].astype(str) == status]
+    paths: set[str] = set()
+    for value in rows["source_paths"].dropna():
+        paths.update(part for part in str(value).split(";") if part)
+    return len(paths)
+
+
+#: Verdicts from :func:`assess_archive_shrinkage`.
+ARCHIVE_NO_BASELINE = "no_baseline"
+ARCHIVE_INTACT = "intact"
+ARCHIVE_SHRANK = "shrank"
+ARCHIVE_COLLAPSED = "collapsed"
+
+
+def assess_archive_shrinkage(n_now: int, n_prior: int, collapse_ratio: float = 0.9) -> dict:
+    """Compare a fresh export-archive scan against the last recorded inventory.
+
+    The export archive is read-only and append-only by design, so a scan that
+    sees fewer files than the previous one is never routine. It has two very
+    different causes -- a Drive FUSE mount serving a partial listing, or files
+    that are actually gone -- and the second one is dangerous in a way that is
+    invisible downstream: the rolling 90-day windows are recomputed over
+    whatever is present, so missing dates do not fail, they quietly change every
+    statistic that depended on them.
+
+    Returns a verdict dict; the caller decides whether to remount and rescan
+    (``shrank``/``collapsed`` can both be a stale mount) or to stop.
+    """
+    n_now, n_prior = int(n_now), int(n_prior)
+    if n_prior <= 0:
+        return {
+            "verdict": ARCHIVE_NO_BASELINE,
+            "n_now": n_now,
+            "n_prior": n_prior,
+            "n_missing": 0,
+            "ratio": None,
+            "message": "no earlier inventory to compare against (first run here)",
+        }
+    ratio = n_now / n_prior
+    missing = max(n_prior - n_now, 0)
+    if n_now >= n_prior:
+        grew = n_now - n_prior
+        return {
+            "verdict": ARCHIVE_INTACT,
+            "n_now": n_now,
+            "n_prior": n_prior,
+            "n_missing": 0,
+            "ratio": ratio,
+            "message": (
+                f"{n_now} file(s) found, {grew} more than the {n_prior} recorded earlier"
+                if grew else f"{n_now} file(s) found, matching the earlier inventory"
+            ),
+        }
+    verdict = ARCHIVE_SHRANK if ratio >= collapse_ratio else ARCHIVE_COLLAPSED
+    return {
+        "verdict": verdict,
+        "n_now": n_now,
+        "n_prior": n_prior,
+        "n_missing": missing,
+        "ratio": ratio,
+        "message": (
+            f"{n_now} file(s) found, but an earlier inventory recorded {n_prior} "
+            f"-- {missing} missing ({1 - ratio:.1%} of the archive)"
+        ),
+    }
