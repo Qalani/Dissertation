@@ -651,12 +651,49 @@ def _upsert_run_record(record):
     )
 
 
+def _dir_state(path):
+    '''(exists, entry count) for a Drive folder, tolerant of a dead mount.'''
+    try:
+        target = Path(path)
+        if not target.is_dir():
+            return False, 0
+        return True, sum(1 for _ in target.iterdir())
+    except OSError:
+        return False, 0
+
+
 def require_phase0(phase_label):
     '''Refuse to run bulk work until Phase 0 has completed in an earlier run.'''
     if not PHASE0_REPORT_PATH.exists():
+        # The report lives on Drive, so a missing file means either Phase 0 was
+        # never run here or the folder was lost. Those want different responses,
+        # and the sibling outputs tell them apart -- so report them rather than
+        # asserting 'has not been run' and sending someone to restart a runtime
+        # that was never the problem.
+        state = {label: _dir_state(path) for label, path in (
+            ('source band cache', CACHE_DIR),
+            ('sidecars', SIDECAR_DIR),
+            ('VRTs', VRT_DIR),
+            ('reports', REPORT_DIR),
+        )}
+        inventory = '\\n'.join(
+            f'    {label:18s}: ' + (f'{n} entr(y/ies)' if exists else 'missing')
+            for label, (exists, n) in state.items()
+        )
+        if any(n for _exists, n in state.values()):
+            hint = ('Other backfill outputs ARE present, so this looks like a lost or '
+                    'partly restored reports folder rather than a first run. Check '
+                    'Drive\\'s Trash before re-running anything.')
+        else:
+            hint = 'No backfill outputs are present at all, consistent with a first run.'
         raise RuntimeError(
-            f'{phase_label} is blocked: Phase 0 has not been run.\\n'
-            f'Run sections 3-3d to completion first; they write {PHASE0_REPORT_PATH}.'
+            f'{phase_label} is blocked: {PHASE0_REPORT_PATH} does not exist.\\n'
+            f'{hint}\\n'
+            f'  under {BACKFILL_ROOT}:\\n{inventory}\\n'
+            'Restarting the runtime will not change this -- the gate is a file on '
+            'Drive, not session state. Phase 0 is cheap to repeat (it makes no Earth '
+            'Engine calls): run sections 3-3d to completion, then start a fresh run '
+            'before the bulk phases.'
         )
     report = json.loads(PHASE0_REPORT_PATH.read_text())
     if report.get('session_id') == SESSION_ID:
