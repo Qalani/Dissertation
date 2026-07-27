@@ -133,6 +133,10 @@ __all__ = [
     "is_transport_endpoint_error",
     "looks_like_stale_mount",
     "DRIVE_MOUNT_PREFIX",
+    "UnsafeRemovalError",
+    "is_live_mount",
+    "assert_safe_to_remove",
+    "remove_stray_mount_dirs",
     "disk_headroom_bytes",
     "human_bytes",
 ]
@@ -215,6 +219,10 @@ class GridMismatchError(BackfillError):
 
 class ReadOnlyPathError(BackfillError):
     """A write was attempted inside a directory declared read-only."""
+
+
+class UnsafeRemovalError(BackfillError):
+    """A recursive delete was attempted on a path that may hold real Drive data."""
 
 
 @dataclass(frozen=True)
@@ -1015,6 +1023,103 @@ def assert_not_in_readonly_dir(path, readonly_dirs: Sequence[Path]) -> Path:
 # ---------------------------------------------------------------------------
 
 DRIVE_MOUNT_PREFIX = "/content/drive"
+
+
+# ---------------------------------------------------------------------------
+# Deletion safety.
+#
+# A failed mount leaves ordinary local directories sitting where the Drive mount
+# belongs, and clearing them is a legitimate repair. The obvious command for that
+# repair -- rm -rf /content/drive -- is also the single most destructive thing
+# anyone can run on this project, because when the mount IS live it deletes
+# straight through FUSE into real Drive data. Both states look identical to `ls`.
+#
+# That has already happened once here, so the distinction is enforced in code
+# rather than left to whoever is reading the instructions at the time. No caller
+# in this repo may delete a Drive path recursively without going through
+# assert_safe_to_remove first.
+# ---------------------------------------------------------------------------
+
+
+def is_live_mount(path, ismount=None) -> bool:
+    """True when ``path`` is itself a live mount point.
+
+    ``ismount`` is injectable for tests; it defaults to :func:`os.path.ismount`.
+    A path that cannot be probed is reported as mounted, because the safe answer
+    under uncertainty is the one that refuses to delete.
+    """
+    probe = ismount if ismount is not None else os.path.ismount
+    try:
+        return bool(probe(str(path)))
+    except OSError:
+        return True
+
+
+def assert_safe_to_remove(
+    path,
+    mount_prefix: str = DRIVE_MOUNT_PREFIX,
+    ismount=None,
+) -> Path:
+    """Raise :class:`UnsafeRemovalError` unless ``path`` is safe to delete recursively.
+
+    The rule is narrow on purpose. Deleting inside ``mount_prefix`` is permitted
+    only while nothing is actually mounted there, which is exactly the stray
+    local directories left behind by a failed mount. As soon as the mount is
+    live, every path at or under it is real Drive data and is refused.
+
+    Returns the resolved path so callers can use it directly.
+    """
+    target = Path(path).expanduser()
+    try:
+        resolved = target.resolve()
+    except OSError:  # pragma: no cover - unresolvable path
+        resolved = target.absolute()
+
+    prefix = Path(mount_prefix).expanduser()
+    try:
+        prefix_resolved = prefix.resolve()
+    except OSError:  # pragma: no cover
+        prefix_resolved = prefix.absolute()
+
+    inside_prefix = (
+        resolved == prefix_resolved or prefix_resolved in resolved.parents
+    )
+
+    if is_live_mount(resolved, ismount=ismount):
+        raise UnsafeRemovalError(
+            f"Refusing to delete {resolved}: it is a live mount point.\n"
+            "Deleting it would follow the mount into the real filesystem behind "
+            "it. Unmount first (drive.flush_and_unmount()) if you truly mean to."
+        )
+
+    if inside_prefix and is_live_mount(prefix_resolved, ismount=ismount):
+        raise UnsafeRemovalError(
+            f"Refusing to delete {resolved}: it sits under the live Drive mount at "
+            f"{prefix_resolved}, so it is real Drive data, not local scratch.\n"
+            "If you meant to clear stray directories left by a failed mount, do it "
+            "while Drive is NOT mounted."
+        )
+
+    return resolved
+
+
+def remove_stray_mount_dirs(
+    mount_prefix: str = DRIVE_MOUNT_PREFIX,
+    ismount=None,
+    rmtree=None,
+) -> bool:
+    """Clear the mount point when it holds only local directories, not a mount.
+
+    This is the supported repair for "Mountpoint must not already contain files",
+    and it is the reason no one should ever type a recursive delete against a
+    Drive path by hand. Returns True when something was removed.
+    """
+    prefix = Path(mount_prefix).expanduser()
+    if not prefix.exists():
+        return False
+    assert_safe_to_remove(prefix, mount_prefix=mount_prefix, ismount=ismount)
+    (rmtree if rmtree is not None else shutil.rmtree)(str(prefix))
+    return True
 
 
 def is_transport_endpoint_error(exc: BaseException) -> bool:
