@@ -53,8 +53,9 @@
       <div class="preview-toolbar">
         <span class="preview-label">Preview</span>
         <span class="flex-spacer"></span>
+        <button id="btn-zoom-fit" title="Scale the diagram to fit the pane">Fit</button>
         <button id="btn-zoom-out" class="icon-btn" title="Zoom out">−</button>
-        <button id="btn-zoom-reset" class="zoom-reset" title="Reset zoom">100%</button>
+        <button id="btn-zoom-reset" class="zoom-reset" title="Reset to actual size">100%</button>
         <button id="btn-zoom-in" class="icon-btn" title="Zoom in">+</button>
       </div>
       <div id="error-bar" hidden></div>
@@ -74,6 +75,7 @@
 </footer>
 
 <script src="vendor/mermaid.min.js"></script>
+<script src="library.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -6,7 +6,13 @@
 
   var STORE_KEY = "mermaidEditor.diagrams.v1";
   var DRAFT_KEY = "mermaidEditor.draft.v1";
+  var SEEDED_KEY = "mermaidEditor.seeded.v1";
   var PNG_SCALE = 2;
+
+  // Built-in diagrams generated from methodology-flowcharts.md (library.js).
+  // Seeded into the saved list on first run and always available from the
+  // Examples menu, so they can be restored after a delete.
+  var LIBRARY = window.MERMAID_EDITOR_LIBRARY || [];
 
   // ---------- DOM ----------
   var $ = function (id) { return document.getElementById(id); };
@@ -114,6 +120,7 @@
   var savedSnapshot = null;  // {name, code} as of last save/load, for dirty checking
   var renderSeq = 0;
   var zoom = 1;
+  var pendingFit = false;  // fit the next render to the pane (set on open, not on keystrokes)
 
   // ---------- mermaid setup ----------
   var darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -132,6 +139,37 @@
   }
 
   // ---------- rendering ----------
+  // Mermaid emits width:100% + max-width, which squeezes a large diagram into
+  // the pane and makes the zoom percentage meaningless. Pin the SVG to its
+  // real dimensions instead and let the zoom transform do all the scaling.
+  function svgSize(svg) {
+    var vb = svg.viewBox && svg.viewBox.baseVal;
+    if (vb && vb.width && vb.height) return { w: vb.width, h: vb.height };
+    var box = svg.getBoundingClientRect();
+    return { w: box.width || 800, h: box.height || 600 };
+  }
+
+  function sizeNaturally(svg) {
+    var size = svgSize(svg);
+    svg.setAttribute("width", Math.ceil(size.w));
+    svg.setAttribute("height", Math.ceil(size.h));
+    svg.style.maxWidth = "none";
+    svg.style.width = Math.ceil(size.w) + "px";
+    svg.style.height = Math.ceil(size.h) + "px";
+  }
+
+  // Largest zoom that shows the whole diagram, never magnifying past 100%.
+  function fitZoom() {
+    var svg = previewEl.querySelector("svg");
+    if (!svg) return 1;
+    var size = svgSize(svg);
+    var pad = 72; // scroll padding plus the SVG's own frame
+    var availW = previewScrollEl.clientWidth - pad;
+    var availH = previewScrollEl.clientHeight - pad;
+    if (availW <= 0 || availH <= 0) return 1;
+    return Math.min(1, availW / size.w, availH / size.h);
+  }
+
   function showError(message) {
     errorBar.textContent = message;
     errorBar.hidden = false;
@@ -157,6 +195,12 @@
       .then(function (result) {
         if (seq !== renderSeq) return; // a newer render superseded this one
         previewEl.innerHTML = result.svg;
+        var svg = previewEl.querySelector("svg");
+        if (svg) sizeNaturally(svg);
+        if (pendingFit) {
+          pendingFit = false;
+          setZoom(fitZoom());
+        }
         hideError();
       })
       .catch(function (err) {
@@ -298,6 +342,7 @@
     saveDraft();
     refreshStatus();
     renderSidebar();
+    pendingFit = true;   // a freshly opened diagram should arrive fully visible
     render();
   }
 
@@ -345,6 +390,32 @@
     }
     refreshStatus();
     renderSidebar();
+  }
+
+  // Load the built-in methodology diagrams into the saved list. Runs once per
+  // browser: a diagram deleted afterwards stays deleted, and re-opening the
+  // editor never resurrects it or creates duplicates. The Examples menu keeps
+  // a pristine copy of each for restoring one by hand.
+  function seedLibrary() {
+    if (!LIBRARY.length || storage.get(SEEDED_KEY)) return;
+
+    var list = loadStore();
+    var existing = Object.create(null);
+    list.forEach(function (d) { existing[d.name] = true; });
+
+    // The sidebar sorts newest first, so give diagram 1 the latest timestamp
+    // and count downwards. That lists them 1..13 in document order and makes
+    // diagram 1 the one the editor opens on a first visit.
+    var base = Date.now() - LIBRARY.length;
+    LIBRARY.forEach(function (item, i) {
+      if (existing[item.name]) return;
+      var when = base + (LIBRARY.length - i);
+      list.push({ id: newId(), name: item.name, code: item.code, createdAt: when, updatedAt: when });
+    });
+
+    if (persistStore(list)) {
+      try { storage.set(SEEDED_KEY, "1"); } catch (e) { /* best effort */ }
+    }
   }
 
   function newDiagram() {
@@ -490,6 +561,7 @@
     $("sidebar").classList.toggle("hidden");
   });
 
+  $("btn-zoom-fit").addEventListener("click", function () { setZoom(fitZoom()); });
   $("btn-zoom-in").addEventListener("click", function () { setZoom(zoom * 1.2); });
   $("btn-zoom-out").addEventListener("click", function () { setZoom(zoom / 1.2); });
   zoomResetBtn.addEventListener("click", function () { setZoom(1); });
@@ -500,7 +572,9 @@
   }, { passive: false });
 
   examplesSel.addEventListener("change", function () {
-    var ex = EXAMPLES[Number(examplesSel.value)];
+    var parts = String(examplesSel.value).split(":");
+    var source = parts[0] === "lib" ? LIBRARY : EXAMPLES;
+    var ex = source[Number(parts[1])];
     examplesSel.selectedIndex = 0;
     if (!ex) return;
     if (!confirmDiscard()) return;
@@ -556,12 +630,22 @@
     }
     initMermaid();
 
-    EXAMPLES.forEach(function (ex, i) {
-      var opt = document.createElement("option");
-      opt.value = String(i);
-      opt.textContent = ex.name;
-      examplesSel.appendChild(opt);
-    });
+    function addOptions(label, items, prefix) {
+      if (!items.length) return;
+      var group = document.createElement("optgroup");
+      group.label = label;
+      items.forEach(function (ex, i) {
+        var opt = document.createElement("option");
+        opt.value = prefix + ":" + i;
+        opt.textContent = ex.name;
+        group.appendChild(opt);
+      });
+      examplesSel.appendChild(group);
+    }
+    addOptions("Methodology flowcharts", LIBRARY, "lib");
+    addOptions("Mermaid basics", EXAMPLES, "ex");
+
+    seedLibrary();
 
     if (!storage.persistent) {
       showError("This browser is blocking site storage, so saved diagrams will disappear when you close the tab. " +
@@ -596,6 +680,7 @@
     refreshStatus();
     renderSidebar();
     applyZoom();
+    pendingFit = true;
     render();
   }
 

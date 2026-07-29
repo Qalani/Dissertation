@@ -342,6 +342,9 @@ button.primary.dirty::after {
 
 #preview svg {
   display: block;
+  /* app.js pins width/height to the diagram's real size; keep the frame's
+     padding outside that measurement so the drawing is never squeezed. */
+  box-sizing: content-box;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;

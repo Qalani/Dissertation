@@ -28,6 +28,38 @@ Use **`mermaid-editor.html`** — one file with everything already inside it.
 Once it's open, bookmark the page (`Ctrl+D` / `⌘D`) so you can get back to it
 without hunting for the file.
 
+## The methodology flowcharts are already in it
+
+The 13 diagrams from `methodology-flowcharts.md` are built in. On first open
+they appear in the sidebar, numbered in document order, with diagram 1 loaded
+and ready to edit or export.
+
+They behave like any other saved diagram: edit them, rename them, delete the
+ones you don't need. Seeding runs **once per browser**, so a diagram you
+delete stays deleted and reopening the editor never creates duplicates. To
+bring one back, pick it from **Examples → Methodology flowcharts**, which
+always holds a pristine copy.
+
+Editing a seeded diagram and pressing Save updates it in place, exactly like
+any editor. To keep the original as well, hit **New** first, or rename before
+saving.
+
+### Changing the flowcharts
+
+`methodology-flowcharts.md` is the source of truth. Edit the ```mermaid blocks
+there, then regenerate:
+
+```bash
+python3 build_library.py       # markdown -> library.js
+python3 build_single_file.py   # refresh mermaid-editor.html
+```
+
+Each `## ` heading becomes a diagram title, so keep those unique.
+
+Note that the built-ins only re-seed in a browser that has never seeded them.
+If you want updated copies in a browser you've already used, pull them from
+the Examples menu.
+
 ## Features
 
 - **Live preview** — the diagram re-renders as you type; syntax errors show in
@@ -40,11 +72,12 @@ without hunting for the file.
   resolution), or the raw **.mmd** source. SVG exports use plain text labels,
   so they open cleanly in Word, Inkscape, and LaTeX pipelines.
 - **Import** — open any `.mmd` / `.mermaid` / `.txt` file.
-- **Examples** — starter templates for flowcharts, sequence, state, class,
-  and Gantt diagrams.
-- **Zoom** — toolbar buttons or `Ctrl` + scroll wheel over the preview;
-  drag the divider to resize the panes. Light and dark mode follow your
-  system setting.
+- **Examples** — the methodology flowcharts, plus starter templates for
+  flowcharts, sequence, state, class, and Gantt diagrams.
+- **Zoom** — **Fit** scales a diagram to the pane, **100%** shows it at true
+  size, and `Ctrl` + scroll wheel zooms freely. Large diagrams open fitted so
+  you see the whole thing first. Drag the divider to resize the panes; light
+  and dark mode follow your system setting.
 
 ## Where are my diagrams stored?
 
@@ -78,8 +111,12 @@ branch**, pick `main` and `/root`) and use it from any device at
 | --- | --- |
 | `mermaid-editor.html` | **The thing to open.** Standalone build, everything inlined. |
 | `index.html`, `styles.css`, `app.js` | Editable sources. Work here, not in the standalone build. |
+| `methodology-flowcharts.md` | Source of truth for the 13 built-in diagrams. |
+| `library.js` | Generated from that markdown — don't edit by hand. |
 | `vendor/mermaid.min.js` | Mermaid v11.16.0 ([MIT](https://github.com/mermaid-js/mermaid/blob/develop/LICENSE)), vendored so the editor works offline. |
+| `build_library.py` | Regenerates `library.js` from the markdown. |
 | `build_single_file.py` | Regenerates `mermaid-editor.html` from the sources. |
+| `build_artifact.py` | Emits a body-only copy for hosting elsewhere. |
 
 After editing any source file, rebuild the standalone copy:
 

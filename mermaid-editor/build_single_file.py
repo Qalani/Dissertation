@@ -42,15 +42,22 @@ def guard(js: str, label: str) -> str:
 
 
 def main() -> None:
+    library_js = HERE / "library.js"
+    if not library_js.exists():
+        sys.exit("ERROR: library.js is missing — run build_library.py first")
+
     html = (HERE / "index.html").read_text(encoding="utf-8")
     css = (HERE / "styles.css").read_text(encoding="utf-8")
     app = (HERE / "app.js").read_text(encoding="utf-8")
+    library = library_js.read_text(encoding="utf-8")
     lib = (HERE / "vendor" / "mermaid.min.js").read_text(encoding="utf-8")
 
     replacements = [
         ('<link rel="stylesheet" href="styles.css">', f"<style>\n{css}\n</style>"),
         ('<script src="vendor/mermaid.min.js"></script>',
          f"<script>\n{guard(lib, 'mermaid.min.js')}\n</script>"),
+        ('<script src="library.js"></script>',
+         f"<script>\n{guard(library, 'library.js')}\n</script>"),
         ('<script src="app.js"></script>',
          f"<script>\n{guard(app, 'app.js')}\n</script>"),
     ]
