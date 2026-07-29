@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mermaid Flowchart Editor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='4' width='12' height='9' rx='2' fill='%234f46e5'/%3E%3Crect x='18' y='19' width='12' height='9' rx='2' fill='%23ec4899'/%3E%3Cpath d='M14 8.5h6a4 4 0 0 1 4 4v6.5' stroke='%2394a3b8' stroke-width='2.5' fill='none'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <button id="btn-sidebar" class="icon-btn" title="Show / hide saved diagrams">☰</button>
+  <div class="brand" title="Mermaid Flowchart Editor">
+    <svg viewBox="0 0 32 32" width="20" height="20" aria-hidden="true"><rect x="2" y="4" width="12" height="9" rx="2" fill="#4f46e5"/><rect x="18" y="19" width="12" height="9" rx="2" fill="#ec4899"/><path d="M14 8.5h6a4 4 0 0 1 4 4v6.5" stroke="#94a3b8" stroke-width="2.5" fill="none"/></svg>
+    <span>Mermaid&nbsp;Editor</span>
+  </div>
+  <input id="diagram-name" type="text" placeholder="Untitled diagram" autocomplete="off" spellcheck="false">
+  <button id="btn-save" class="primary" title="Save to this browser (Ctrl+S)">Save</button>
+  <button id="btn-new" title="Start a new diagram">New</button>
+  <span class="flex-spacer"></span>
+  <select id="examples" title="Insert an example">
+    <option value="" selected disabled>Examples…</option>
+  </select>
+  <button id="btn-import" title="Open a .mmd text file">Import</button>
+  <input id="file-input" type="file" accept=".mmd,.mermaid,.txt" hidden>
+  <span class="btn-group" role="group" aria-label="Export">
+    <button id="btn-export-svg" title="Download as SVG image">SVG</button>
+    <button id="btn-export-png" title="Download as PNG image (2× resolution)">PNG</button>
+    <button id="btn-export-mmd" title="Download the Mermaid source as a .mmd file">.mmd</button>
+  </span>
+</header>
+
+<div class="layout">
+  <aside id="sidebar">
+    <div class="sidebar-head">
+      <span>Saved diagrams</span>
+      <span id="saved-count" class="count-badge">0</span>
+    </div>
+    <ul id="saved-list"></ul>
+    <p id="sidebar-empty" class="sidebar-empty">Nothing saved yet.<br>Press <strong>Save</strong> to keep a diagram in this browser.</p>
+  </aside>
+
+  <main class="split">
+    <section class="editor-pane" id="editor-pane">
+      <textarea id="code" spellcheck="false" autocomplete="off" autocapitalize="off"
+        placeholder="Type Mermaid code here, e.g.&#10;&#10;flowchart TD&#10;    A[Start] --> B{Decision}&#10;    B -- Yes --> C[Do it]&#10;    B -- No  --> D[Skip]"></textarea>
+    </section>
+
+    <div class="divider" id="divider" title="Drag to resize"></div>
+
+    <section class="preview-pane">
+      <div class="preview-toolbar">
+        <span class="preview-label">Preview</span>
+        <span class="flex-spacer"></span>
+        <button id="btn-zoom-out" class="icon-btn" title="Zoom out">−</button>
+        <button id="btn-zoom-reset" class="zoom-reset" title="Reset zoom">100%</button>
+        <button id="btn-zoom-in" class="icon-btn" title="Zoom in">+</button>
+      </div>
+      <div id="error-bar" hidden></div>
+      <div id="preview-scroll">
+        <div id="preview"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer class="statusbar">
+  <span id="save-status">Not saved yet</span>
+  <span class="flex-spacer"></span>
+  <span class="statusbar-note">Diagrams are saved in this browser (localStorage) — use <strong>.mmd</strong> export for backups</span>
+  <a href="https://mermaid.js.org/syntax/flowchart.html" target="_blank" rel="noopener">Syntax reference ↗</a>
+  <span class="dim">Mermaid v11.16.0</span>
+</footer>
+
+<script src="vendor/mermaid.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
