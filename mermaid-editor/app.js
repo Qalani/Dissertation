@@ -91,6 +91,64 @@
 "    Revisions             :b2, after b1, 30d\n" }
   ];
 
+  // ---------- dialogs ----------
+  // Deliberately not window.confirm/alert: a sandboxed frame (a hosted copy
+  // embedded without allow-modals) ignores those and confirm() returns false,
+  // which silently cancelled opening, deleting and starting a new diagram.
+  var dialogBackdrop = $("dialog-backdrop");
+  var dialogConfirmBtn = $("dialog-confirm");
+  var dialogCancelBtn = $("dialog-cancel");
+  var dialogExtraBtn = $("dialog-extra");
+  var toastEl = $("toast");
+  var dialogOpen = false;
+  var lastFocus = null;
+
+  function closeDialog() {
+    dialogOpen = false;
+    dialogBackdrop.hidden = true;
+    if (lastFocus && lastFocus.focus) lastFocus.focus();
+    lastFocus = null;
+  }
+
+  function runAndClose(fn) {
+    closeDialog();
+    if (fn) fn();
+  }
+
+  function ask(opts) {
+    lastFocus = document.activeElement;
+    $("dialog-title").textContent = opts.title;
+    $("dialog-body").textContent = opts.body || "";
+
+    dialogConfirmBtn.textContent = opts.confirmLabel || "OK";
+    dialogConfirmBtn.classList.toggle("danger", !!opts.danger);
+    dialogConfirmBtn.onclick = function () { runAndClose(opts.onConfirm); };
+
+    dialogCancelBtn.textContent = opts.cancelLabel || "Cancel";
+    dialogCancelBtn.onclick = function () { runAndClose(opts.onCancel); };
+
+    dialogExtraBtn.hidden = !opts.extraLabel;
+    dialogExtraBtn.textContent = opts.extraLabel || "";
+    dialogExtraBtn.onclick = function () { runAndClose(opts.onExtra); };
+
+    dialogBackdrop.hidden = false;
+    dialogOpen = true;
+    dialogConfirmBtn.focus();
+  }
+
+  dialogBackdrop.addEventListener("mousedown", function (e) {
+    if (e.target === dialogBackdrop) closeDialog();
+  });
+
+  var toastTimer = null;
+  function notify(message, isError) {
+    toastEl.textContent = message;
+    toastEl.classList.toggle("error", !!isError);
+    toastEl.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.hidden = true; }, isError ? 7000 : 3500);
+  }
+
   // ---------- storage ----------
   // localStorage throws in private windows, sandboxed frames, and when site
   // data is blocked. Fall back to memory so the editor still works; boot()
@@ -235,7 +293,7 @@
       storage.set(STORE_KEY, JSON.stringify(list));
       return true;
     } catch (e) {
-      alert("Could not save to this browser's storage:\n" + e.message);
+      notify("Could not save to this browser's storage: " + e.message, true);
       return false;
     }
   }
@@ -330,8 +388,21 @@
   }
 
   // ---------- document operations ----------
-  function confirmDiscard() {
-    return !isDirty() || confirm("You have unsaved changes. Discard them?");
+  // Calls onYes once it is safe to replace the buffer. Offers to save first,
+  // so switching diagrams mid-edit never has to cost you the edit.
+  function confirmDiscard(onYes) {
+    if (!isDirty()) { onYes(); return; }
+    ask({
+      title: "You have unsaved changes",
+      body: "“" + (nameEl.value.trim() || "Untitled diagram") +
+            "” has edits that aren't saved yet.",
+      cancelLabel: "Keep editing",
+      extraLabel: "Save first",
+      onExtra: function () { saveCurrent(); onYes(); },
+      confirmLabel: "Discard changes",
+      danger: true,
+      onConfirm: onYes
+    });
   }
 
   function setBuffer(id, name, code, snapshot) {
@@ -372,24 +443,34 @@
 
   function openDiagram(id) {
     if (id === currentId && !isDirty()) return;
-    if (!confirmDiscard()) return;
     var doc = loadStore().find(function (d) { return d.id === id; });
     if (!doc) return;
-    setBuffer(doc.id, doc.name, doc.code, true);
+    confirmDiscard(function () {
+      setBuffer(doc.id, doc.name, doc.code, true);
+    });
   }
 
   function deleteDiagram(id, name) {
-    if (!confirm('Delete "' + name + '"? This cannot be undone.')) return;
-    var list = loadStore().filter(function (d) { return d.id !== id; });
-    persistStore(list);
-    if (id === currentId) {
-      // Keep the text in the buffer, but it is no longer linked to a saved doc
-      currentId = null;
-      savedSnapshot = null;
-      saveDraft();
-    }
-    refreshStatus();
-    renderSidebar();
+    ask({
+      title: "Delete this diagram?",
+      body: "“" + name + "” will be removed from this browser. This can't be undone.",
+      cancelLabel: "Keep it",
+      confirmLabel: "Delete",
+      danger: true,
+      onConfirm: function () {
+        var list = loadStore().filter(function (d) { return d.id !== id; });
+        persistStore(list);
+        if (id === currentId) {
+          // Keep the text in the buffer, but it is no longer linked to a saved doc
+          currentId = null;
+          savedSnapshot = null;
+          saveDraft();
+        }
+        refreshStatus();
+        renderSidebar();
+        notify("Deleted “" + name + "”");
+      }
+    });
   }
 
   // Load the built-in methodology diagrams into the saved list. Runs once per
@@ -419,9 +500,10 @@
   }
 
   function newDiagram() {
-    if (!confirmDiscard()) return;
-    setBuffer(null, "", "flowchart TD\n    A[Start] --> B[Next step]\n", false);
-    codeEl.focus();
+    confirmDiscard(function () {
+      setBuffer(null, "", "flowchart TD\n    A[Start] --> B[Next step]\n", false);
+      codeEl.focus();
+    });
   }
 
   // ---------- export / import ----------
@@ -443,7 +525,7 @@
   function getExportSvg() {
     var svg = previewEl.querySelector("svg");
     if (!svg) {
-      alert("Nothing to export yet — the preview is empty or has an error.");
+      notify("Nothing to export yet — fix the diagram first.", true);
       return null;
     }
     var clone = svg.cloneNode(true);
@@ -482,17 +564,17 @@
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         canvas.toBlob(function (blob) {
           if (blob) download(blob, slugify(nameEl.value) + ".png");
-          else alert("PNG export failed in this browser — try the SVG export instead.");
+          else notify("PNG export failed in this browser — try the SVG export instead.", true);
         }, "image/png");
       } catch (e) {
-        alert("PNG export failed (" + e.message + ") — try the SVG export instead.");
+        notify("PNG export failed (" + e.message + ") — try the SVG export instead.", true);
       } finally {
         URL.revokeObjectURL(url);
       }
     };
     img.onerror = function () {
       URL.revokeObjectURL(url);
-      alert("PNG export failed — try the SVG export instead.");
+      notify("PNG export failed — try the SVG export instead.", true);
     };
     img.src = url;
   }
@@ -505,9 +587,10 @@
     if (!file) return;
     var reader = new FileReader();
     reader.onload = function () {
-      if (!confirmDiscard()) return;
-      var name = file.name.replace(/\.(mmd|mermaid|txt)$/i, "");
-      setBuffer(null, name, String(reader.result), false);
+      confirmDiscard(function () {
+        var name = file.name.replace(/\.(mmd|mermaid|txt)$/i, "");
+        setBuffer(null, name, String(reader.result), false);
+      });
     };
     reader.readAsText(file);
   }
@@ -577,11 +660,20 @@
     var ex = source[Number(parts[1])];
     examplesSel.selectedIndex = 0;
     if (!ex) return;
-    if (!confirmDiscard()) return;
-    setBuffer(null, ex.name, ex.code, false);
+    confirmDiscard(function () {
+      setBuffer(null, ex.name, ex.code, false);
+    });
   });
 
   window.addEventListener("keydown", function (e) {
+    if (dialogOpen) {
+      // Escape cancels; nothing else should reach the editor behind the dialog
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeDialog();
+      }
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
       e.preventDefault();
       saveCurrent();

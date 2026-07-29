@@ -400,6 +400,88 @@ button.primary.dirty::after {
   #save-status.saved { color: #69db7c; }
 }
 
+/* ---------- confirmation dialog ---------- */
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(15, 23, 42, 0.45);
+}
+
+.dialog-backdrop[hidden] { display: none; }
+
+.dialog {
+  width: min(430px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 22px 18px;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.25);
+}
+
+.dialog h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  font-weight: 650;
+  text-wrap: balance;
+}
+
+.dialog p {
+  margin: 0 0 18px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dialog-actions button[hidden] { display: none; }
+
+#dialog-confirm.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+/* ---------- toast ---------- */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 46px;
+  transform: translateX(-50%);
+  z-index: 110;
+  max-width: min(520px, calc(100vw - 32px));
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  padding: 10px 16px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.22);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.toast[hidden] { display: none; }
+.toast.error { border-left-color: var(--danger); }
+
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* ---------- small screens ---------- */
 @media (max-width: 800px) {
   .split { flex-direction: column; }
@@ -469,6 +551,22 @@ button.primary.dirty::after {
     </section>
   </main>
 </div>
+
+<!-- In-page confirmation. Native confirm() is ignored in sandboxed frames
+     (no allow-modals), which silently cancelled every action it guarded. -->
+<div id="dialog-backdrop" class="dialog-backdrop" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-body">
+    <h2 id="dialog-title"></h2>
+    <p id="dialog-body"></p>
+    <div class="dialog-actions">
+      <button id="dialog-cancel"></button>
+      <button id="dialog-extra" hidden></button>
+      <button id="dialog-confirm" class="primary"></button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
 <footer class="statusbar">
   <span id="save-status">Not saved yet</span>
@@ -4221,6 +4319,64 @@ window.MERMAID_EDITOR_LIBRARY = [
 "    Revisions             :b2, after b1, 30d\n" }
   ];
 
+  // ---------- dialogs ----------
+  // Deliberately not window.confirm/alert: a sandboxed frame (a hosted copy
+  // embedded without allow-modals) ignores those and confirm() returns false,
+  // which silently cancelled opening, deleting and starting a new diagram.
+  var dialogBackdrop = $("dialog-backdrop");
+  var dialogConfirmBtn = $("dialog-confirm");
+  var dialogCancelBtn = $("dialog-cancel");
+  var dialogExtraBtn = $("dialog-extra");
+  var toastEl = $("toast");
+  var dialogOpen = false;
+  var lastFocus = null;
+
+  function closeDialog() {
+    dialogOpen = false;
+    dialogBackdrop.hidden = true;
+    if (lastFocus && lastFocus.focus) lastFocus.focus();
+    lastFocus = null;
+  }
+
+  function runAndClose(fn) {
+    closeDialog();
+    if (fn) fn();
+  }
+
+  function ask(opts) {
+    lastFocus = document.activeElement;
+    $("dialog-title").textContent = opts.title;
+    $("dialog-body").textContent = opts.body || "";
+
+    dialogConfirmBtn.textContent = opts.confirmLabel || "OK";
+    dialogConfirmBtn.classList.toggle("danger", !!opts.danger);
+    dialogConfirmBtn.onclick = function () { runAndClose(opts.onConfirm); };
+
+    dialogCancelBtn.textContent = opts.cancelLabel || "Cancel";
+    dialogCancelBtn.onclick = function () { runAndClose(opts.onCancel); };
+
+    dialogExtraBtn.hidden = !opts.extraLabel;
+    dialogExtraBtn.textContent = opts.extraLabel || "";
+    dialogExtraBtn.onclick = function () { runAndClose(opts.onExtra); };
+
+    dialogBackdrop.hidden = false;
+    dialogOpen = true;
+    dialogConfirmBtn.focus();
+  }
+
+  dialogBackdrop.addEventListener("mousedown", function (e) {
+    if (e.target === dialogBackdrop) closeDialog();
+  });
+
+  var toastTimer = null;
+  function notify(message, isError) {
+    toastEl.textContent = message;
+    toastEl.classList.toggle("error", !!isError);
+    toastEl.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.hidden = true; }, isError ? 7000 : 3500);
+  }
+
   // ---------- storage ----------
   // localStorage throws in private windows, sandboxed frames, and when site
   // data is blocked. Fall back to memory so the editor still works; boot()
@@ -4365,7 +4521,7 @@ window.MERMAID_EDITOR_LIBRARY = [
       storage.set(STORE_KEY, JSON.stringify(list));
       return true;
     } catch (e) {
-      alert("Could not save to this browser's storage:\n" + e.message);
+      notify("Could not save to this browser's storage: " + e.message, true);
       return false;
     }
   }
@@ -4460,8 +4616,21 @@ window.MERMAID_EDITOR_LIBRARY = [
   }
 
   // ---------- document operations ----------
-  function confirmDiscard() {
-    return !isDirty() || confirm("You have unsaved changes. Discard them?");
+  // Calls onYes once it is safe to replace the buffer. Offers to save first,
+  // so switching diagrams mid-edit never has to cost you the edit.
+  function confirmDiscard(onYes) {
+    if (!isDirty()) { onYes(); return; }
+    ask({
+      title: "You have unsaved changes",
+      body: "“" + (nameEl.value.trim() || "Untitled diagram") +
+            "” has edits that aren't saved yet.",
+      cancelLabel: "Keep editing",
+      extraLabel: "Save first",
+      onExtra: function () { saveCurrent(); onYes(); },
+      confirmLabel: "Discard changes",
+      danger: true,
+      onConfirm: onYes
+    });
   }
 
   function setBuffer(id, name, code, snapshot) {
@@ -4502,24 +4671,34 @@ window.MERMAID_EDITOR_LIBRARY = [
 
   function openDiagram(id) {
     if (id === currentId && !isDirty()) return;
-    if (!confirmDiscard()) return;
     var doc = loadStore().find(function (d) { return d.id === id; });
     if (!doc) return;
-    setBuffer(doc.id, doc.name, doc.code, true);
+    confirmDiscard(function () {
+      setBuffer(doc.id, doc.name, doc.code, true);
+    });
   }
 
   function deleteDiagram(id, name) {
-    if (!confirm('Delete "' + name + '"? This cannot be undone.')) return;
-    var list = loadStore().filter(function (d) { return d.id !== id; });
-    persistStore(list);
-    if (id === currentId) {
-      // Keep the text in the buffer, but it is no longer linked to a saved doc
-      currentId = null;
-      savedSnapshot = null;
-      saveDraft();
-    }
-    refreshStatus();
-    renderSidebar();
+    ask({
+      title: "Delete this diagram?",
+      body: "“" + name + "” will be removed from this browser. This can't be undone.",
+      cancelLabel: "Keep it",
+      confirmLabel: "Delete",
+      danger: true,
+      onConfirm: function () {
+        var list = loadStore().filter(function (d) { return d.id !== id; });
+        persistStore(list);
+        if (id === currentId) {
+          // Keep the text in the buffer, but it is no longer linked to a saved doc
+          currentId = null;
+          savedSnapshot = null;
+          saveDraft();
+        }
+        refreshStatus();
+        renderSidebar();
+        notify("Deleted “" + name + "”");
+      }
+    });
   }
 
   // Load the built-in methodology diagrams into the saved list. Runs once per
@@ -4549,9 +4728,10 @@ window.MERMAID_EDITOR_LIBRARY = [
   }
 
   function newDiagram() {
-    if (!confirmDiscard()) return;
-    setBuffer(null, "", "flowchart TD\n    A[Start] --> B[Next step]\n", false);
-    codeEl.focus();
+    confirmDiscard(function () {
+      setBuffer(null, "", "flowchart TD\n    A[Start] --> B[Next step]\n", false);
+      codeEl.focus();
+    });
   }
 
   // ---------- export / import ----------
@@ -4573,7 +4753,7 @@ window.MERMAID_EDITOR_LIBRARY = [
   function getExportSvg() {
     var svg = previewEl.querySelector("svg");
     if (!svg) {
-      alert("Nothing to export yet — the preview is empty or has an error.");
+      notify("Nothing to export yet — fix the diagram first.", true);
       return null;
     }
     var clone = svg.cloneNode(true);
@@ -4612,17 +4792,17 @@ window.MERMAID_EDITOR_LIBRARY = [
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         canvas.toBlob(function (blob) {
           if (blob) download(blob, slugify(nameEl.value) + ".png");
-          else alert("PNG export failed in this browser — try the SVG export instead.");
+          else notify("PNG export failed in this browser — try the SVG export instead.", true);
         }, "image/png");
       } catch (e) {
-        alert("PNG export failed (" + e.message + ") — try the SVG export instead.");
+        notify("PNG export failed (" + e.message + ") — try the SVG export instead.", true);
       } finally {
         URL.revokeObjectURL(url);
       }
     };
     img.onerror = function () {
       URL.revokeObjectURL(url);
-      alert("PNG export failed — try the SVG export instead.");
+      notify("PNG export failed — try the SVG export instead.", true);
     };
     img.src = url;
   }
@@ -4635,9 +4815,10 @@ window.MERMAID_EDITOR_LIBRARY = [
     if (!file) return;
     var reader = new FileReader();
     reader.onload = function () {
-      if (!confirmDiscard()) return;
-      var name = file.name.replace(/\.(mmd|mermaid|txt)$/i, "");
-      setBuffer(null, name, String(reader.result), false);
+      confirmDiscard(function () {
+        var name = file.name.replace(/\.(mmd|mermaid|txt)$/i, "");
+        setBuffer(null, name, String(reader.result), false);
+      });
     };
     reader.readAsText(file);
   }
@@ -4707,11 +4888,20 @@ window.MERMAID_EDITOR_LIBRARY = [
     var ex = source[Number(parts[1])];
     examplesSel.selectedIndex = 0;
     if (!ex) return;
-    if (!confirmDiscard()) return;
-    setBuffer(null, ex.name, ex.code, false);
+    confirmDiscard(function () {
+      setBuffer(null, ex.name, ex.code, false);
+    });
   });
 
   window.addEventListener("keydown", function (e) {
+    if (dialogOpen) {
+      // Escape cancels; nothing else should reach the editor behind the dialog
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeDialog();
+      }
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
       e.preventDefault();
       saveCurrent();

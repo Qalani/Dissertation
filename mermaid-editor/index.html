@@ -66,6 +66,22 @@
   </main>
 </div>
 
+<!-- In-page confirmation. Native confirm() is ignored in sandboxed frames
+     (no allow-modals), which silently cancelled every action it guarded. -->
+<div id="dialog-backdrop" class="dialog-backdrop" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-body">
+    <h2 id="dialog-title"></h2>
+    <p id="dialog-body"></p>
+    <div class="dialog-actions">
+      <button id="dialog-cancel"></button>
+      <button id="dialog-extra" hidden></button>
+      <button id="dialog-confirm" class="primary"></button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
 <footer class="statusbar">
   <span id="save-status">Not saved yet</span>
   <span class="flex-spacer"></span>
