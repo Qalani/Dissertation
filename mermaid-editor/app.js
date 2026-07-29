@@ -85,6 +85,30 @@
 "    Revisions             :b2, after b1, 30d\n" }
   ];
 
+  // ---------- storage ----------
+  // localStorage throws in private windows, sandboxed frames, and when site
+  // data is blocked. Fall back to memory so the editor still works; boot()
+  // warns the user that saves will not survive a refresh in that case.
+  var storage = (function () {
+    try {
+      var probe = "__mmd_probe__";
+      localStorage.setItem(probe, "1");
+      localStorage.removeItem(probe);
+      return {
+        persistent: true,
+        get: function (k) { return localStorage.getItem(k); },
+        set: function (k, v) { localStorage.setItem(k, v); }
+      };
+    } catch (e) {
+      var mem = Object.create(null);
+      return {
+        persistent: false,
+        get: function (k) { return k in mem ? mem[k] : null; },
+        set: function (k, v) { mem[k] = String(v); }
+      };
+    }
+  })();
+
   // ---------- state ----------
   var currentId = null;      // id of the open saved diagram, or null if never saved
   var savedSnapshot = null;  // {name, code} as of last save/load, for dirty checking
@@ -154,7 +178,7 @@
   // ---------- storage ----------
   function loadStore() {
     try {
-      var raw = localStorage.getItem(STORE_KEY);
+      var raw = storage.get(STORE_KEY);
       var list = raw ? JSON.parse(raw) : [];
       return Array.isArray(list) ? list : [];
     } catch (e) {
@@ -164,7 +188,7 @@
 
   function persistStore(list) {
     try {
-      localStorage.setItem(STORE_KEY, JSON.stringify(list));
+      storage.set(STORE_KEY, JSON.stringify(list));
       return true;
     } catch (e) {
       alert("Could not save to this browser's storage:\n" + e.message);
@@ -180,7 +204,7 @@
 
   function saveDraft() {
     try {
-      localStorage.setItem(DRAFT_KEY, JSON.stringify({
+      storage.set(DRAFT_KEY, JSON.stringify({
         id: currentId, name: nameEl.value, code: codeEl.value
       }));
     } catch (e) { /* draft is best-effort */ }
@@ -539,8 +563,13 @@
       examplesSel.appendChild(opt);
     });
 
+    if (!storage.persistent) {
+      showError("This browser is blocking site storage, so saved diagrams will disappear when you close the tab. " +
+                "Use the .mmd export button to keep your work.");
+    }
+
     var draft = null;
-    try { draft = JSON.parse(localStorage.getItem(DRAFT_KEY) || "null"); } catch (e) { /* ignore */ }
+    try { draft = JSON.parse(storage.get(DRAFT_KEY) || "null"); } catch (e) { /* ignore */ }
     var store = loadStore();
 
     if (draft && typeof draft.code === "string" && draft.code.trim()) {
