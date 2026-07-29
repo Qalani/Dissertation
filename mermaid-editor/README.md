@@ -76,8 +76,12 @@ the Examples menu.
   flowcharts, sequence, state, class, and Gantt diagrams.
 - **Zoom** — **Fit** scales a diagram to the pane, **100%** shows it at true
   size, and `Ctrl` + scroll wheel zooms freely. Large diagrams open fitted so
-  you see the whole thing first. Drag the divider to resize the panes; light
-  and dark mode follow your system setting.
+  you see the whole thing first. Drag the divider to resize the panes.
+- **Light / dark** — the toolbar button cycles **match system → light →
+  dark**, and remembers the choice. It restyles the diagram as well as the
+  editor, so **switch to light before exporting** anything headed for a white
+  dissertation page: PNG exports use the current theme's background, and a
+  dark-theme diagram draws light text.
 
 ## Where are my diagrams stored?
 

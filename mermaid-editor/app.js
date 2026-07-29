@@ -7,6 +7,7 @@
   var STORE_KEY = "mermaidEditor.diagrams.v1";
   var DRAFT_KEY = "mermaidEditor.draft.v1";
   var SEEDED_KEY = "mermaidEditor.seeded.v1";
+  var THEME_KEY = "mermaidEditor.theme.v1";
   var PNG_SCALE = 2;
 
   // Built-in diagrams generated from methodology-flowcharts.md (library.js).
@@ -180,14 +181,60 @@
   var zoom = 1;
   var pendingFit = false;  // fit the next render to the pane (set on open, not on keystrokes)
 
-  // ---------- mermaid setup ----------
+  // ---------- appearance ----------
   var darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
+  // Cycles system -> light -> dark. Keeping "system" in the cycle means
+  // choosing a mode is never a one-way door back to following the OS.
+  var THEME_ORDER = ["system", "light", "dark"];
+  var THEME_LABEL = {
+    system: "Appearance: match system — click for light",
+    light: "Appearance: light — click for dark",
+    dark: "Appearance: dark — click to match system"
+  };
+  var THEME_ICON = {
+    system: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">' +
+            '<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none"/></svg>',
+    light: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">' +
+           '<circle cx="12" cy="12" r="4.5"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.2 5.2l1.4 1.4M17.4 17.4l1.4 1.4M18.8 5.2l-1.4 1.4M6.6 17.4l-1.4 1.4"/></svg>',
+    dark: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true">' +
+          '<path d="M20 14.6A8.6 8.6 0 0 1 9.4 4 8.6 8.6 0 1 0 20 14.6z"/></svg>'
+  };
+
+  var themeMode = "system";
+
+  function isDark() {
+    return themeMode === "dark" || (themeMode === "system" && darkQuery.matches);
+  }
+
+  // Reflect the choice on <html> so the CSS token overrides take effect, and
+  // rebuild the diagram, whose colours come from mermaid's own theme.
+  function applyTheme(rerender) {
+    var root = document.documentElement;
+    if (themeMode === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", themeMode);
+
+    var btn = $("btn-theme");
+    btn.innerHTML = THEME_ICON[themeMode];
+    btn.title = THEME_LABEL[themeMode];
+    btn.setAttribute("aria-label", THEME_LABEL[themeMode]);
+
+    initMermaid();
+    if (rerender) render();
+  }
+
+  function setTheme(mode, rerender) {
+    themeMode = THEME_ORDER.indexOf(mode) === -1 ? "system" : mode;
+    try { storage.set(THEME_KEY, themeMode); } catch (e) { /* best effort */ }
+    applyTheme(rerender);
+  }
+
+  // ---------- mermaid setup ----------
   function initMermaid() {
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: "strict",
-      theme: darkQuery.matches ? "dark" : "default",
+      theme: isDark() ? "dark" : "default",
       // Plain SVG text labels (no <foreignObject>) so exported SVGs open
       // correctly in Word, Inkscape, LaTeX pipelines, etc.
       htmlLabels: false,
@@ -559,7 +606,9 @@
         canvas.width = Math.ceil(ex.width * PNG_SCALE);
         canvas.height = Math.ceil(ex.height * PNG_SCALE);
         var ctx = canvas.getContext("2d");
-        ctx.fillStyle = darkQuery.matches ? "#1d2027" : "#ffffff";
+        // Match the theme on screen: a dark-theme diagram draws light text,
+        // which would be invisible on white.
+        ctx.fillStyle = isDark() ? "#1d2027" : "#ffffff";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         canvas.toBlob(function (blob) {
@@ -705,9 +754,15 @@
     });
   })();
 
+  $("btn-theme").addEventListener("click", function () {
+    var next = THEME_ORDER[(THEME_ORDER.indexOf(themeMode) + 1) % THEME_ORDER.length];
+    setTheme(next, true);
+  });
+
+  // Only follow the OS while the user hasn't pinned a mode.
   darkQuery.addEventListener("change", function () {
-    initMermaid();
-    render();
+    if (themeMode !== "system") return;
+    applyTheme(true);
   });
 
   window.addEventListener("visibilitychange", function () {
@@ -720,7 +775,9 @@
       showError("Could not load vendor/mermaid.min.js — make sure the vendor folder sits next to index.html.");
       return;
     }
-    initMermaid();
+    // Restores a pinned mode, or follows the OS if none was chosen.
+    // Also runs initMermaid(); boot renders once at the end.
+    setTheme(storage.get(THEME_KEY) || "system", false);
 
     function addOptions(label, items, prefix) {
       if (!items.length) return;

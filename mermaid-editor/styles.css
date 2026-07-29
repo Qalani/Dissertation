@@ -15,8 +15,12 @@
   color-scheme: light;
 }
 
+/* Dark tokens apply in two cases: the OS asks for dark and the user hasn't
+   pinned light, or the user pinned dark outright. The rule is duplicated
+   rather than combined so neither case depends on selector ordering.
+   data-theme is set by the toolbar toggle; absent means "follow the OS". */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #14161d;
     --panel: #1d2027;
     --panel-alt: #191c23;
@@ -31,6 +35,22 @@
     --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
     color-scheme: dark;
   }
+}
+
+:root[data-theme="dark"] {
+  --bg: #14161d;
+  --panel: #1d2027;
+  --panel-alt: #191c23;
+  --border: #2e323d;
+  --text: #e6e8ee;
+  --text-dim: #9aa1af;
+  --accent: #818cf8;
+  --accent-soft: #262a44;
+  --danger: #ff8787;
+  --error-bg: #2c1c1e;
+  --error-border: #5c2a2e;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -105,6 +125,15 @@ button.primary.dirty::after {
   padding: 6px 10px;
   line-height: 1;
 }
+
+.theme-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 9px;
+}
+
+.theme-btn svg { display: block; }
 
 .btn-group {
   display: inline-flex;
@@ -377,8 +406,9 @@ button.primary.dirty::after {
 
 #save-status.saved { color: #2b8a3e; }
 @media (prefers-color-scheme: dark) {
-  #save-status.saved { color: #69db7c; }
+  :root:not([data-theme="light"]) #save-status.saved { color: #69db7c; }
 }
+:root[data-theme="dark"] #save-status.saved { color: #69db7c; }
 
 /* ---------- confirmation dialog ---------- */
 .dialog-backdrop {
