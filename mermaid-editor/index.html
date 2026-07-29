@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en" data-ui-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mermaid Flowchart Editor</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>🧜</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <button id="toggleSidebar" class="icon-btn" title="Show/hide saved diagrams (Ctrl+B)" aria-label="Toggle sidebar">☰</button>
+  <h1>Mermaid Editor</h1>
+
+  <div class="doc-title-wrap">
+    <input id="docTitle" class="doc-title" type="text" value="Untitled diagram"
+           aria-label="Diagram name" spellcheck="false">
+    <span id="dirtyDot" class="dirty-dot" title="Unsaved changes" hidden>●</span>
+  </div>
+
+  <div class="spacer"></div>
+
+  <button id="btnNew" class="btn">New</button>
+  <button id="btnSave" class="btn btn-primary" title="Save to this browser (Ctrl+S)">Save</button>
+
+  <div class="menu-wrap">
+    <button id="btnExport" class="btn" aria-haspopup="true" aria-expanded="false">Export ▾</button>
+    <div id="exportMenu" class="menu" hidden>
+      <button data-act="png">PNG image</button>
+      <button data-act="svg">SVG image</button>
+      <button data-act="mmd">Mermaid source (.mmd)</button>
+      <hr>
+      <button data-act="copy-svg">Copy SVG to clipboard</button>
+      <button data-act="copy-code">Copy code to clipboard</button>
+      <button data-act="copy-link">Copy shareable link</button>
+    </div>
+  </div>
+
+  <div class="menu-wrap">
+    <button id="btnMore" class="btn" aria-haspopup="true" aria-expanded="false">More ▾</button>
+    <div id="moreMenu" class="menu" hidden>
+      <button data-act="open-file">Open .mmd file…</button>
+      <button data-act="backup">Back up all diagrams (.json)</button>
+      <button data-act="restore">Restore from backup…</button>
+      <hr>
+      <button data-act="shortcuts">Keyboard shortcuts</button>
+      <button data-act="about">About / where things are stored</button>
+    </div>
+  </div>
+
+  <label class="sel-wrap" title="Mermaid diagram theme">
+    <span class="sr-only">Diagram theme</span>
+    <select id="mermaidTheme">
+      <option value="default">Theme: default</option>
+      <option value="neutral">Theme: neutral</option>
+      <option value="forest">Theme: forest</option>
+      <option value="dark">Theme: dark</option>
+      <option value="base">Theme: base</option>
+    </select>
+  </label>
+
+  <button id="btnUiTheme" class="icon-btn" title="Light / dark interface" aria-label="Toggle interface theme">◐</button>
+</header>
+
+<main class="layout" id="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <input id="searchBox" type="search" placeholder="Search saved diagrams" aria-label="Search saved diagrams">
+    </div>
+    <ul id="diagramList" class="diagram-list"></ul>
+    <div class="sidebar-foot">
+      <span id="storageInfo" class="muted"></span>
+    </div>
+  </aside>
+
+  <section class="editor-pane" id="editorPane">
+    <div class="pane-head">
+      <span class="pane-title">Code</span>
+      <label class="sel-wrap small" title="Insert a starting template">
+        <span class="sr-only">Insert template</span>
+        <select id="templateSelect">
+          <option value="">Insert template…</option>
+        </select>
+      </label>
+    </div>
+    <div class="code-wrap">
+      <div id="gutter" class="gutter" aria-hidden="true"></div>
+      <textarea id="code" spellcheck="false" autocomplete="off" autocorrect="off"
+                autocapitalize="off" wrap="off" aria-label="Mermaid source code"></textarea>
+    </div>
+  </section>
+
+  <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" tabindex="0"
+       aria-label="Resize editor and preview"></div>
+
+  <section class="preview-pane" id="previewPane">
+    <div class="pane-head">
+      <span class="pane-title">Preview</span>
+      <div class="zoom-controls">
+        <button class="icon-btn" id="zoomOut" title="Zoom out" aria-label="Zoom out">−</button>
+        <button class="icon-btn" id="zoomReset" title="Fit to view" aria-label="Fit to view">⤢</button>
+        <button class="icon-btn" id="zoomIn" title="Zoom in" aria-label="Zoom in">+</button>
+        <span id="zoomLabel" class="muted zoom-label">100%</span>
+      </div>
+    </div>
+    <div class="preview-viewport" id="viewport">
+      <div class="preview-stage" id="stage"></div>
+      <div class="loading" id="loading" hidden>Loading Mermaid…</div>
+    </div>
+    <div class="error-panel" id="errorPanel" hidden>
+      <div class="error-head">Diagram error</div>
+      <pre id="errorText"></pre>
+    </div>
+  </section>
+</main>
+
+<footer class="statusbar">
+  <span id="status" class="muted">Starting…</span>
+  <span class="spacer"></span>
+  <span id="lineInfo" class="muted"></span>
+</footer>
+
+<dialog id="infoDialog" class="dialog">
+  <h2 id="infoTitle">Info</h2>
+  <div id="infoBody"></div>
+  <form method="dialog"><button class="btn btn-primary" value="ok">Close</button></form>
+</dialog>
+
+<input type="file" id="filePicker" accept=".mmd,.mermaid,.md,.txt,text/plain" hidden>
+<input type="file" id="backupPicker" accept=".json,application/json" hidden>
+
+<div id="toast" class="toast" hidden></div>
+
+<!-- A classic deferred script, not a module: modules are blocked by CORS when the
+     page is opened straight off disk, and this way index.html works on file:// too. -->
+<script src="app.js" defer></script>
+</body>
+</html>

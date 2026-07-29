@@ -3,3 +3,6 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Local copy of the Mermaid library fetched by mermaid-editor/download-offline-copy.sh
+mermaid-editor/vendor/
