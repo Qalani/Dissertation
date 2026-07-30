@@ -53,7 +53,8 @@ WANTED = {
     '_blank_run_log_value', 'read_active_classifier_run_log',
     '_records_from_classifier_run_log', '_resolve_canonical_records',
     'find_classified_tifs', '_build_selection_audit', 'validate_panel_provenance',
-    'CLASSIFIED_SELECTION_AUDIT',
+    'CLASSIFIED_SELECTION_AUDIT', 'PANEL_SOURCE_METADATA_COLUMNS',
+    'panel_source_column', 'stamp_source_metadata',
 }
 
 
@@ -508,14 +509,55 @@ def test_panel_provenance_validation_rejects_a_pre_provenance_panel(notebook, tm
         ns['validate_panel_provenance'](old)
 
 
+def test_stamping_then_validating_round_trips(notebook, tmp_path):
+    """Section 7 stamps exactly the columns validate_panel_provenance requires.
+
+    Regression: the stamping loop prefixed every metadata column with 'source_',
+    so tif_index's already-prefixed 'source_run_log' landed as
+    'source_source_run_log' and a freshly built panel failed its own validation.
+    """
+    ns = _load_selection(notebook, tmp_path)
+    model, proba, _ = _s2_names()
+    _touch(ns['_tif_dir'], model)
+    _touch(ns['_tif_dir'], proba)
+    _write_run_log(ns, [_row('S2', '2021-06-01', '2021-06-02',
+                             ns['_tif_dir'] / model, ns['_tif_dir'] / proba)])
+
+    out = ns['find_classified_tifs'](ns['_tif_dir'], '2017-01-01', '2026-12-31')
+
+    # Mirror the Section 7 loop: reduce one raster, stamp it, validate.
+    panel_parts = []
+    for row in out.itertuples(index=False):
+        df = pd.DataFrame({'grid_id': [1, 2], 'wh_cover': [0.1, 0.2]})
+        row_dict = row._asdict()
+        ns['stamp_source_metadata'](df, row_dict, ns['PANEL_SOURCE_METADATA_COLUMNS'])
+        df['sensor'] = ns['_normalise_classifier_sensor'](row_dict.get('sensor'))
+        panel_parts.append(df)
+    panel_raw = pd.concat(panel_parts, ignore_index=True)
+
+    assert 'source_run_log' in panel_raw.columns
+    assert 'source_source_run_log' not in panel_raw.columns
+    assert ns['validate_panel_provenance'](panel_raw, context='built panel') is True
+
+
+def test_source_column_naming_does_not_double_prefix(notebook, tmp_path):
+    ns = _load_selection(notebook, tmp_path)
+    assert ns['panel_source_column']('sensor') == 'source_sensor'
+    assert ns['panel_source_column']('source_run_log') == 'source_run_log'
+    # Every configured metadata column must map to a distinct panel column.
+    mapped = [ns['panel_source_column'](c) for c in ns['PANEL_SOURCE_METADATA_COLUMNS']]
+    assert len(mapped) == len(set(mapped))
+
+
 def test_panel_build_stamps_the_provenance_columns(notebook):
     """Section 7 must carry classifier version and export token onto every row."""
     cells = [''.join(c['source']) for c in json.loads(notebook.read_text())['cells']]
-    build = [s for s in cells if '    metadata_cols = [' in s]
+    build = [s for s in cells if '    metadata_cols = PANEL_SOURCE_METADATA_COLUMNS' in s]
     assert len(build) == 1
-    for field in ('classifier_version', 'export_token', 'from_directory_scan', 'source_run_log'):
-        assert field in build[0]
+    assert 'stamp_source_metadata(df, row_dict, metadata_cols)' in build[0]
     assert 'validate_panel_provenance' in build[0]
+    # The old blind-prefix loop is gone.
+    assert 'df[f"source_{col}"]' not in build[0]
 
     checkpoint = [s for s in cells if 'def _panel_raw_fingerprint' in s]
     assert len(checkpoint) == 1
