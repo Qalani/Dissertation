@@ -11,7 +11,8 @@ with ``test_gam_guardrails.py`` (the helper API) and ``test_driver_gam_notebook.
   signature or dropped, and degenerate covariates never reach the model;
 * the forcing set is exogenous, and the lagged-response terms only ever appear in
   the predictive specification;
-* classifier confidence is used exactly once;
+* the response is the HARD classified cover and classifier confidence is not used
+  at all (the single-use guardrail is retained, with its mode pinned to "none");
 * the fold design validates far more than the final four months.
 """
 
@@ -36,12 +37,13 @@ def _cell(marker):
 
 
 def _base_namespace(tmp_path):
-    """Guardrail helpers + the methodological-corrections config block."""
+    """§4e shared helpers + guardrail helpers + the methodological-corrections config."""
     ns = {"pd": pd, "np": np, "Path": Path, "OUTPUT_DIR": tmp_path,
           "CELL_SIZE_M": 500, "TEST_START": "2019-01-01", "TEST_END": "2023-12-31",
           "ACTIVE_CLASSIFIER_VERSION": "route_b_test_v1",
           "TRAIN_FRACTION": 0.75, "RANDOM_STATE": 42,
           "display": lambda *a, **k: None}
+    exec(compile(_cell("4e. Shared corrections"), "<shared>", "exec"), ns)
     exec(compile(_cell("4d. Methodological guardrails"), "<guardrails>", "exec"), ns)
     cfg = _cell("# Methodological corrections to the driver GAM")
     cfg = cfg[cfg.index("# Methodological corrections to the driver GAM"):]
@@ -73,14 +75,14 @@ def _synthetic_panel(n_cells=120, n_months=60, seed=0):
         "turb_ndti_s2": rng.normal(0, 0.2, n),
         "chl_mci_s3": rng.gamma(2, 10, n),
     })
+    # HARD-class response: wh_cover is hard WH area / valid classified area, which is
+    # the only response definition the panel now admits. No soft (confidence-weighted)
+    # cover and no per-cell confidence column exists to be picked up downstream.
     cover = np.clip(rng.beta(0.3, 8, n), 0, 1)
-    panel["wh_cover_hard"] = cover
-    panel["wh_cover_soft"] = np.where(rng.random(n) < 0.02, np.nan, cover * 0.9)
-    panel["wh_cover"] = panel["wh_cover_soft"].fillna(panel["wh_cover_hard"])
+    panel["wh_area_m2"] = cover * panel["valid_area_m2"]
+    panel["wh_cover"] = panel["wh_area_m2"] / panel["valid_area_m2"]
+    panel["wh_cover_hard"] = panel["wh_cover"]
     panel["wh_present"] = (panel["wh_cover"] >= 0.02).astype(int)
-    # confidence is defined ONLY where WH pixels exist -- the asymmetry that made the
-    # old `fillna(1.0)` treat every absence as a certain observation.
-    panel["wh_conf_mean"] = np.where(panel["wh_cover"] > 0, rng.uniform(0.3, 1, n), np.nan)
     panel = panel.sort_values(["grid_id", "month"]).reset_index(drop=True)
     panel["wh_cover_lag1"] = panel.groupby("grid_id")["wh_cover"].shift(1)
     panel["wh_cover_neigh_lag1"] = panel.groupby("grid_id")["wh_cover"].shift(1) * 0.8
@@ -193,7 +195,7 @@ def model_ns(tmp_path):
     ns.update({
         "panel": _synthetic_panel(),
         "PANEL_IS_S2_ONLY": True,
-        "USE_PROBABILITY_RESPONSE": True,
+        "USE_PROBABILITY_RESPONSE": False,
         "MONTHLY_COVARIATE_COLS": [],
         "CELLMONTH_COVARIATE_COLS": ["turb_ndti_s2", "chl_mci_s3", "air_temp_c"],
         "STATIC_COVARIATE_COLS": ["dist_majriver_m", "dist_shore_m", "frac_cropland"],
@@ -236,19 +238,34 @@ def test_forcing_formulas_pass_the_exogeneity_gate(model_ns):
             model_ns[key], known, label=key, allow=("grid_id",))
 
 
-def test_confidence_is_used_exactly_once(model_ns):
+def test_response_is_hard_class_and_confidence_is_not_used(model_ns):
+    """The classified rasters are truth: hard cover, unit weights, no confidence column."""
     usage = model_ns["CONFIDENCE_USAGE"]
-    assert usage["mode"] == "soft_response"
+    assert usage["mode"] == "none"
     assert usage["weight_col"] is None
-    assert model_ns["RESPONSE_IS_SOFT"] is True
+    assert model_ns["RESPONSE_IS_SOFT"] is False
     assert model_ns["WEIGHTS_ARE_CONFIDENCE"] is False
+    assert model_ns["RESPONSE_KIND"] == "hard_class"
     assert (model_ns["gam_df"]["obs_weight"] == 1.0).all()
+    # No probability/confidence-derived column reaches the modelling frame.
+    model_ns["assert_no_confidence_columns"](model_ns["gam_df"].columns,
+                                             label="gam_df")
+    # ... and the response really is hard WH area / valid classified area.
+    model_ns["assert_hard_cover_response"](model_ns["model_df"], label="model_df")
+
+
+def test_hard_cover_assertion_catches_a_soft_response(model_ns):
+    """A response that is not hard WH area / valid area must fail loudly."""
+    tampered = model_ns["model_df"].copy()
+    tampered["wh_cover"] = tampered["wh_cover"] * 0.9
+    with pytest.raises(AssertionError, match="HARD classified WH fraction"):
+        model_ns["assert_hard_cover_response"](tampered, label="tampered")
 
 
 def test_likelihood_weights_are_refused_without_absence_confidence(tmp_path):
     ns = _base_namespace(tmp_path)
     panel = _synthetic_panel()
-    ns.update({"panel": panel, "PANEL_IS_S2_ONLY": True, "USE_PROBABILITY_RESPONSE": True,
+    ns.update({"panel": panel, "PANEL_IS_S2_ONLY": True, "USE_PROBABILITY_RESPONSE": False,
                "MONTHLY_COVARIATE_COLS": [],
                "CELLMONTH_COVARIATE_COLS": ["turb_ndti_s2", "chl_mci_s3", "air_temp_c"],
                "STATIC_COVARIATE_COLS": ["dist_majriver_m", "dist_shore_m", "frac_cropland"],
@@ -312,4 +329,7 @@ def test_downstream_builders_execute_on_the_shared_frame(model_ns):
     exec(compile(_cell("13f. Robustness: does any conclusion depend on a preprocessing choice?"),
                  "<s13f>", "exec"), ns)
     fams = set(ns["robust_variants"]["family"])
-    assert {"response", "measurement_error", "spatial_support", "coverage_threshold"} <= fams
+    # The measurement_error family is gone: the classified rasters are taken as truth,
+    # so there is no assumed-classifier-accuracy factor left to sweep.
+    assert {"response", "spatial_support", "coverage_threshold"} <= fams
+    assert "measurement_error" not in fams
