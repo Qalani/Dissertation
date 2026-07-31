@@ -118,6 +118,70 @@ def test_confidence_columns_are_refused_in_a_feature_set(ns):
             ns["assert_no_confidence_columns"](["depth_m", bad])
 
 
+def _run_duplicate_month_cell(notebook, panel_raw, method="mean"):
+    """Execute the real §7 duplicate-month reduction against a synthetic panel_raw."""
+    ns = _shared_namespace(notebook)
+    ns.update({
+        "np": np, "pd": pd, "display": lambda *a, **k: None,
+        "panel_raw": panel_raw, "DUPLICATE_MONTH_METHOD": method,
+        "PRIMARY_SENSOR": "S2", "MIN_VALID_PIXELS_PER_CELL_MONTH": 10,
+        "CELL_SIZE_M": 500, "PRESENCE_COVER_THRESHOLD": 0.02,
+        "PRESENCE_AREA_HA_THRESHOLD": None,
+    })
+    exec(compile(_cell(notebook, "Reduce duplicates WITHIN each sensor"), "<s7>", "exec"), ns)
+    return ns["panel_sensor"]
+
+
+def _multi_snapshot_panel_raw():
+    """One cell-month seen twice, the second snapshot mostly clouded out.
+
+    Snapshot A: 100 valid px, 50 WH px -> cover 0.50
+    Snapshot B:  10 valid px,  0 WH px -> cover 0.00
+    mean-of-ratios = 0.25, but the honest hard-class fraction is
+    (50+0)/(100+10) = 0.4545..., which is what pooling the areas gives.
+    """
+    px = 250_000.0 / 100.0        # pixel area, so 100 px == one 500 m cell
+    rows = [
+        {"grid_id": 1, "month": pd.Timestamp("2020-01-01"), "sensor": "S2",
+         "valid_pixels": 100, "wh_pixels": 50, "source_file": "a.tif"},
+        {"grid_id": 1, "month": pd.Timestamp("2020-01-01"), "sensor": "S2",
+         "valid_pixels": 10, "wh_pixels": 0, "source_file": "b.tif"},
+        {"grid_id": 2, "month": pd.Timestamp("2020-01-01"), "sensor": "S2",
+         "valid_pixels": 100, "wh_pixels": 20, "source_file": "a.tif"},
+    ]
+    df = pd.DataFrame(rows)
+    df["valid_area_m2"] = df["valid_pixels"] * px
+    df["wh_area_m2"] = df["wh_pixels"] * px
+    df["wh_cover"] = df["wh_area_m2"] / df["valid_area_m2"]
+    return df
+
+
+def test_duplicate_month_reduction_keeps_the_hard_area_identity(notebook, ns):
+    """Several snapshots in one month must not break wh_cover = wh_area / valid_area.
+
+    Reducing the per-snapshot cover FRACTIONS is a mean-of-ratios; when the snapshots
+    saw different amounts of the cell it disagrees with the pooled hard-class fraction
+    (on the real panel this broke the identity for ~15% of cell-months, by up to 0.56
+    cover). The areas are reduced and the cover recomputed from them instead.
+    """
+    panel_sensor = _run_duplicate_month_cell(notebook, _multi_snapshot_panel_raw())
+    ns["assert_hard_cover_response"](panel_sensor, label="reduced panel")
+
+    row = panel_sensor.set_index(["grid_id", "month"]).loc[(1, pd.Timestamp("2020-01-01"))]
+    assert row["wh_cover"] == pytest.approx(50 / 110), "cover must be the pooled hard fraction"
+    assert row["wh_cover"] != pytest.approx(0.25), "mean-of-ratios must not survive"
+    # A single-snapshot cell-month is unaffected.
+    assert panel_sensor.set_index(["grid_id", "month"]).loc[
+        (2, pd.Timestamp("2020-01-01")), "wh_cover"] == pytest.approx(0.20)
+
+
+def test_duplicate_month_reduction_does_not_average_the_cover_column(notebook):
+    """The response must be recomputed, not aggregated, so the identity holds by build."""
+    cell = _cell(notebook, "Reduce duplicates WITHIN each sensor")
+    assert '"wh_cover": DUPLICATE_MONTH_METHOD,' not in cell
+    assert 'panel_sensor["wh_cover"] = np.where(' in cell
+
+
 def test_notebook_configures_a_hard_class_response(notebook):
     code = "\n".join(_code_cells(notebook))
     assert "USE_PROBABILITY_RESPONSE = False" in code
