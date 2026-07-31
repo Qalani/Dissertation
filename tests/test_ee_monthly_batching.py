@@ -37,8 +37,13 @@ WANTED = ('_is_ee_capacity_error', '_aoi_monthly_batch', 'aoi_monthly_dataframe'
 # Payload keys of _ee_cache_signature. Pinned so a performance knob added to the
 # extractor cannot silently join the fingerprint and invalidate every cached
 # covariate group. 'ee_climate_per_cell' exists only in the GAM notebook.
+# What the signature must cover: the DATES requested, the AOI, the RESOLUTION and
+# every EE_* extraction parameter. The panel's month LIST is deliberately absent —
+# a month appearing or being filtered out by the monthly-coverage gate does not
+# change an already-extracted month's value, so it must not force a full rebuild.
 CACHE_SIGNATURE_KEYS = {
-    'cell_size_m', 'panel_crs', 'aoi_bbox_wgs84', 'n_grid_cells', 'months',
+    'cell_size_m', 'panel_crs', 'aoi_bbox_wgs84', 'n_grid_cells', 'grid_bounds',
+    'test_start', 'test_end',
     'ee_layers', 'ee_s2_products', 'ee_s3_products', 'ee_rain_antecedent_days',
     'ee_rain_intensity', 'ee_rain_spike_thresholds_mm', 'ee_rain_wet_day_mm',
     'ee_rain_per_cell', 'ee_bay_axis_bearing_deg', 'ee_water_occurrence_threshold',
@@ -462,6 +467,33 @@ def test_cache_signature_does_not_include_the_batching_knob(notebook):
     unexpected = keys - CACHE_SIGNATURE_KEYS - CACHE_SIGNATURE_OPTIONAL_KEYS
     assert not unexpected, f'cache signature gained {sorted(unexpected)}'
     assert CACHE_SIGNATURE_KEYS <= keys, f'cache signature lost {sorted(CACHE_SIGNATURE_KEYS - keys)}'
+
+
+def test_cache_signature_tracks_dates_aoi_and_resolution_but_not_the_month_list(notebook):
+    """Only dates / AOI / resolution (and the EE_* knobs) may invalidate the cache.
+
+    Keying the signature on the panel's exact month set meant one added or filtered
+    month discarded every already-extracted month and re-ran hours of Earth Engine
+    work. The dates window, AOI and resolution stay in the signature -- they DO make
+    cached values wrong -- while the month list moves to the manifest so a later run
+    can top up only the months it is missing.
+    """
+    source = _function_source(notebook, '_ee_cache_signature')
+    keys = set(re.findall(r'^\s{8}"([a-z0-9_]+)":', source, re.M))
+    assert 'months' not in keys, 'the month list must not invalidate the whole cache'
+    for required in ('test_start', 'test_end', 'aoi_bbox_wgs84', 'grid_bounds',
+                     'cell_size_m', 'panel_crs'):
+        assert required in keys, f'cache signature must still track {required}'
+
+
+def test_cached_months_are_recorded_and_topped_up_incrementally(notebook):
+    """The manifest records which months are cached; only missing ones are extracted."""
+    code = _code(notebook)
+    assert 'def _months_in_cache(' in code
+    assert 'def _append_months(' in code
+    assert '"months": [str(m.date()) for m in _cached_months],' in code
+    assert 'missing_months = sorted(_panel_months_ts - set(cached_months or set()))' in code
+    assert 'grid, missing_months, only_groups=_month_groups' in code
 
 
 def test_monthly_climate_is_still_an_independently_retried_group(notebook):
