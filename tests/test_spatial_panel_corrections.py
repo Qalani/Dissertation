@@ -125,8 +125,16 @@ def _run_duplicate_month_cell(notebook, panel_raw, method="mean"):
         "np": np, "pd": pd, "display": lambda *a, **k: None,
         "panel_raw": panel_raw, "DUPLICATE_MONTH_METHOD": method,
         "PRIMARY_SENSOR": "S2", "MIN_VALID_PIXELS_PER_CELL_MONTH": 10,
+        # The valid-FRACTION filter is exercised in test_predictive_ml_sweeps /
+        # test_predictive_ml_validity; disabled here so this test keeps measuring the
+        # area-pooling identity alone.
+        "MIN_VALID_FRACTION_PER_CELL_MONTH": None,
         "CELL_SIZE_M": 500, "PRESENCE_COVER_THRESHOLD": 0.02,
         "PRESENCE_AREA_HA_THRESHOLD": None,
+        "PRESENCE_COVER_THRESHOLD_GRID": (0.005, 0.01, 0.02),
+        "PRESENCE_AREA_HA_THRESHOLD_GRID": (0.125, 0.25, 0.5),
+        "PRESENCE_PRIMARY_DEFINITION": "cover_0.02",
+        "PRESENCE_THRESHOLD_SELECTION_SOURCE": "predeclared",
     })
     exec(compile(_cell(notebook, "Reduce duplicates WITHIN each sensor"), "<s7>", "exec"), ns)
     return ns["panel_sensor"]
