@@ -321,13 +321,76 @@ def test_assert_folds_scored(g):
                        "fold": [1, 2, 1, 2],
                        "spearman": [0.3, 0.2, 0.1, 0.4],
                        "rmse": [0.1, 0.1, 0.1, 0.1]})
-    assert g["assert_folds_scored"](ok, {"spatial": [1, 2], "temporal": [1, 2]})
+    # A clean pass returns the (empty) list of undefined-by-construction metrics.
+    assert g["assert_folds_scored"](ok, {"spatial": [1, 2], "temporal": [1, 2]}) == []
     with pytest.raises(AssertionError):
         g["assert_folds_scored"](ok, {"spatial": [1, 2, 3], "temporal": [1, 2]})
     bad = ok.copy()
     bad.loc[bad.index[-1], ["spearman", "rmse"]] = np.nan
     with pytest.raises(AssertionError):
         g["assert_folds_scored"](bad, {"spatial": [1, 2], "temporal": [1, 2]})
+    # A fold string/float fold column (rpy2 hands back doubles) still matches.
+    astr = ok.copy()
+    astr["fold"] = astr["fold"].astype(str)
+    assert g["assert_folds_scored"](astr, {"spatial": [1, 2], "temporal": [1, 2]}) == []
+
+
+def test_assert_folds_scored_excuses_undefined_rank_on_constant_folds(g):
+    """An all-zero held-out block has no ranking, so a NaN Spearman is not a failure.
+
+    Its error metrics are still finite and still required, and a NaN Spearman on a
+    fold that DOES vary (a constant prediction) is still a failure.
+    """
+    base = pd.DataFrame({"kind": ["spatial"] * 2 + ["temporal"] * 2,
+                         "fold": [1, 2, 1, 2],
+                         "n": [500, 500, 500, 500],
+                         "n_pos": [60, 60, 0, 40],
+                         "spearman": [0.3, 0.2, np.nan, 0.4],
+                         "rmse": [0.1, 0.1, 0.1, 0.1]})
+    expected = {"spatial": [1, 2], "temporal": [1, 2]}
+    assert g["assert_folds_scored"](base, expected) == ["temporal:1:spearman"]
+
+    # Fewer than three held-out rows is the other undefined case.
+    tiny = base.copy()
+    tiny.loc[0, ["n", "n_pos", "spearman"]] = [2, 1, np.nan]
+    assert g["assert_folds_scored"](tiny, expected) == [
+        "spatial:1:spearman", "temporal:1:spearman"]
+
+    # A NaN Spearman where the block varies is a real degeneracy.
+    varying = base.copy()
+    varying.loc[1, "spearman"] = np.nan
+    with pytest.raises(AssertionError, match="spatial:2:spearman"):
+        g["assert_folds_scored"](varying, expected)
+
+    # The excuse is rank-only: a NaN error metric on the same fold still raises.
+    no_rmse = base.copy()
+    no_rmse.loc[2, "rmse"] = np.nan
+    with pytest.raises(AssertionError, match="temporal:1:rmse"):
+        g["assert_folds_scored"](no_rmse, expected)
+
+    # An undefined rank metric never hides a fold that came back empty.
+    with pytest.raises(AssertionError, match="spatial:3"):
+        g["assert_folds_scored"](base, {"spatial": [1, 2, 3], "temporal": [1, 2]})
+
+
+def test_cv_fold_coverage_is_asserted_against_the_budgeted_folds(g):
+    """§13-CV and §13h must expect the folds the sweep was ASKED for.
+
+    A CV budget (GAM_CV_MAX_SPATIAL_FOLDS / _TEMPORAL_FOLDS) deliberately scores a
+    subset of the design; asserting against the full design failed a run that did
+    exactly what it was configured to do.
+    """
+    cells = [
+        "".join(c["source"])
+        for c in json.loads(NOTEBOOK.read_text())["cells"]
+        if c["cell_type"] == "code" and "assert_folds_scored(" in "".join(c["source"])
+        and "def assert_folds_scored" not in "".join(c["source"])
+    ]
+    assert len(cells) == 2, f"expected 2 calling cells, found {len(cells)}"
+    for src in cells:
+        assert "CV_SPATIAL_FOLDS_USED" in src and "CV_TEMPORAL_FOLDS_USED" in src
+        # The full design must still be named, so the reduction is reported.
+        assert "REDUCED DESIGN" in src
 
 
 # ---------------------------------------------------------------------
