@@ -373,6 +373,143 @@ def test_assert_folds_scored_excuses_undefined_rank_on_constant_folds(g):
         g["assert_folds_scored"](base, {"spatial": [1, 2, 3], "temporal": [1, 2]})
 
 
+# The three reasons a rank correlation can be NaN, and what each one means for the
+# fold: only the last is a model failure.
+EXPECTED_2 = {"spatial": [1], "temporal": [1]}
+HEALTHY = {"kind": "spatial", "fold": 1, "n": 400, "n_pos": 120, "n_high": 20,
+           "spearman": 0.3, "rmse": 0.10, "pred_min": 0.0, "pred_max": 0.40}
+
+
+def _nan_fold(**over):
+    """A temporal fold 1 whose Spearman came back NaN but whose rmse did not."""
+    row = {"kind": "temporal", "fold": 1, "n": 400, "n_pos": 120, "n_high": 20,
+           "spearman": np.nan, "rmse": 0.11, "pred_min": 0.01, "pred_max": 0.30}
+    row.update(over)
+    return pd.DataFrame([HEALTHY, row])
+
+
+def test_assert_folds_scored_reads_the_recorded_na_reason(g):
+    """The sweep records WHY each Spearman is NaN; the guardrail must act on it.
+
+    Row counts cannot tell a block that admits no ranking from a fit that returned
+    one value for every held-out row, so the reason is recorded beside the value
+    and read back here rather than re-derived.
+    """
+    for why in ("constant_obs", "too_few"):
+        assert g["assert_folds_scored"](
+            _nan_fold(spearman_na_reason=why), EXPECTED_2) == ["temporal:1:spearman"]
+
+    # A constant prediction against a block that DOES rank is a real degeneracy: the
+    # fold has no skill to report, only an rmse that reads like one.
+    with pytest.raises(AssertionError, match="temporal:1:spearman .constant_pred.") as e:
+        g["assert_folds_scored"](_nan_fold(spearman_na_reason="constant_pred"),
+                                 EXPECTED_2)
+    assert "ONE value for every held-out row" in str(e.value)
+
+    # A recorded reason never excuses a non-finite ERROR metric on the same fold.
+    with pytest.raises(AssertionError, match="temporal:1:rmse"):
+        g["assert_folds_scored"](
+            _nan_fold(spearman_na_reason="constant_obs", rmse=np.nan), EXPECTED_2)
+
+
+def test_assert_folds_scored_diagnoses_results_written_without_a_reason(g):
+    """Older cv_results -- and folds resumed from checkpoints written by them --
+    carry no reason column, so it is reconstructed from what they do carry.
+
+    A Spearman goes NaN for exactly three reasons, tested in that order, so ruling
+    out the first two identifies the third for the whole-block correlation. Guessing
+    instead (the row counts alone) failed folds whose held-out block was simply
+    constant, which is not a failure.
+    """
+    afs = g["assert_folds_scored"]
+
+    # Predictions vary and there are rows to rank, so the block itself must be the
+    # constant one -- undefined by construction, not a failed fold.
+    assert afs(_nan_fold(), EXPECTED_2) == ["temporal:1:spearman"]
+
+    # One predicted value across the block: a degeneracy, named as such.
+    with pytest.raises(AssertionError, match="temporal:1:spearman .constant_pred."):
+        afs(_nan_fold(pred_min=0.07, pred_max=0.07), EXPECTED_2)
+
+    # Too few held-out rows outranks both.
+    assert afs(_nan_fold(n=2, pred_min=0.07, pred_max=0.07), EXPECTED_2) == [
+        "temporal:1:spearman"]
+
+    # With no prediction range recorded either, nothing can be concluded and the
+    # fold still raises rather than being quietly excused.
+    with pytest.raises(AssertionError, match="temporal:1:spearman"):
+        afs(_nan_fold().drop(columns=["pred_min", "pred_max"]), EXPECTED_2)
+
+    # A resumed fold carries the column but no value in it (rpy2 may surface R's
+    # character NA as a string); that is "unstated", not a reason.
+    for blank in (np.nan, "NA", ""):
+        assert afs(_nan_fold(spearman_na_reason=blank), EXPECTED_2) == [
+            "temporal:1:spearman"]
+
+
+def test_assert_folds_scored_uses_each_rank_metrics_own_subset(g):
+    """_pos ranks only the rows with cover and _high only those above the threshold,
+    so each is undefined on its OWN row count, not on the block's."""
+    frame = _nan_fold(spearman=0.2, spearman_high=np.nan, n_high=2)
+    frame.loc[0, "spearman_high"] = 0.1
+    assert g["assert_folds_scored"](
+        frame, EXPECTED_2,
+        metric_cols=("spearman", "spearman_high", "rmse")) == ["temporal:1:spearman_high"]
+
+    # A block with plenty of high-cover rows and a varying prediction is not excused.
+    frame2 = _nan_fold(spearman=0.2, spearman_high=np.nan, n_high=50)
+    frame2.loc[0, "spearman_high"] = 0.1
+    with pytest.raises(AssertionError, match="temporal:1:spearman_high"):
+        g["assert_folds_scored"](frame2, EXPECTED_2,
+                                 metric_cols=("spearman", "spearman_high", "rmse"))
+
+
+def test_cover_metrics_records_why_each_spearman_is_nan(g):
+    """cover_metrics is the Python mirror of the R sweep's metrics_fn, so it has to
+    speak the same reason vocabulary -- that is what makes the two cross-checkable."""
+    cm, reasons = g["cover_metrics"], (
+        "spearman_na_reason", "spearman_pos_na_reason", "spearman_high_na_reason")
+    # Three rows above the high-cover threshold, so every subset can be ranked.
+    obs = np.array([0.0] * 10 + [0.05, 0.25, 0.45, 0.65])
+    pred = np.linspace(0.01, 0.30, obs.size)
+
+    assert all(cm(obs, pred)[k] == "" for k in reasons)
+
+    zero = cm(np.zeros(obs.size), pred)
+    assert zero["spearman_na_reason"] == "constant_obs"
+    assert zero["spearman_pos_na_reason"] == "too_few"      # no positive rows at all
+    assert np.isnan(zero["spearman"]) and np.isfinite(zero["rmse"])
+
+    flat = cm(obs, np.full(obs.size, 0.07))
+    assert all(flat[k] == "constant_pred" for k in reasons)
+    assert flat["pred_min"] == flat["pred_max"]             # what the fallback reads
+
+    # Every reason is one the guardrail knows how to act on.
+    vocabulary = set(g["RANK_NA_UNDEFINED"]) | set(g["RANK_NA_DEGENERATE"]) | {""}
+    for case in (cm(obs, pred), zero, flat, cm(obs[:2], pred[:2])):
+        assert {case[k] for k in reasons} <= vocabulary
+
+
+def test_cv_sweep_records_the_na_reason_and_survives_a_schema_change(g):
+    """§13-CV must write the reason columns and bind folds resumed from checkpoints
+    written before they existed -- rbind() refuses a mismatched column set outright,
+    which would strand every checkpoint the first time a metric column is added."""
+    src = [
+        "".join(c["source"])
+        for c in json.loads(NOTEBOOK.read_text())["cells"]
+        if c["cell_type"] == "code"
+        and "Dependence-aware cross-validation" in "".join(c["source"])
+    ]
+    assert len(src) == 1, f"expected 1 CV sweep cell, found {len(src)}"
+    cell = src[0]
+    for reason in ("too_few", "constant_obs", "constant_pred"):
+        assert f'return("{reason}")' in cell, f"sp_why does not name {reason}"
+    for col in ("spearman_na_reason", "spearman_pos_na_reason",
+                "spearman_high_na_reason"):
+        assert cell.count(col) >= 2, f"{col} missing from metrics_fn or na_metrics"
+    assert "rbind_aligned" in cell and "do.call(rbind, res)" not in cell
+
+
 def test_cv_fold_coverage_is_asserted_against_the_budgeted_folds(g):
     """§13-CV and §13h must expect the folds the sweep was ASKED for.
 
