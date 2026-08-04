@@ -464,6 +464,55 @@ def test_assert_folds_scored_uses_each_rank_metrics_own_subset(g):
                                  metric_cols=("spearman", "spearman_high", "rmse"))
 
 
+def test_a_prediction_pinned_to_a_response_bound_is_named_as_saturation(g):
+    """A constant prediction ON a response bound is a saturated link, not a shrunk fit.
+
+    §13-CV temporal fold 1 of the forcing spec returned 2.22e-16 -- mgcv's clamped
+    inverse logit -- for all 5,400 held-out rows. Both faults are failures, but they
+    are found in different places: a saturated link means the linear predictor was
+    driven off the scale (extrapolation past the fold's training range), while a
+    model shrunk to its intercept lands at the response MEAN. Reporting the first as
+    the second sent the reader looking at select=TRUE for a problem that was not there.
+    """
+    afs = g["assert_folds_scored"]
+    floor_ = float(np.finfo(float).eps)          # what betar's linkinv clamps to
+
+    for bound in (floor_, 1.0 - floor_):
+        with pytest.raises(AssertionError,
+                           match="temporal:1:spearman .saturated_pred.") as e:
+            afs(_nan_fold(pred_min=bound, pred_max=bound), EXPECTED_2)
+        assert "saturated the link" in str(e.value)
+        assert "extrapolation" in str(e.value)
+
+    # A constant prediction in the INTERIOR is still the shrinkage-shaped failure.
+    with pytest.raises(AssertionError, match="temporal:1:spearman .constant_pred.") as e:
+        afs(_nan_fold(pred_min=0.07, pred_max=0.07), EXPECTED_2)
+    assert "select=TRUE" in str(e.value)
+
+    # An EXACT 0 is a deliberate constant, not a clamp: the zero baseline predicts it
+    # on purpose, and calling that "saturated" would invent an extrapolation fault.
+    with pytest.raises(AssertionError, match="temporal:1:spearman .constant_pred."):
+        afs(_nan_fold(pred_min=0.0, pred_max=0.0), EXPECTED_2)
+
+    # A reason recorded by the sweep itself is acted on the same way, and neither
+    # form is ever excused as undefined-by-construction.
+    with pytest.raises(AssertionError, match="saturated_pred"):
+        afs(_nan_fold(spearman_na_reason="saturated_pred"), EXPECTED_2)
+    assert "saturated_pred" in g["RANK_NA_DEGENERATE"]
+    assert "saturated_pred" not in g["RANK_NA_UNDEFINED"]
+
+
+def test_spearman_why_separates_saturation_from_a_flat_prediction(g):
+    """The Python metric mirror must speak the same distinction as the R sweep."""
+    obs = np.array([0.0, 0.1, 0.4, 0.9])
+    eps = float(np.finfo(float).eps)
+    assert g["_spearman_why"](obs, np.full(4, 0.07))[1] == "constant_pred"
+    assert g["_spearman_why"](obs, np.full(4, 0.0))[1] == "constant_pred"   # zero baseline
+    assert g["_spearman_why"](obs, np.full(4, eps))[1] == "saturated_pred"
+    assert g["_spearman_why"](obs, np.full(4, 1.0 - eps))[1] == "saturated_pred"
+    assert g["_spearman_why"](obs, np.array([0.1, 0.2, 0.3, 0.4]))[1] == ""
+
+
 def test_cover_metrics_records_why_each_spearman_is_nan(g):
     """cover_metrics is the Python mirror of the R sweep's metrics_fn, so it has to
     speak the same reason vocabulary -- that is what makes the two cross-checkable."""
