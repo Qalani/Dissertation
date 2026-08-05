@@ -470,9 +470,17 @@ def test_a_prediction_pinned_to_a_response_bound_is_named_as_saturation(g):
     §13-CV temporal fold 1 of the forcing spec returned 2.22e-16 -- mgcv's clamped
     inverse logit -- for all 5,400 held-out rows. Both faults are failures, but they
     are found in different places: a saturated link means the linear predictor was
-    driven off the scale (extrapolation past the fold's training range), while a
-    model shrunk to its intercept lands at the response MEAN. Reporting the first as
-    the second sent the reader looking at select=TRUE for a problem that was not there.
+    driven off the scale, while a model shrunk to its intercept lands at the response
+    MEAN. Reporting the first as the second sent the reader looking at select=TRUE for
+    a problem that was not there.
+
+    WHERE the value sits is all this function decides. WHAT drove eta there is a
+    separate question, and the help text used to answer it with one cause --
+    extrapolation past the fold's training range. That was wrong: the clamp which
+    holds every test covariate at that range shipped, ran with 100% of the fold's
+    time_index held, and returned the fold bit-identical (rmse 0.04802567,
+    pred_min = pred_max = 2.22e-16). So the message must send the reader to the
+    fold's fit-health columns rather than name a cause it cannot know.
     """
     afs = g["assert_folds_scored"]
     floor_ = float(np.finfo(float).eps)          # what betar's linkinv clamps to
@@ -482,7 +490,12 @@ def test_a_prediction_pinned_to_a_response_bound_is_named_as_saturation(g):
                            match="temporal:1:spearman .saturated_pred.") as e:
             afs(_nan_fold(pred_min=bound, pred_max=bound), EXPECTED_2)
         assert "saturated the link" in str(e.value)
-        assert "extrapolation" in str(e.value)
+        # Points at the evidence that separates a saturated FIT from a saturated
+        # PREDICT, and must not re-assert extrapolation as the cause.
+        assert "fit-health" in str(e.value)
+        assert "ar1_rho" in str(e.value)
+        assert "extrap_clamped_frac" in str(e.value)
+        assert "the usual cause is extrapolation" not in str(e.value)
 
     # A constant prediction in the INTERIOR is still the shrinkage-shaped failure.
     with pytest.raises(AssertionError, match="temporal:1:spearman .constant_pred.") as e:

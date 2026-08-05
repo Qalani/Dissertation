@@ -1,4 +1,4 @@
-"""§13-CV must not extrapolate a held-out fold, and must not resume past a fix to it.
+"""§13-CV must fit and predict a held-out fold honestly, and not resume past a fix.
 
 The failure this pins down: temporal fold 1 of the ``forcing`` spec came back with a
 NaN Spearman and ``pred_min == pred_max == 2.22e-16`` for all 5,400 held-out rows, so
@@ -6,14 +6,27 @@ NaN Spearman and ``pred_min == pred_max == 2.22e-16`` for all 5,400 held-out row
 floor mgcv clamps betar's inverse logit to -- which means the linear predictor was
 driven off the scale, not that the fit had shrunk to its intercept.
 
-A rolling-origin fold predicts months lying entirely beyond its training window, so
-every ``bs='tp'`` smooth and the raw ``time_index`` trend are evaluated outside the
-range they were fitted on, where both are linear and unbounded. Two things therefore
-have to hold, and both are checked here:
+It was first diagnosed as extrapolation, and that diagnosis was wrong. A rolling-origin
+fold does predict months lying beyond its training window, so every ``bs='tp'`` smooth
+and the raw ``time_index`` trend are evaluated outside the range they were fitted on,
+where both are linear and unbounded -- a real hazard, worth refusing on its own terms.
+But the clamp that refuses it shipped, ran with 100% of that fold's ``time_index``
+held, and returned the fold BIT-IDENTICAL: rmse 0.04802567, mae 0.009322798,
+``area_recovery`` 2.38e-14, the same to every digit as the pre-clamp run. The link was
+already saturated at IN-RANGE covariate values.
+
+What was actually missing is the AR1 correction §13 applies to its own models. Fitted
+at ``rho = 0``, a fold whose lag-1 within-cell residual correlation is ~0.9 is treated
+as ~120,000 independent cell-months; fREML under-smooths and eta runs off the logit
+scale. Four things therefore have to hold, and all four are checked here:
 
 1. the sweep holds each test covariate at the edge of its own fold's training range
    before ``predict()``, and records how much it held so the restriction is reported;
-2. the checkpoint fingerprint covers the fit/predict path, not just the data -- the
+2. it fits each fold with ``rho`` and ``AR.start``, and takes the transfer spec's
+   spatial ``k`` from §13 rather than a literal nothing versions;
+3. every fold records the fit-health columns that separate a saturated FIT from a
+   saturated PREDICT, so the next occurrence does not cost a re-run to diagnose;
+4. the checkpoint fingerprint covers the fit/predict path, not just the data -- the
    run that produced the failure resumed all 12 units from disk and refitted nothing,
    so a fix that did not invalidate those checkpoints would have been a no-op.
 
@@ -122,6 +135,92 @@ def test_the_summary_cell_reports_what_was_held(cells):
 
 
 # ---------------------------------------------------------------------
+# 1b. The fold is FITTED the way §13 fits its models
+# ---------------------------------------------------------------------
+def test_folds_are_fitted_with_the_ar1_correction(cv_cell):
+    """Fitting a fold of this panel at rho = 0 is what saturated the link.
+
+    §13 whitens its own fits (`rho = rho_use, AR.start = ars`); the sweep did not, so
+    ~120,000 cell-months with lag-1 residual correlation ~0.9 were fit as independent.
+    """
+    fit_at = cv_cell.index("fit_eval <- function")
+    fit_body = cv_cell[fit_at:cv_cell.index("# Reference baselines on the SAME folds", fit_at)]
+    assert "rho = rho_use" in fit_body and "AR.start = ars" in fit_body, (
+        "§13-CV is fitting its folds without the AR1 correction §13 applies to its own "
+        "models; an un-whitened fold under-smooths and saturates the link")
+
+    # The rho has to come from outside the cell -- re-piloting per fold would double
+    # every fit -- so it must actually be an input, not a literal.
+    header = cv_cell[:cv_cell.index("\n")]
+    for name in ("GAM_AR1_ENABLED", "GAM_CV_RHO_FORCING_R", "GAM_CV_RHO_PREDICTIVE_R"):
+        assert f"-i {name}" in header, f"{name} is not passed into the §13-CV cell"
+
+
+def test_ar_start_is_built_after_the_predictive_spec_drops_its_rows(cv_cell):
+    """AR.start marks series starts, so it must see the frame that is actually fit.
+
+    Dropping the no-lag rows breaks within-cell contiguity; a mask built before that
+    subset would mark the wrong rows as the start of a series. bam() reads the series
+    off row order, so the frame must be sorted by cell then month as well.
+    """
+    subset_at = cv_cell.index('tr <- tr[as.integer(tr$has_response_lag) == 1L')
+    ars_at = cv_cell.index("ars <- if (rho_use != 0) ar1_starts(")
+    assert subset_at < ars_at, "AR.start is built before the predictive spec subsets"
+
+    sort_at = cv_cell.index("trf <- tr[order(")
+    assert sort_at < ars_at, "the fold is not ordered by cell/month before AR.start"
+    assert "grid_id" in cv_cell[sort_at:ars_at] and "time_rank" in cv_cell[sort_at:ars_at]
+
+
+def test_the_transfer_spatial_basis_is_not_hardcoded(cv_cell):
+    """§13 prints r_formula_cv with GAM_K_SPATIAL; the sweep fitted k=c(12,12).
+
+    The notebook reported a transfer formula it did not fit, and the checkpoint
+    fingerprint versioned a `k_spatial` the sweep ignored.
+    """
+    assert "k=c(12,12)" not in cv_cell, (
+        "the CV spatial basis is hardcoded again; it must come from GAM_K_SPATIAL")
+    assert "-i GAM_K_SPATIAL_R" in cv_cell[:cv_cell.index("\n")]
+    build_at = cv_cell.index("build_rhs <- function")
+    assert "k_sp" in cv_cell[build_at:cv_cell.index("fit_eval <- function", build_at)]
+
+
+def test_every_fold_records_why_it_could_have_saturated(cv_cell):
+    """A saturated fold is either an under-smoothed FIT or an extrapolated PREDICT.
+
+    Both report the same symptom and are fixed in different places, so telling them
+    apart used to mean re-running the whole sweep. Each column is written by BOTH
+    branches of fit_eval, so a resumed frame never has to invent one.
+    """
+    for col in ("ar1_rho", "fit_min", "fit_max", "sp_total", "edf_total", "converged"):
+        assert col in cv_cell, f"{col} is not recorded on the fold"
+    assert "na_health" in cv_cell and "fit_health <- function" in cv_cell
+    # Success branch and failure branch both carry a health block.
+    assert "health, metrics_fn(" in cv_cell
+    assert "na_health, na_metrics)" in cv_cell
+
+
+def test_the_summary_cell_shows_fit_health_before_it_can_raise(cells):
+    """The guardrail RAISES, so anything printed after it is lost on the run that
+    needs it most. The evidence a failure is read against must come first."""
+    summary = [
+        "".join(c["source"])
+        for c in cells
+        if c["cell_type"] == "code"
+        and "# --- CV summary, fold coverage, bound checks" in "".join(c["source"])
+    ]
+    assert len(summary) == 1
+    body = summary[0]
+    health_at = body.index("Fit health per unit")
+    assert_at = body.index("assert_folds_scored(")
+    assert health_at < assert_at, (
+        "the fold guardrail raises before the fit-health table is displayed, so a "
+        "degenerate fold takes the evidence for its own diagnosis with it")
+    coverage_at = body.index("CV_FOLD_COVERAGE = fold_coverage_table")
+    assert coverage_at < assert_at, "fold coverage is lost when the guardrail raises"
+
+
+# ---------------------------------------------------------------------
 # 2. A fix to the sweep must not be resumed past
 # ---------------------------------------------------------------------
 def test_checkpoint_fingerprint_covers_the_cv_predict_path(all_code):
@@ -131,8 +230,9 @@ def test_checkpoint_fingerprint_covers_the_cv_predict_path(all_code):
         "the checkpoint fingerprint does not version the CV fit/predict path; a change "
         "to it will be silently resumed away")
     version = re.search(r'"cv_predict_version":\s*(\d+)', all_code)
-    assert version and int(version.group(1)) >= 2, (
-        "cv_predict_version must be bumped past the pre-clamp path (1)")
+    assert version and int(version.group(1)) >= 3, (
+        "cv_predict_version must be bumped past the un-whitened fit path (2), or the "
+        "checkpoints written by it are resumed and the AR1 fix is a no-op")
 
     # And it must sit in the design dict that is actually hashed, unconditionally --
     # the cv_budget block below it is only recorded when a cap is active.
@@ -178,6 +278,20 @@ ok(sp_why(o, rep(0, 4)) == "constant_pred", "an exact 0 (zero baseline) is not s
 ok(sp_why(o, rep(.Machine$double.eps, 4)) == "saturated_pred", "betar floor is saturation")
 ok(sp_why(o, rep(1 - .Machine$double.eps, 4)) == "saturated_pred", "betar ceiling too")
 ok(sp_why(o, c(0.1, 0.2, 0.3, 0.4)) == "", "a healthy fold states no reason")
+
+# AR.start marks the first row of each independent series bam() must not correlate
+# across. Getting it wrong does not error -- it silently models the wrong dependence.
+d1 <- data.frame(grid_id = c("a", "a", "a", "b", "b"), time_rank = c(0, 1, 2, 0, 1))
+ok(identical(ar1_starts(d1), c(TRUE, FALSE, FALSE, TRUE, FALSE)),
+   "a new cell starts a series, consecutive months do not")
+
+# A month gap inside one cell (§9d drops low-coverage months) is a new series too.
+d2 <- data.frame(grid_id = rep("a", 4), time_rank = c(0, 1, 5, 6))
+ok(identical(ar1_starts(d2), c(TRUE, FALSE, TRUE, FALSE)), "a month gap breaks the series")
+
+ok(identical(ar1_starts(d1[0, ]), logical(0)), "an empty fold yields no starts")
+ok(sum(ar1_starts(d1)) == 2, "one start per contiguous run")
+ok(ar1_starts(data.frame(grid_id = "a", time_rank = 0))[1], "a single row is a start")
 cat("PASS\n")
 """
 
@@ -192,6 +306,8 @@ def test_r_helpers_behave(cv_cell, tmp_path):
         _extract(cv_cell, "clamp_to_train", "\n\n  build_rhs")
         + "\n"
         + _extract(cv_cell, "sp_why", "\n  sp <- function")
+        + "\n"
+        + _extract(cv_cell, "ar1_starts", "\n  fit_health <- function")
         + "\n"
         + R_CHECKS
     )
