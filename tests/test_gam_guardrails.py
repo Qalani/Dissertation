@@ -660,3 +660,78 @@ def test_tag_and_assert_evidence(g):
         g["tag_evidence"](pd.DataFrame({"a": [1]}), "vibes")
     with pytest.raises(AssertionError):
         g["assert_evidence_labelled"]({"raw": pd.DataFrame({"a": [1]})})
+
+
+# ---------------------------------------------------------------------
+# 8. TMB fit-size budget
+# ---------------------------------------------------------------------
+# §13d hands glmmTMB a design whose smooth bases are DENSE, so TMB tapes
+# rows x basis-columns entries for automatic differentiation. Under rpy2 that peak
+# is charged against the same RAM ceiling as the notebook's own frames, and when it
+# is exceeded the whole kernel is SIGKILLed — no R condition, no tryCatch, no
+# session. These pin the sizing that keeps the fit inside the RAM actually free.
+OB_ARGS = dict(n_drivers=8, k_driver=6, k_season=6)
+
+
+def test_available_ram_is_positive_and_falls_back(g):
+    assert g["available_ram_gb"]() > 0
+    # An unreadable /proc must degrade to the caller's floor, not to "unlimited".
+    assert g["available_ram_gb"](fallback_gb=1.5) > 0
+
+
+def test_basis_columns_count_centred_smooths(g):
+    # 8 drivers x (6-1) + (6-1) season + (100-1) spatial
+    assert g["tmb_basis_columns"](8, 6, 6, 100) == 8 * 5 + 5 + 99
+
+
+def test_peak_grows_with_rows_times_basis(g):
+    small = g["tmb_peak_gb"](10_000, 50)
+    assert g["tmb_peak_gb"](20_000, 50) == pytest.approx(2 * small)
+    assert g["tmb_peak_gb"](10_000, 100) == pytest.approx(2 * small)
+
+
+def test_a_fit_inside_the_budget_is_left_alone(g):
+    p = g["budget_tmb_fit"](n_rows=60_000, k_spatial=100, budget_gb=50.0, **OB_ARGS)
+    assert (p["n_rows"], p["k_spatial"]) == (60_000, 100)
+    assert p["feasible"] and p["downsized"] == ""
+
+
+def test_the_spatial_surface_is_cut_before_the_rows(g):
+    """Rows buy the 0/interior/1 masses that identify the cutpoints; the surface
+    is a nuisance control here, so it is what gives way first."""
+    p = g["budget_tmb_fit"](n_rows=60_000, k_spatial=100, budget_gb=1.2, **OB_ARGS)
+    assert p["n_rows"] == 60_000          # rows untouched while the surface can still shrink
+    assert p["k_spatial"] < 100
+    assert "k_spatial" in p["downsized"] and "rows" not in p["downsized"]
+
+
+def test_rows_are_cut_only_once_the_surface_hits_its_floor(g):
+    p = g["budget_tmb_fit"](n_rows=60_000, k_spatial=100, budget_gb=0.4,
+                            min_rows=5_000, min_k_spatial=20, **OB_ARGS)
+    assert p["k_spatial"] == 20           # floored
+    assert p["n_rows"] < 60_000           # and only then did the rows give way
+    assert p["n_rows"] >= 5_000
+    assert p["peak_gb"] <= p["budget_gb"]
+
+
+def test_a_budget_that_cannot_hold_the_floor_is_infeasible(g):
+    p = g["budget_tmb_fit"](n_rows=60_000, k_spatial=100, budget_gb=0.001,
+                            min_rows=8_000, min_k_spatial=20, **OB_ARGS)
+    assert not p["feasible"], "a fit that does not fit its floor must be skipped, not attempted"
+
+
+def test_a_frame_smaller_than_the_row_floor_is_still_feasible(g):
+    """min_rows is the floor the BUDGET may cut to, not a minimum the data owes.
+
+    A small panel (the test fixtures, a coarse grid) was never downsized, so it must
+    not be reported as too big to fit.
+    """
+    p = g["budget_tmb_fit"](n_rows=7_200, k_spatial=50, budget_gb=40.0,
+                            min_rows=8_000, **OB_ARGS)
+    assert p["n_rows"] == 7_200
+    assert p["feasible"] and p["downsized"] == ""
+
+
+def test_no_budget_at_all_is_infeasible_rather_than_unbounded(g):
+    p = g["budget_tmb_fit"](n_rows=60_000, k_spatial=100, budget_gb=0.0, **OB_ARGS)
+    assert not p["feasible"]

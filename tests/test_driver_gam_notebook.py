@@ -333,3 +333,179 @@ def test_sibling_predictive_notebook_is_untouched_by_these_rules():
     drv = NOTEBOOK.read_text()
     assert "winam_wh_spatial_panel_predictive_ml" in drv, (
         "the driver notebook should still point at its sibling")
+
+
+# ---------------------------------------------------------------------
+# Ordered-Beta memory contract (§13d and the ordbeta family in §13e)
+# ---------------------------------------------------------------------
+# glmmTMB maps every mgcv s() term onto a random-effect block over a DENSE spline
+# basis, so TMB tapes rows x basis-columns entries for automatic differentiation.
+# rpy2 runs R inside the Python process, so that peak is charged against one Colab
+# RAM ceiling together with every frame the notebook holds. Asking for 60,000 rows
+# against s(x_km, y_km, k=100) exhausted it and the runtime was killed mid-fit.
+#
+# An out-of-memory kill is a SIGKILL to the whole process: no R condition is
+# raised and no tryCatch() runs, which is why the session died rather than
+# reporting an error. These pin the two things that make it survivable — size the
+# fit against the RAM actually free, and run it somewhere that is not this session.
+def test_ordbeta_subsample_is_budgeted_against_free_ram(code_sources):
+    s = _cell_containing(code_sources, "13d. Ordered-Beta cross-check")
+    assert "available_ram_gb()" in s, "the subsample must be sized against RAM read at run time"
+    assert "budget_tmb_fit(" in s
+    assert "GAM_ORDBETA_RUN_R" in s, (
+        "the R cell needs an EFFECTIVE run flag so an unaffordable fit is skipped, "
+        "not attempted")
+
+
+def test_ordbeta_fit_runs_in_a_child_process(code_sources):
+    s = _cell_containing(code_sources, "fit_ordbeta_isolated <- function")
+    assert "system2(" in s and "Rscript" in s, (
+        "the fit must run in a child R process; a tryCatch() in this session cannot "
+        "catch the SIGKILL that an out-of-memory kill delivers")
+    assert "timeout_s" in s, "a child that never returns must be given up on"
+    assert "137L" in s, "an out-of-memory kill (exit 137) must be named as such"
+
+
+def test_the_child_reports_r_errors_so_a_missing_file_means_a_kill(code_sources):
+    """The child saves output on BOTH paths, which is what makes the signal clean."""
+    s = _cell_containing(code_sources, "fit_ordbeta_isolated <- function")
+    child = s[s.index("writeLines("):s.index("rs <- Sys.which")]
+    assert "error = function(e) list(ok = FALSE" in child
+    assert child.count("saveRDS(out, a[2]") == 1, (
+        "the child must write its result file on success AND on an R error, so that a "
+        "MISSING file unambiguously means it was killed")
+
+
+def test_ordbeta_isolation_is_on_by_default(code_sources):
+    d = _cell_containing(code_sources, "13d. Ordered-Beta cross-check")
+    e = _cell_containing(code_sources, "13e. Model-family comparison")
+    assert re.search(r"^GAM_ORDBETA_ISOLATE\s*=\s*True", d, re.M)
+    assert re.search(r"^MFC_ORDBETA_ISOLATE\s*=\s*True", e, re.M)
+
+
+def test_family_comparison_ordbeta_goes_through_the_isolated_fitter(code_sources):
+    """§13e fits one model per mode x fold x family. One killed ordered-Beta fold
+    used to cost the session and every other fit in the sweep."""
+    s = _cell_containing(code_sources, "13e comparison skipped")
+    assert s.count("glmmTMB::glmmTMB(") == 1, (
+        "the only glmmTMB call in §13e must be the one inside ob_fit_predict(); every "
+        "caller goes through it so a killed fold degrades to an NA metric row")
+    body = s[s.index("predict_family <- function"):]
+    assert "glmmTMB::glmmTMB(" not in body, "predict_family must not fit glmmTMB directly"
+    assert body.count("ob_fit_predict(") == 2, (
+        "both the ordbeta family and the hurdle's ordered-Beta positive stage must use it")
+
+
+def test_ordbeta_spatial_basis_is_budgeted_not_squared(all_source):
+    assert "MFC_K_SPATIAL)[1]^2" not in all_source, (
+        "the ordered-Beta spatial basis was derived as MFC_K_SPATIAL ** 2 (144, capped "
+        "at 100); that dense basis on a 60,000-row subsample is what exhausted the runtime")
+    assert "MFC_ORDBETA_K_SPATIAL_R" in all_source
+
+
+def test_ordbeta_failure_is_reported_not_swallowed(code_sources):
+    s = _cell_containing(code_sources, "fit_ordbeta_isolated <- function")
+    assert "did not produce a fit" in s
+    assert "NOT RUN" in s, "a cross-check that did not run must never read as one that did"
+
+
+def test_isolated_fitter_actually_survives_a_killed_child(cells, tmp_path):
+    """Execute the child-process contract for real, when Rscript is available.
+
+    Static checks cannot see the two things that matter here: that a child killed
+    the way the OOM killer kills it (SIGKILL) leaves the parent alive and
+    correctly diagnosed, and that the formula survives the hand-off. The latter is
+    easy to get wrong — ``as.character()`` on a formula yields ``c("~", lhs, rhs)``,
+    so a ``[1]`` subscript ships "~" and every fit fails in the child.
+    """
+    import shutil
+    import subprocess
+
+    rscript = shutil.which("Rscript")
+    if not rscript:
+        pytest.skip("Rscript not installed")
+
+    body = None
+    for c in cells:
+        if c["cell_type"] != "code":
+            continue
+        s = "".join(c["source"])
+        if "fit_ordbeta_isolated <- function" in s:
+            body = s[s.index("fit_ordbeta_isolated <- function"):s.index("\nrun_ob")]
+    assert body, "no cell defines fit_ordbeta_isolated"
+    (tmp_path / "helper.R").write_text(body)
+
+    driver = r'''
+setwd(commandArgs(trailingOnly = TRUE)[1])
+source("helper.R")
+set.seed(1); tr <- data.frame(y = runif(200), x = rnorm(200)); te <- tr[1:37, ]
+
+# glmmTMB is not a test dependency: swap in a glm so the hand-off, the prediction
+# vector and the summary text are exercised without it.
+src <- paste(deparse(body(fit_ordbeta_isolated)), collapse = "\n")
+src <- gsub("glmmTMB::glmmTMB(as.formula(p$form), data = p$train,",
+            "glm(as.formula(p$form), data = p$train,", src, fixed = TRUE)
+src <- gsub("family = glmmTMB::ordbeta())", "family = quasibinomial())", src, fixed = TRUE)
+src <- gsub("isTRUE(m$sdr$pdHess)", "isTRUE(m$converged)", src, fixed = TRUE)
+stub <- fit_ordbeta_isolated; body(stub) <- parse(text = src)[[1]]
+
+# 1. success: a FORMULA object survives the hand-off and predicts onto newdata.
+r <- stub(tr, y ~ x, newdata = te, timeout_s = 120)
+stopifnot(isTRUE(r$ok), length(r$pred) == nrow(te), is.finite(r$fitted_max),
+          length(r$summary_txt) > 1)
+# 2. newdata = NULL predicts in-sample.
+stopifnot(length(stub(tr, y ~ x, timeout_s = 120)$pred) == nrow(tr))
+# 3. an R-level error in the child comes back as a message, not a dead session.
+e <- fit_ordbeta_isolated(tr, y ~ x, timeout_s = 120)   # real one: no glmmTMB here
+stopifnot(identical(e$ok, FALSE), nzchar(e$why))
+# 4. a child killed exactly as the OOM killer kills it: parent alive and correct.
+ksrc <- sub("writeLines\\(c\\(", 'writeLines(c("tools::pskill(Sys.getpid(), 9)", ',
+            paste(deparse(body(fit_ordbeta_isolated)), collapse = "\n"))
+killer <- fit_ordbeta_isolated; body(killer) <- parse(text = ksrc)[[1]]
+k <- killer(tr, y ~ x, timeout_s = 120)
+stopifnot(identical(k$ok, FALSE), isTRUE(k$killed), grepl("out of memory", k$why))
+# 5. no temp files left behind by any of those paths.
+stopifnot(length(list.files(tempdir(), pattern = "^ordbeta")) == 0)
+cat("OK\n")
+'''
+    (tmp_path / "driver.R").write_text(driver)
+    proc = subprocess.run([rscript, "--vanilla", str(tmp_path / "driver.R"), str(tmp_path)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0 and "OK" in proc.stdout, (
+        f"child-process contract failed:\nstdout={proc.stdout}\nstderr={proc.stderr}")
+
+
+def test_recorded_k_spatial_survives_a_wrapped_formula(cells, tmp_path):
+    """The k_spatial recorded in ordbeta_summary is read back out of the fitted
+    formula, and R's deparse() WRAPS a long one. Rejoining the pieces leaves runs
+    of whitespace at the wrap points, so a spatial term that happens to straddle a
+    wrap reported k_spatial as NA — and a downsized cross-check that does not say
+    what it was downsized to reads as the one that was requested.
+    """
+    import shutil
+    import subprocess
+
+    rscript = shutil.which("Rscript")
+    if not rscript:
+        pytest.skip("Rscript not installed")
+
+    src = next("".join(c["source"]) for c in cells
+               if c["cell_type"] == "code" and "k_sp <- suppressWarnings" in "".join(c["source"]))
+    extract = src[src.index("form_txt <- gsub"):src.index("ordbeta_summary <- data.frame(engine")]
+
+    # Where deparse() breaks depends on the whole formula, so this uses a driver
+    # count whose wrap lands INSIDE the spatial term — the case that actually broke.
+    # The two stopifnot()s keep the test honest: if a future R wraps elsewhere they
+    # fail loudly rather than letting this pass without exercising anything.
+    script = ('form <- as.formula("wh_cover ~ s(rain, k=6) + s(month_num, k=6) '
+              '+ s(x_km, y_km, k=50)")\n'
+              'raw <- paste(deparse(form), collapse = " ")\n'
+              'stopifnot(length(deparse(form)) > 1)              # it really does wrap\n'
+              'stopifnot(grepl("y_km,[[:space:]]{2,}", raw))     # and inside the spatial term\n'
+              + extract +
+              '\nstopifnot(identical(k_sp, 50L)); cat("OK\\n")\n')
+    f = tmp_path / "k.R"
+    f.write_text(script)
+    proc = subprocess.run([rscript, "--vanilla", str(f)], capture_output=True, text=True)
+    assert proc.returncode == 0 and "OK" in proc.stdout, (
+        f"k_spatial not recovered from a wrapped formula:\n{proc.stdout}{proc.stderr}")
