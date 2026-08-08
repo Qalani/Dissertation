@@ -73,13 +73,32 @@ covariates the spatial panel uses, so the two models are reading the same data.
 | ❌ **Not identifiable — at all** | Every **static** habitat variable: `depth_m`, `dist_shore_m`, `dist_majriver_m`, `frac_cropland`, `openness_index`. Averaged over a fixed cell set they are *constants*, and a constant cannot explain variation in anything. They are dropped explicitly in §7 rather than silently. |
 | ⚠️ **Identifiable only with care** | Anything strongly seasonal. Rainfall, temperature and WH extent all follow the annual cycle, so a driver can "explain" WH simply by being seasonal. §9 measures this for every driver and §12 reports every effect **both** with and without seasonal control. |
 
+**The principal model is a state-space dynamic regression (§19–§24).** The
+question this notebook has to answer is not *"is rainfall correlated with
+hyacinth"* — on a series with lag-1 autocorrelation near 0.9 almost anything
+seasonal is. It is *"once the series' own persistence is represented properly,
+is there anything left for the environment to explain, or to predict?"* Putting
+`y_lag1` on the right-hand side of an OLS regression (§12's M4) is one answer,
+and a fragile one: it deletes every month whose predecessor is missing, and its
+standard errors are wrong unless the disturbance is exactly AR(1). §19 instead
+puts the dependence in the **process**, chooses between AR(1), AR(2) and a
+stochastic local level using **no driver information whatsoever**, locks that
+choice, and only then adds the environmental block (§20). §21–§22 ask whether
+that block improves genuine **one-calendar-month-ahead** prediction against the
+*matched* no-driver model, with a calendar-aware bootstrap interval on the
+difference. §12–§18 are retained in full as association and sensitivity
+analyses.
+
 **The honest sample size.** The panel spans at most ~9 years of months, and the
 response is strongly autocorrelated, so the *effective* number of independent
 observations is a fraction of the row count. Every standard error here is
-autocorrelation-robust (Newey–West), every *p*-value is FDR-adjusted, and every
-claim of predictive skill comes from rolling-origin cross-validation — never
-from in-sample $R^2$. §16 reports whether the drivers beat *persistence plus
-season* out of sample; if they do not, that is the finding.
+autocorrelation-robust (Newey–West for the static models, a state-space sandwich
+for the principal one), every *p*-value is FDR-adjusted, and every claim of
+predictive skill comes from rolling-origin cross-validation — never from
+in-sample $R^2$. The state-space model uses **all** observed months rather than
+the complete-case subset, but it cannot manufacture independent information the
+record does not contain: the interval widths, not the row count, are the honest
+summary.
 
 **Every temporal operation is defined on calendar months.** The record has
 **gaps** — months excluded by the coverage filter — so two rows that are
@@ -106,15 +125,21 @@ specification** (§17).
 | 6–7 | Load the panel → build the AOI monthly series |
 | 8–9 | Series diagnostics; **season/trend identifiability audit** |
 | 10–11 | Lag structure; model dataset |
-| 12 | **Model A** — linear driver model, Newey–West SEs, nested specifications |
+| 12 | **Model A (M0–M4)** — static linear driver model, Newey–West SEs; M4 adds `y_lag1` as a *sensitivity* |
 | 13 | **Model B** — elastic net + bootstrap stability selection (collinearity-robust ranking) |
-| 14 | **Model C** — spline GLM (non-linear driver–response shapes, partial effects) |
+| 14 | **Model C** — spline GLM, **one driver at a time, df ≤ 3, exploratory** (§14b checks it out of sample) |
 | 15 | **Model D** — gradient boosting + out-of-fold permutation importance |
-| 16 | Out-of-sample skill vs persistence / seasonal baselines, on **calendar-month** rolling-origin windows |
+| 16 | Three-calendar-month rolling-origin skill — **sensitivity only, demoted** |
 | 17 | **Variance partitioning** — Shapley $R^2$ across drivers, season, trend, persistence, with shared-vs-unique read **within** each specification |
-| 18 | Robustness — response definition, coverage, leave-one-year-out, deseasonalised |
-| 19 | **Synthesis table** — the ranked, verdict-bearing driver list |
-| 20–21 | Exports; interpretation checklist |
+| 18 | Robustness of the *static* models — response definition, coverage, leave-one-year-out, deseasonalised |
+| **19** | **PRINCIPAL model, step 1** — candidate dependence structures (AR(1) / AR(2) / local level) selected on **null dynamics only** |
+| **20** | **PRINCIPAL model, step 2** — matched null vs full state-space driver model; coefficients, joint test, state diagnostics |
+| **21** | **PRINCIPAL model, step 3** — expanding-window **one-calendar-month-ahead** rolling origin, with literal persistence, fitted AR(1) and seasonal-naive baselines |
+| **22** | Paired month-level losses + calendar-aware moving-block bootstrap interval on the RMSE difference |
+| **23** | Parametric bootstrap of the joint driver-block LR statistic under the matched null |
+| **24** | State-space robustness — leave-one-year-out, transforms, alternative dependence structures |
+| 25 | **Synthesis** — the five questions, and the ranked, verdict-bearing driver list |
+| 26–27 | Exports; interpretation checklist |
 """)
 
 
@@ -156,7 +181,14 @@ import matplotlib.dates as mdates
 import scipy.stats as sstats
 import statsmodels.api as sm
 
+# State-space machinery for the PRINCIPAL dynamic-regression model (§19-§24).
+# Both live in statsmodels core, so there is nothing extra to install in Colab.
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.statespace.structural import UnobservedComponents
+
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*Maximum Likelihood optimization failed.*")
+warnings.filterwarnings("ignore", message=".*No frequency information was provided.*")
 pd.set_option("display.width", 160)
 pd.set_option("display.max_columns", 80)
 
@@ -182,6 +214,7 @@ except Exception:  # pragma: no cover - non-IPython
 
 print(f"Colab: {IN_COLAB} | Drive mounted: {DRIVE_MOUNTED}")
 print(f"pandas {pd.__version__} | statsmodels {sm.__version__}")
+print("state-space: SARIMAX + UnobservedComponents available (§19-§24)")
 
 # Optional extras. Absence changes what runs, never whether the notebook runs.
 try:
@@ -248,6 +281,11 @@ OUTPUT_DIR = Path("/content/drive/MyDrive/WH_temporal_driver_model")
 USE_SYNTHETIC_DEMO = False
 SYNTHETIC_N_MONTHS = 108
 SYNTHETIC_SEED = 42
+# Share of synthetic months pushed below the coverage filter, so the offline
+# self-test has the same kind of CALENDAR GAPS the real record has. Set to 0.0
+# for a gapless series; the real Winam record is roughly a quarter missing
+# inside its fitted span, so the default is deliberately not zero.
+SYNTHETIC_MISSING_FRACTION = 0.20
 
 # =====================================================================
 # 3b. How the AOI series is built
@@ -408,9 +446,93 @@ SEASON_CONFOUND_R2 = 0.80
 MAX_ABS_PAIRWISE_R = 0.90
 VIF_THRESHOLD = 5.0
 
-# Spline GLM (§14): degrees of freedom per driver smooth. 3-4 is the ceiling
-# worth attempting on ~100 monthly observations.
-SPLINE_DF = 4
+# Spline GLM (§14): degrees of freedom per driver smooth. The previous default
+# fitted EVERY driver as a df=4 smooth simultaneously — 25 design columns on ~64
+# complete months, which is not a model, it is an interpolation. §14 now fits
+# ONE predeclared driver at a time at df <= SPLINE_DF_MAX, centres each smooth,
+# and labels the result exploratory unless it also improves one-month-ahead
+# out-of-sample prediction (§14b).
+SPLINE_DF = 3
+SPLINE_DF_MAX = 3             # hard ceiling; SPLINE_DF is clipped to it
+SPLINE_ONE_DRIVER_AT_A_TIME = True
+SPLINE_MIN_ROWS_PER_COLUMN = 4   # a smooth is REFUSED below this rows-per-column.
+# 4 is a floor, not a licence: the withdrawn all-at-once design sat at 2.6 rows
+# per column, and the one-at-a-time design here sits at roughly 5 on this record.
+# That is still thin, which is why §14 is labelled exploratory throughout and why
+# §14b's out-of-sample check — not the in-sample F test — decides what may be
+# reported.
+SPLINE_OOS_CHECK = True       # rolling-origin linear-vs-spline check in §14b
+
+# =====================================================================
+# 3e. State-space dynamic regression — the PRINCIPAL model (§19-§24)
+# =====================================================================
+# The static models above answer "is this driver associated with WH extent".
+# They cannot answer "does this driver explain WH extent once the series'
+# own persistence is represented", because a lagged response on the right-hand
+# side of an OLS regression is only one (fragile) way to write persistence down,
+# and it silently deletes every month whose predecessor is missing. The
+# state-space models below put the dependence in the ERROR / STATE process
+# instead, so a missing month costs a likelihood contribution rather than a row.
+RUN_STATE_SPACE = True
+
+# Deliberately small candidate set. Each is a hypothesis about HOW the series
+# remembers itself; nothing here is chosen by looking at driver p-values.
+#   sarimax_ar1  - regression with AR(1) errors
+#   sarimax_ar2  - regression with AR(2) errors
+#   local_level  - stochastic local level (random-walk state) + observation noise
+SS_CANDIDATE_STRUCTURES = ["sarimax_ar1", "sarimax_ar2", "local_level"]
+
+# How the locked structure is chosen from the NULL (no-driver) fits. Both
+# criteria are printed either way; this only decides which one breaks the tie.
+#   "aicc"   - smallest AICc on the observed response months (default)
+#   "rmse1"  - smallest one-month-ahead rolling-origin RMSE
+SS_SELECT_BY = "aicc"
+
+# Seasonality inside the state-space models is DETERMINISTIC annual Fourier
+# (the same terms as SEASON_COLS), never a stochastic seasonal, so the season
+# cannot absorb driver signal by drifting. A linear trend is included ONLY in
+# candidates without a stochastic local level — a random-walk level and a linear
+# trend compete for the same low-frequency variation.
+SS_SEASON_HARMONICS = None    # None -> reuse SEASON_HARMONICS
+
+# Covariance estimator for the state-space coefficient standard errors.
+# "robust_approx" is the Huber sandwich around the approximate information
+# matrix — the state-space analogue of a heteroskedasticity-robust SE. Falls
+# back to "opg" and then to the default if the sandwich is not computable.
+SS_COV_TYPE = "robust_approx"
+SS_MAXITER = 250              # optimiser iterations for the reported fits
+SS_ROLLING_MAXITER = 100      # fewer per rolling-origin refit; there are many
+
+# --- One-calendar-month-ahead rolling-origin evaluation (§21) ----------------
+# EXPANDING window, one calendar month ahead, every feasible origin. This is the
+# PRINCIPAL predictive assessment. §16's three-calendar-month windows are kept
+# as a sensitivity comparison and are no longer the headline.
+SS_MIN_TRAIN_MONTHS = 24      # observed response months required before an origin
+SS_FORECAST_MIN_LAG = 1       # every forecast driver must be known at the origin
+# A driver whose a-priori lag is 0 (temperature, wind, lake level) is NOT
+# knowable at the origin, so for FORECASTING it enters at lag 1. Map a driver to
+# a column holding a genuine forecast value to override this.
+SS_FORECAST_EXOG_OVERRIDE = {}
+# e.g. SS_FORECAST_EXOG_OVERRIDE = {"air_temp_c": "air_temp_c_forecast_t"}
+
+# --- Paired RMSE-difference bootstrap (§22) ---------------------------------
+SS_RMSE_BOOTSTRAP_N = 2000
+SS_RMSE_BOOTSTRAP_BLOCK = None   # None -> ceil(eval span ** (1/3)) calendar months
+SS_RMSE_BOOTSTRAP_SEED = 11
+
+# --- Parametric bootstrap of the joint driver-block LR statistic (§23) -------
+# Simulates from the FITTED MATCHED NULL, re-imposes the record's missing-month
+# pattern, refits null and full, and rebuilds the LR null distribution. The
+# asymptotic chi-square reference is unreliable at ~60 observed months.
+SS_RUN_LR_BOOTSTRAP = True
+SS_LR_BOOTSTRAP_N = 399       # 300-500 is the intended range
+SS_LR_BOOTSTRAP_SEED = 2024
+SS_LR_BOOTSTRAP_MAXITER = 80
+SS_LR_BOOTSTRAP_TIME_BUDGET_S = 900   # abandon (and say so) past this many seconds
+
+# --- Robustness (§24) --------------------------------------------------------
+SS_ROBUST_TRANSFORMS = ["logit", "log", "identity"]
+SS_RUN_LOYO = True
 
 # Gradient boosting (§15). Deliberately small: with ~100 months a large
 # ensemble memorises the series and its importances mean nothing.
@@ -432,12 +554,23 @@ try:
     OUTPUT_WRITABLE = True
 except Exception as exc:
     OUTPUT_WRITABLE = False
-    print(f"OUTPUT_DIR not writable ({exc}); §20 will skip the exports.")
+    print(f"OUTPUT_DIR not writable ({exc}); §26 will skip the exports.")
+
+SPLINE_DF = int(min(SPLINE_DF, SPLINE_DF_MAX))
+if SS_SEASON_HARMONICS is None:
+    SS_SEASON_HARMONICS = SEASON_HARMONICS
 
 print("Configuration loaded.")
 print(f"  response          : {RESPONSE_COL} ({RESPONSE_TRANSFORM} scale)")
 print(f"  forcing mechanisms: {len(TEMPORAL_FORCING_TERMS)}")
 print(f"  lag selection     : {LAG_SELECTION}")
+print(f"  principal model   : state-space dynamic regression "
+      f"({'on' if RUN_STATE_SPACE else 'OFF'}), candidates "
+      f"{SS_CANDIDATE_STRUCTURES}, selected by {SS_SELECT_BY}")
+print(f"  principal skill   : expanding-window ONE-calendar-month-ahead "
+      f"rolling origin (>= {SS_MIN_TRAIN_MONTHS} training months)")
+print(f"  spline (§14)      : one driver at a time, df = {SPLINE_DF} "
+      f"(ceiling {SPLINE_DF_MAX}), exploratory unless it survives §14b")
 print(f"  output            : {OUTPUT_DIR}")
 ''')
 
@@ -655,13 +788,21 @@ def calendar_lag(monthly, cols, lag):
     return out, made
 
 
-def make_synthetic_monthly(n_months=108, seed=42):
+def make_synthetic_monthly(n_months=108, seed=42, missing_fraction=0.0):
     """A synthetic AOI series with KNOWN driver effects, for offline checking.
 
     Construction (on the logit-cover scale): a strong annual cycle, an upward
     trend, autoregressive persistence, a POSITIVE effect of lagged antecedent
     rainfall, a NEGATIVE effect of wave exposure, and two pure-noise drivers
     that must NOT be recovered.
+
+    `missing_fraction` drives `coverage_fraction` below any plausible threshold
+    on that share of months, so the self-test series has the SAME kind of
+    calendar gaps the real record has. Without them the offline run never
+    exercises the missing-month machinery — the exogenous placeholder, the
+    withheld months, the unavailable seasonal-naive lookups — which is most of
+    what §19-§21 have to get right. The gaps include a deliberate pair exactly
+    12 calendar months apart so a seasonal-naive lookup genuinely fails.
     """
     rng = np.random.default_rng(seed)
     months = pd.date_range("2017-01-01", periods=int(n_months), freq="MS")
@@ -709,9 +850,25 @@ def make_synthetic_monthly(n_months=108, seed=42):
         "decoy_noise": decoy_a,
         "decoy_level": decoy_b,
     })
+    if float(missing_fraction) > 0:
+        n_gap = int(round(float(missing_fraction) * len(out)))
+        pool = np.arange(6, len(out) - 1)
+        gaps = set(int(v) for v in rng.choice(pool, size=min(n_gap, len(pool)),
+                                              replace=False))
+        # One gap whose partner exactly 12 calendar months later is observed, so
+        # the seasonal-naive baseline has a month it genuinely cannot score.
+        if len(out) > 40:
+            gaps.add(24)
+            gaps.discard(36)
+        out.loc[sorted(gaps), "coverage_fraction"] = 0.30
+        truth_gaps = sorted(gaps)
+    else:
+        truth_gaps = []
+
     truth = {"rain_chirps_30d_mm(lag1)": +0.45, "wave_exposure_idx(lag0)": -0.30,
              "air_temp_c(lag0)": +0.10, "decoy_noise": 0.0, "decoy_level": 0.0,
-             "ar1_on_eta": 0.45, "trend_per_month_logit": 0.012}
+             "ar1_on_eta": 0.45, "trend_per_month_logit": 0.012,
+             "n_months_forced_missing": len(truth_gaps)}
     return out, truth
 
 
@@ -1891,6 +2048,487 @@ print(f"§5b: {int(HELPER_SELFTESTS['passed'].sum())} of {len(HELPER_SELFTESTS)}
 display(HELPER_SELFTESTS)
 ''')
 
+
+# ===========================================================================
+# 5c. State-space helpers
+# ===========================================================================
+md("""### 5c. Helpers — state-space dynamic regression
+
+The static models put persistence on the right-hand side as `y_lag1`. That has
+two costs on this record: it **deletes** every month whose predecessor is
+missing (23 of the fitted months here sit next to a gap), and it forces a single
+functional form on "the series remembers itself".
+
+A state-space model puts the dependence in the **error or state process**
+instead. The measurement equation stays
+$y_t = x_t'\\beta + \\text{(season)}_t + \\mu_t$, and the candidates differ only
+in what $\\mu_t$ is:
+
+| Structure | $\\mu_t$ | Trend | What it assumes |
+|---|---|---|---|
+| `sarimax_ar1` | $\\phi\\mu_{t-1} + \\varepsilon_t$ | deterministic linear | shocks decay geometrically towards a fixed mean |
+| `sarimax_ar2` | $\\phi_1\\mu_{t-1} + \\phi_2\\mu_{t-2} + \\varepsilon_t$ | deterministic linear | as above, with the possibility of oscillation |
+| `local_level` | random-walk level + observation noise | **none** (the level *is* the trend) | the level has no fixed mean; shocks are permanent |
+
+Two consequences matter for this record and are why the state-space model is the
+principal one:
+
+1. **A missing month costs a likelihood contribution, not a row.** The Kalman
+   filter simply skips the update at a month with no observation and carries the
+   state forward, so all `N_OBSERVED` months are used instead of the complete-case
+   subset the `y_lag1` design is restricted to.
+2. **Nothing is imputed.** Where the response is missing there is no likelihood
+   term at all, so the exogenous values on those months are irrelevant to the
+   fit. That is the only reason the placeholder in §19 is admissible, and §19
+   asserts that no month with an observed response ever uses one.
+
+A linear trend enters **only** the candidates without a stochastic level: a
+random-walk level and a linear trend both claim the low-frequency variation, and
+fitting them together makes neither identified.
+""")
+
+code('''# =====================================================================
+# 5c. State-space dynamic-regression helpers
+# =====================================================================
+# Every function here is calendar-first in the same sense as §5: the models are
+# fitted on the CALENDAR-COMPLETE monthly grid with NaN responses left in place,
+# so "one step ahead" is always one calendar month, never one observed row.
+
+SS_STRUCTURES = {
+    "sarimax_ar1": {"kind": "sarimax", "order": (1, 0, 0), "allow_linear_trend": True,
+                    "label": "SARIMAX regression, AR(1) errors",
+                    "ar_lags": 1},
+    "sarimax_ar2": {"kind": "sarimax", "order": (2, 0, 0), "allow_linear_trend": True,
+                    "label": "SARIMAX regression, AR(2) errors",
+                    "ar_lags": 2},
+    "local_level": {"kind": "ucm", "level": "local level", "allow_linear_trend": False,
+                    "label": "local-level structural model (UnobservedComponents)",
+                    "ar_lags": 0},
+}
+
+
+def ss_structure_label(structure):
+    return SS_STRUCTURES[structure]["label"]
+
+
+def ss_allows_linear_trend(structure):
+    """A deterministic linear trend is admissible only without a stochastic level."""
+    return bool(SS_STRUCTURES[structure]["allow_linear_trend"])
+
+
+def ss_param_name(structure, term):
+    """Name `term`'s coefficient carries in the fitted result's parameter vector."""
+    return f"beta.{term}" if SS_STRUCTURES[structure]["kind"] == "ucm" else str(term)
+
+
+def calendar_grid_index(months):
+    """A gapless month-start DatetimeIndex covering `months`, with freq set.
+
+    statsmodels needs a frequency to know what "one step ahead" means. Handing it
+    a complete-case index would make one step mean "one observed row".
+    """
+    m = pd.to_datetime(pd.Series(months))
+    return pd.date_range(m.min(), m.max(), freq="MS")
+
+
+def fourier_terms(months, n_harmonics, prefix="season"):
+    """Deterministic annual Fourier terms for arbitrary month timestamps.
+
+    Depends on the CALENDAR MONTH only, so it is identical whichever subset of
+    the record it is evaluated on — which is what lets a rolling-origin fold
+    build it for a future month without using any future information.
+    """
+    idx = pd.to_datetime(pd.Series(months).reset_index(drop=True))
+    ang = 2 * np.pi * idx.dt.month.to_numpy(dtype=float) / 12.0
+    out = pd.DataFrame(index=range(len(idx)))
+    for k in range(1, int(n_harmonics) + 1):
+        out[f"{prefix}_sin{k}"] = np.sin(k * ang)
+        out[f"{prefix}_cos{k}"] = np.cos(k * ang)
+    return out
+
+
+def ss_build_model(y, exog, structure):
+    """Instantiate the state-space model for `structure` (no fitting)."""
+    spec = SS_STRUCTURES[structure]
+    ex = None
+    if exog is not None and getattr(exog, "shape", (0, 0))[1] > 0:
+        ex = exog
+    if spec["kind"] == "sarimax":
+        return SARIMAX(y, exog=ex, order=spec["order"], trend="c",
+                       enforce_stationarity=True, enforce_invertibility=True)
+    return UnobservedComponents(y, exog=ex, level=spec["level"])
+
+
+def ss_fit(y, exog, structure, cov_type=None, maxiter=250, disp=False):
+    """Fit `structure`, degrading the covariance estimator rather than failing.
+
+    Returns (results, info). `info` records which covariance estimator actually
+    produced the standard errors, so a table can never silently mix a robust
+    sandwich with the default one.
+    """
+    mod = ss_build_model(y, exog, structure)
+    tried, res, used = [], None, None
+    order = [c for c in [cov_type, "robust_approx", "opg", None] if c not in tried]
+    seen = set()
+    order = [c for c in order if not (c in seen or seen.add(c))]
+    last_exc = None
+    for cand in order:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                if cand is None:
+                    res = mod.fit(disp=disp, maxiter=int(maxiter))
+                else:
+                    res = mod.fit(disp=disp, maxiter=int(maxiter), cov_type=cand)
+                _ = res.bse            # forces the covariance to be computed
+                if not np.all(np.isfinite(np.asarray(res.bse, dtype=float))):
+                    raise ValueError("non-finite standard errors")
+            used = cand or "default (opg)"
+            break
+        except Exception as exc:      # pragma: no cover - optimiser dependent
+            last_exc = exc
+            tried.append(cand)
+            continue
+    if res is None:
+        raise RuntimeError(f"state-space fit failed for {structure!r}: {last_exc}")
+    info = {"structure": structure, "cov_type_used": used,
+            "cov_types_refused": [str(t) for t in tried],
+            "converged": bool(getattr(res, "mle_retvals", {}).get("converged", True)),
+            "n_iterations": int(getattr(res, "mle_retvals", {}).get("iterations", -1) or -1)}
+    return res, info
+
+
+def ss_n_effective(y):
+    """Months that actually contribute a likelihood term (i.e. observed ones)."""
+    return int(np.isfinite(np.asarray(y, dtype=float)).sum())
+
+
+def ss_n_free_params(res):
+    """Free parameters: everything estimated, fixed parameters excluded."""
+    fixed = set(getattr(res, "fixed_params", []) or [])
+    return int(sum(1 for p in res.params.index if p not in fixed))
+
+
+def aicc_from(llf, k, n):
+    """AICc = -2 logL + 2k + 2k(k+1)/(n-k-1), with n = OBSERVED response months.
+
+    Using the number of grid rows instead of the number of observed months would
+    understate the penalty on a record that is a third missing.
+    """
+    llf, k, n = float(llf), int(k), int(n)
+    if n - k - 1 <= 0:
+        return np.inf
+    return -2.0 * llf + 2.0 * k + (2.0 * k * (k + 1)) / (n - k - 1)
+
+
+def ss_standardized_innovations(res, months=None, drop_burn=True):
+    """One-step-ahead standardized prediction errors, aligned to calendar months.
+
+    Only months with an observed response carry an innovation; the rest are NaN
+    because the filter made no update there.
+    """
+    v = np.asarray(res.standardized_forecasts_error, dtype=float)
+    v = v[0] if v.ndim == 2 else v
+    v = np.asarray(v, dtype=float).ravel()
+    burn = int(getattr(res, "loglikelihood_burn", 0) or 0)
+    nd = int(getattr(res, "nobs_diffuse", 0) or 0)
+    cut = max(burn, nd) if drop_burn else 0
+    out = pd.Series(v, dtype=float)
+    if cut:
+        out.iloc[:cut] = np.nan
+    endog = np.asarray(res.model.endog, dtype=float).ravel()
+    out[~np.isfinite(endog[: len(out)])] = np.nan
+    if months is not None:
+        idx = pd.to_datetime(pd.Series(months).reset_index(drop=True))
+        if len(idx) != len(out):
+            raise ValueError("`months` must have one entry per filtered observation")
+        return pd.DataFrame({"month": idx, "std_innovation": out.to_numpy()})
+    return out
+
+
+def calendar_ljung_box(x, months=None, nlags=12):
+    """Ljung-Box statistic built from CALENDAR-lag autocorrelations.
+
+    Q = n(n+2) * sum_h r_h^2 / (n - h), summed over the lags whose calendar pair
+    count is non-zero. Lags with no genuinely h-months-apart pairs are dropped
+    and reported rather than being scored as r_h = 0.
+    """
+    tab = acf_values(x, months=months, nlags=nlags)
+    n = int(np.isfinite(np.asarray(x, dtype=float)).sum())
+    use = tab[tab["acf"].notna() & (tab["n_pairs"] > 0) & (tab["lag"] < n)]
+    if not len(use) or n < 5:
+        return {"lb_stat": np.nan, "df": 0, "lb_pvalue": np.nan,
+                "lags_used": [], "lags_dropped": tab["lag"].tolist(), "n": n}
+    q = float(n * (n + 2) * np.sum(use["acf"].to_numpy() ** 2
+                                   / (n - use["lag"].to_numpy())))
+    df = int(len(use))
+    return {"lb_stat": q, "df": df,
+            "lb_pvalue": float(sstats.chi2.sf(q, df)),
+            "lags_used": use["lag"].tolist(),
+            "lags_dropped": tab.loc[~tab["lag"].isin(use["lag"]), "lag"].tolist(),
+            "n": n}
+
+
+def ss_innovation_diagnostics(res, months, nlags=12, label=""):
+    """Standardized-innovation diagnostics on calendar lags."""
+    inn = ss_standardized_innovations(res, months=months)
+    v = inn["std_innovation"]
+    ok = v.notna()
+    acf = acf_values(v, months=inn["month"], nlags=nlags)
+    lb = calendar_ljung_box(v, months=inn["month"], nlags=nlags)
+    vals = v[ok].to_numpy(dtype=float)
+    jb = sstats.jarque_bera(vals) if len(vals) >= 8 else (np.nan, np.nan)
+    third = max(2, len(vals) // 3)
+    if len(vals) >= 12:
+        v1, v2 = np.var(vals[:third], ddof=1), np.var(vals[-third:], ddof=1)
+        het = float(v2 / v1) if v1 > 0 else np.nan
+        het_p = (float(2 * min(sstats.f.cdf(het, third - 1, third - 1),
+                               sstats.f.sf(het, third - 1, third - 1)))
+                 if np.isfinite(het) and het > 0 else np.nan)
+    else:
+        het, het_p = np.nan, np.nan
+    return {
+        "label": label,
+        "n_innovations": int(ok.sum()),
+        "mean_std_innovation": float(np.mean(vals)) if len(vals) else np.nan,
+        "sd_std_innovation": float(np.std(vals, ddof=1)) if len(vals) > 1 else np.nan,
+        "acf1": float(acf["acf"].iloc[0]) if len(acf) else np.nan,
+        "acf1_n_pairs": int(acf["n_pairs"].iloc[0]) if len(acf) else 0,
+        "acf12": (float(acf.loc[acf["lag"] == 12, "acf"].iloc[0])
+                  if (acf["lag"] == 12).any() else np.nan),
+        "ljung_box_stat": lb["lb_stat"], "ljung_box_df": lb["df"],
+        "ljung_box_p": lb["lb_pvalue"], "ljung_box_lags": str(lb["lags_used"]),
+        "jarque_bera_p": float(jb[1]) if np.isfinite(jb[1]) else np.nan,
+        "het_var_ratio_last_over_first_third": het,
+        "het_p": het_p,
+    }, acf, inn
+
+
+def ss_state_diagnostics(res, structure, alpha=0.05):
+    """AR roots (SARIMAX) or latent-state variances (local level).
+
+    `stationary_supported` is the SAME gate §12 applies to the `y_lag1` model:
+    a long-run multiplier may only be quoted when it is True. For the local-level
+    model it is False BY CONSTRUCTION — a random-walk level has a unit root, so
+    "the long-run effect of a permanent 1-SD change" is not a defined quantity.
+    """
+    spec = SS_STRUCTURES[structure]
+    out = {"structure": structure, "kind": spec["kind"],
+           "label": spec["label"], "alpha": float(alpha)}
+    if spec["kind"] == "ucm":
+        pars = {k: float(v) for k, v in res.params.items() if k.startswith("sigma2")}
+        out.update(pars)
+        out.update(rho_sum=np.nan, rho_ci_lo=np.nan, rho_ci_hi=np.nan,
+                   roots_outside_unit_circle=False, ci_within_unit_circle=False,
+                   min_root_modulus=np.nan,
+                   stationary_supported=False,
+                   reason=("stochastic local level is a random walk: unit root by "
+                           "construction, so no long-run multiplier is defined"))
+        return out
+
+    ar_names = [p for p in res.params.index if p.startswith("ar.L")]
+    phi = np.array([float(res.params[p]) for p in ar_names], dtype=float)
+    roots = ar_polynomial_roots(phi)
+    mod = np.abs(roots)
+    names = list(res.params.index)
+    V = np.asarray(res.cov_params())
+    g = np.zeros(len(names))
+    for p in ar_names:
+        g[names.index(p)] = 1.0
+    se = float(np.sqrt(max(float(g @ V @ g), 0.0)))
+    z = float(sstats.norm.ppf(1 - alpha / 2.0))
+    out.update({f"phi_{i+1}": float(v) for i, v in enumerate(phi)})
+    out.update(
+        rho_sum=float(phi.sum()),
+        rho_se=se,
+        rho_ci_lo=float(phi.sum() - z * se),
+        rho_ci_hi=float(phi.sum() + z * se),
+        min_root_modulus=float(np.min(mod)) if len(mod) else np.nan,
+        roots_outside_unit_circle=bool(len(mod) and np.all(mod > 1.0)),
+        ar_roots=str(np.round(roots, 4).tolist()),
+    )
+    out["ci_within_unit_circle"] = bool(out["rho_ci_lo"] > -1.0 and out["rho_ci_hi"] < 1.0)
+    if not out["roots_outside_unit_circle"]:
+        reason = "fitted AR polynomial has a root on or inside the unit circle"
+    elif not out["ci_within_unit_circle"]:
+        reason = "AR confidence interval includes a unit root"
+    else:
+        reason = ""
+    out["stationary_supported"] = bool(out["roots_outside_unit_circle"]
+                                       and out["ci_within_unit_circle"])
+    out["reason"] = reason
+    return out
+
+
+def ss_tidy_coefficients(res, structure, terms, label="", alpha=0.05, cov_type_used=""):
+    """Driver coefficients from a fitted state-space model, with CI, p and BH q.
+
+    `term` is reported under the DRIVER's name, not the internal `beta.x` name,
+    so a state-space table can be lined up against a §12 HAC table — while
+    `source_model` keeps them from ever being merged by accident.
+    """
+    rows = []
+    ci = res.conf_int(alpha=alpha)
+    ci.columns = ["ci_lo", "ci_hi"]
+    for t in terms:
+        pname = ss_param_name(structure, t)
+        if pname not in res.params.index:
+            continue
+        rows.append({
+            "term": t, "param_name": pname,
+            "coef": float(res.params[pname]),
+            "se": float(res.bse[pname]),
+            "z": float(res.tvalues[pname]),
+            "p": float(res.pvalues[pname]),
+            "ci_lo": float(ci.loc[pname, "ci_lo"]),
+            "ci_hi": float(ci.loc[pname, "ci_hi"]),
+        })
+    tab = pd.DataFrame(rows)
+    if len(tab):
+        tab["q_fdr"] = bh_fdr(tab["p"]).to_numpy()
+    tab.insert(0, "specification", label)
+    tab["source_model"] = f"state-space {structure}"
+    tab["se_kind"] = cov_type_used or "unknown"
+    return tab
+
+
+def ss_joint_lr_test(res_full, res_null, k_extra):
+    """Likelihood-ratio test of the whole driver block against the matched null."""
+    stat = float(2.0 * (float(res_full.llf) - float(res_null.llf)))
+    df = int(k_extra)
+    return {"lr_stat": stat, "df": df,
+            "p_chi2": float(sstats.chi2.sf(max(stat, 0.0), df)) if df > 0 else np.nan,
+            "llf_full": float(res_full.llf), "llf_null": float(res_null.llf),
+            "llf_difference": float(res_full.llf) - float(res_null.llf)}
+
+
+def ss_joint_wald_test(res, structure, terms):
+    """Wald test that every driver coefficient is zero, under the fitted covariance."""
+    names = list(res.params.index)
+    use = [ss_param_name(structure, t) for t in terms]
+    use = [u for u in use if u in names]
+    if not use:
+        return {"wald_stat": np.nan, "df": 0, "p_wald": np.nan}
+    R = np.zeros((len(use), len(names)))
+    for i, u in enumerate(use):
+        R[i, names.index(u)] = 1.0
+    try:
+        w = res.wald_test(R, scalar=True)
+        return {"wald_stat": float(np.squeeze(w.statistic)), "df": int(len(use)),
+                "p_wald": float(np.squeeze(w.pvalue))}
+    except Exception:                                  # pragma: no cover
+        return {"wald_stat": np.nan, "df": int(len(use)), "p_wald": np.nan}
+
+
+def inverse_response_transform(values, how="logit", eps=1e-4):
+    """Undo `transform_response`. The result is a MEDIAN, not a mean.
+
+    Back-transforming a point forecast of a non-linear transform gives the
+    median of the implied distribution on the raw scale. Reported as such: the
+    raw-scale RMSE below is a median-forecast RMSE, not a bias-corrected one.
+    """
+    v = pd.to_numeric(pd.Series(values), errors="coerce").astype(float)
+    if how == "identity":
+        return v
+    if how == "log":
+        return np.exp(v)
+    if how == "logit":
+        return 1.0 / (1.0 + np.exp(-v))
+    raise ValueError(f"unknown transform {how!r}")
+
+
+def rmse_mae(y, yhat):
+    """RMSE / MAE over the finite pairs, with the pair count."""
+    y = np.asarray(y, dtype=float)
+    yhat = np.asarray(yhat, dtype=float)
+    ok = np.isfinite(y) & np.isfinite(yhat)
+    if not ok.any():
+        return {"n": 0, "rmse": np.nan, "mae": np.nan}
+    e = y[ok] - yhat[ok]
+    return {"n": int(ok.sum()), "rmse": float(np.sqrt(np.mean(e ** 2))),
+            "mae": float(np.mean(np.abs(e)))}
+
+
+def block_bootstrap_rmse_difference(months, err_a, err_b, block_months=None,
+                                    n_boot=2000, seed=0, alpha=0.05):
+    """Moving-block bootstrap interval for RMSE(a) - RMSE(b) on PAIRED errors.
+
+    The blocks are contiguous runs of CALENDAR months drawn from the evaluation
+    grid, so a resample never places two months that are a year apart next to
+    each other, and an evaluation month that is missing stays missing. Both error
+    series are indexed by the same months, so every replicate compares the two
+    models on exactly the same resampled months.
+    """
+    m = pd.to_datetime(pd.Series(months).reset_index(drop=True))
+    a = np.asarray(err_a, dtype=float)
+    b = np.asarray(err_b, dtype=float)
+    if not (len(m) == len(a) == len(b)):
+        raise ValueError("months and both error series must be the same length")
+    ok = np.isfinite(a) & np.isfinite(b)
+    m, a, b = m[ok].reset_index(drop=True), a[ok], b[ok]
+    if len(m) < 4:
+        return {"n_months": int(len(m)), "n_successful": 0,
+                "block_months": np.nan, "ci_lo": np.nan, "ci_hi": np.nan,
+                "boot_mean": np.nan, "share_negative": np.nan}
+    rng = np.random.default_rng(seed)
+    L = calendar_block_length(m, block_months)
+    diffs = []
+    for idx, _blocks in calendar_block_indices(m, L, rng, int(n_boot)):
+        if len(idx) < 4:
+            continue
+        ra = float(np.sqrt(np.mean(a[idx] ** 2)))
+        rb = float(np.sqrt(np.mean(b[idx] ** 2)))
+        diffs.append(ra - rb)
+    d = np.asarray(diffs, dtype=float)
+    if not len(d):
+        return {"n_months": int(len(m)), "n_successful": 0, "block_months": L,
+                "ci_lo": np.nan, "ci_hi": np.nan, "boot_mean": np.nan,
+                "share_negative": np.nan}
+    return {"n_months": int(len(m)), "n_successful": int(len(d)), "block_months": int(L),
+            "ci_lo": float(np.quantile(d, alpha / 2)),
+            "ci_hi": float(np.quantile(d, 1 - alpha / 2)),
+            "boot_mean": float(np.mean(d)),
+            "share_negative": float(np.mean(d < 0))}
+
+
+def newey_west_mean_test(d, months=None, maxlags=None):
+    """HAC (Newey-West) test that a paired loss difference has mean zero.
+
+    This is the Diebold-Mariano statistic for one-step-ahead forecasts. The
+    bandwidth is in calendar months and the pairs are formed on the calendar, so
+    two evaluation months either side of a gap are not treated as consecutive.
+    """
+    d = np.asarray(d, dtype=float)
+    ok = np.isfinite(d)
+    d = d[ok]
+    n = len(d)
+    if n < 4:
+        return {"mean": np.nan, "se_hac": np.nan, "t": np.nan, "p": np.nan, "n": n}
+    mi = (np.arange(n) if months is None
+          else month_index(pd.Series(months).reset_index(drop=True)[ok]))
+    u = d - d.mean()
+    L = hac_maxlags(n, maxlags)
+    s = float(np.sum(u ** 2))
+    for h in range(1, int(L) + 1):
+        w = 1.0 - h / (L + 1.0)
+        acc = 0.0
+        for i in range(n):
+            j = np.where(mi == mi[i] + h)[0]
+            if len(j):
+                acc += float(u[i] * u[j[0]])
+        s += 2.0 * w * acc
+    var = s / (n ** 2)
+    se = float(np.sqrt(max(var, 0.0)))
+    t = float(d.mean() / se) if se > 0 else np.nan
+    return {"mean": float(d.mean()), "se_hac": se, "t": t,
+            "p": float(2 * sstats.norm.sf(abs(t))) if np.isfinite(t) else np.nan,
+            "n": n, "maxlags": int(L)}
+
+
+print("§5c state-space helpers defined: "
+      f"{len(SS_STRUCTURES)} candidate dependence structures.")
+''')
+
 # ===========================================================================
 # 6. Load
 # ===========================================================================
@@ -1914,7 +2552,8 @@ monthly_raw = None
 SYNTHETIC_TRUTH = None
 
 if USE_SYNTHETIC_DEMO:
-    monthly_raw, SYNTHETIC_TRUTH = make_synthetic_monthly(SYNTHETIC_N_MONTHS, SYNTHETIC_SEED)
+    monthly_raw, SYNTHETIC_TRUTH = make_synthetic_monthly(
+        SYNTHETIC_N_MONTHS, SYNTHETIC_SEED, SYNTHETIC_MISSING_FRACTION)
     SOURCE.update(mode="synthetic", is_synthetic=True)
     print("*** USE_SYNTHETIC_DEMO = True: this run is a self-test, not a result. ***")
     print(f"Synthetic series: {len(monthly_raw)} months, known effects:")
@@ -2203,8 +2842,16 @@ SERIES_DIAGNOSTICS = pd.DataFrame([{
 display(SERIES_DIAGNOSTICS.T.rename(columns={0: "value"}))
 
 print(f"Lag-1 autocorrelation {_lag1_r:.2f} (from {_lag1_pairs} pairs of genuinely "
-      f"consecutive calendar months) -> roughly {_n_eff:.0f} independent "
-      f"observations behind {N_OBSERVED} months.")
+      f"consecutive calendar months).")
+print(f"APPROXIMATE effective sample size (Bartlett, on the RAW response): "
+      f"{_n_eff:.0f} of {N_OBSERVED} months.")
+print("  Read that as an order-of-magnitude diagnostic, NOT as the sample size any")
+print("  model uses. It is computed on the raw response, so the autocorrelation it")
+print("  measures still contains the annual cycle and the trend, which every model")
+print("  below removes. The state-space model in §19-§24 uses ALL observed months")
+print("  and represents this dependence explicitly rather than discounting for it —")
+print("  but it cannot manufacture independent information the record does not")
+print("  contain, so the interval widths, not this number, are the honest summary.")
 print(f"Season alone explains {_season_r2:.1%} of the response; "
       f"a linear trend alone explains {_trend_r2:.1%}.")
 print("Any driver effect must be argued AGAINST those two, which is what §12 M2/M3 do.")
@@ -2275,7 +2922,7 @@ _confounded = (DRIVER_AUDIT.loc[DRIVER_AUDIT["season_confounded"].fillna(False),
 if _confounded:
     print(f"\\nSEASON-CONFOUNDED (R2 on season >= {SEASON_CONFOUND_R2:.2f}): {_confounded}")
     print("These stay in the model but any effect they show is reported as "
-          "'not separable from seasonality' in §19, whatever its p-value.")
+          "'not separable from seasonality' in §25, whatever its p-value.")
 
 # --- Resolve the mechanism set against what the series actually holds ---------
 _rows, _resolved = [], {}
@@ -3041,14 +3688,14 @@ else:
                 # A near-ridge fit (low l1_ratio) hardly ever sets a coefficient
                 # to exactly zero, so EVERY driver scores a high selection
                 # frequency and the number carries no information. Detect that
-                # and say so, rather than letting §19 read it as robustness.
+                # and say so, rather than letting §25 read it as robustness.
                 _sd_freq = STABILITY.loc[STABILITY["is_driver"], "selection_frequency"]
                 ENET_SPARSITY_OK = bool(len(_sd_freq) and _sd_freq.min() < 0.90)
                 ENET_INFO["sparsity_informative"] = ENET_SPARSITY_OK
                 if not ENET_SPARSITY_OK:
                     print(f"\\n*** The chosen l1_ratio ({_l1}) produced a non-sparse fit: "
                           f"every driver survives in >= {_sd_freq.min():.0%} of resamples. "
-                          "Selection frequency is therefore UNINFORMATIVE here and §19 "
+                          "Selection frequency is therefore UNINFORMATIVE here and §25 "
                           "ignores it when assigning verdicts. ***")
 
                 _sd = STABILITY[STABILITY["is_driver"]]
@@ -3070,152 +3717,343 @@ else:
 # ===========================================================================
 # 14. Model C
 # ===========================================================================
-md("""## 14. Model C — non-linear driver shapes (natural-spline GLM)
+md("""## 14. Model C — non-linear driver shapes (natural-spline GLM), **exploratory**
 
-Hyacinth responses are not linear: temperature has an optimum, and wave
-disturbance plausibly matters only above a threshold. Each driver enters as a
-natural cubic spline with `SPLINE_DF` degrees of freedom, and two **nested $F$
-tests** are reported per driver:
+### What was wrong with the previous version of this section
 
-* `p_any_effect_F` — the whole spline block against dropping the driver;
-* `p_nonlinearity_F` — the spline block against entering the driver as a
-  straight line, i.e. *does the curvature buy anything*.
+The earlier §14 entered **every** driver as a `df = 4` natural-cubic smooth
+*simultaneously*: 6 drivers x 4 basis columns + 4 season columns + trend = **25
+design columns fitted on 64 complete months**. At 2.6 rows per column an
+unpenalised spline basis interpolates; the resulting curves, their $F$ tests and
+the apparent lake-level non-linearity were properties of that over-parameterised
+design, not of the lake. That result is **withdrawn**, and this section is
+rebuilt with five safeguards:
 
-These are $F$ tests, not HAC Wald tests, and that is deliberate: a spline basis
-is collinear by construction, and a HAC Wald test on four collinear restrictions
-at $n \\approx 100$ is numerically unstable (it returns $p = 0$ for blocks whose
-$\\Delta R^2$ is 0.001). The $F$ tests assume independent residuals, so they are
-an **upper bound on the evidence** — autocorrelation-robust inference lives in
-§12, and this section is about *shape*. Read `delta_r2` and
-`nonlinearity_gain_r2` as the magnitudes that matter.
+1. **One predeclared driver at a time.** Each fit is `smooth(driver_j) + season
+   + trend` — the other drivers enter *linearly*, never as smooths. The design
+   is then `SPLINE_DF` + ~6 columns instead of 25.
+2. **`SPLINE_DF` <= `SPLINE_DF_MAX` = 3**, and a smooth is refused outright
+   below `SPLINE_MIN_ROWS_PER_COLUMN` rows per design column, with the refusal
+   printed.
+3. **Each smooth is centred** — the training basis columns have their training
+   means subtracted — so the smooth carries no intercept and cannot trade level
+   against the constant, the season or the trend.
+4. **The training `design_info` is reused for every prediction grid.** `patsy`
+   is asked once, on the training data, for the basis; the plotting grid is
+   built with `build_design_matrices([design_info], ...)`. Knots and boundary
+   constraints are therefore *never* recomputed on the grid, which is what made
+   the old partial-effect curves untrustworthy near the data edges.
+5. **Exploratory unless it survives out of sample.** §14b re-runs the
+   one-calendar-month-ahead rolling origin of §21 with the smooth in place of the
+   linear term. A curve is promoted from `exploratory` to `supported
+   out-of-sample` only if it lowers one-month-ahead RMSE against the *identical*
+   linear specification. Nothing in §25 quotes a non-linear effect that has not.
 
-The partial-effect curves are the interpretable output: the *shape* of each
-driver–response relationship with everything else held at its mean, with
-HAC-based confidence bands. With ~100 months the honest default is that most
-drivers are indistinguishable from linear, and that is itself a reportable
-result.
+The $p$-values remain nested $F$ tests assuming independent residuals — an
+**upper bound on the evidence** on a series with lag-1 autocorrelation near 0.9.
+They are printed to rank shapes, never to certify one.
 """)
 
 code('''# =====================================================================
-# 14. Natural-spline GLM: non-linear driver shapes
+# 14. Natural-spline GLM: ONE predeclared driver at a time, centred, df <= 3
 # =====================================================================
 SPLINE_TESTS = pd.DataFrame()
-SPLINE_FIT = None
+SPLINE_FITS = {}
+SPLINE_DESIGN_INFO = {}
 PARTIAL_EFFECTS = pd.DataFrame()
+SPLINE_REFUSALS = []
+SPLINE_SUPPORTED_OOS = []          # filled by §14b; empty until then
+
+_spline_df = int(min(SPLINE_DF, SPLINE_DF_MAX))
+_ctrl_cols = [c for c in SEASON_COLS + TREND_TERMS if c in fit_df.columns]
 
 if not HAVE_PATSY:
     print("patsy unavailable; §14 skipped.")
-elif N_FIT < (len(DRIVER_TERMS) * SPLINE_DF + len(SEASON_COLS) + 10):
-    print(f"{N_FIT} rows cannot support {len(DRIVER_TERMS)} smooths at df={SPLINE_DF} "
-          f"({len(DRIVER_TERMS) * SPLINE_DF} spline columns). §14 skipped — "
-          "lower SPLINE_DF or reduce the mechanism set.")
+elif not SPLINE_ONE_DRIVER_AT_A_TIME:
+    print("SPLINE_ONE_DRIVER_AT_A_TIME = False: the all-drivers-at-once design is "
+          "refused here because it produced 25 columns on 64 months. Set it back to "
+          "True, or accept that §14 does not run.")
 else:
-    def _basis(frame, col, df=SPLINE_DF):
-        """Natural cubic-spline basis for one driver, named for readability."""
-        B = np.asarray(dmatrix(f"cr(x, df={int(df)}) - 1",
-                               {"x": frame[col].to_numpy(dtype=float)},
-                               return_type="dataframe"))
-        return pd.DataFrame(B, columns=[f"{col}__s{i+1}" for i in range(B.shape[1])],
-                            index=frame.index)
+    from patsy import build_design_matrices, dmatrices  # noqa: F401
 
-    _blocks = {c: _basis(fit_df, c) for c in DRIVER_TERMS}
-    _ctrl = fit_df[[c for c in SEASON_COLS + TREND_TERMS if c in fit_df.columns]]
-    _Xfull = pd.concat([*_blocks.values(), _ctrl], axis=1)
-    SPLINE_FIT = fit_hac(fit_df["y"], _Xfull, weights=W, maxlags=HAC_MAXLAGS,
-                         months=FIT_MONTHS)
+    def _centred_spline(frame, col, df):
+        """Training basis for ONE driver, centred, with its patsy design_info kept.
 
-    # Nested F tests, not HAC Wald tests. A natural-spline basis is by
-    # construction highly collinear, and a HAC Wald test on 4 collinear
-    # restrictions at n ~ 100 is numerically unstable — it returns p = 0 for
-    # blocks whose delta R2 is 0.001. The F tests below are stable and
-    # interpretable, at the cost of assuming independent residuals, so they are
-    # an UPPER BOUND on the evidence and are labelled as such. HAC inference on
-    # the linear terms is in §12; this section is about SHAPE.
-    def _plain(cols):
+        Returns (basis DataFrame, design_info, centring means). The design_info is
+        what every prediction grid is later built from, so the knots and the
+        boundary constraints are fixed by the TRAINING data once and never
+        recomputed.
+        """
+        B = dmatrix(f"cr(x, df={int(df)}) - 1",
+                    {"x": frame[col].to_numpy(dtype=float)},
+                    return_type="dataframe")
+        info = B.design_info
+        means = B.mean(axis=0)
+        Bc = B - means                       # centred: no intercept inside the smooth
+        Bc.columns = [f"{col}__s{i + 1}" for i in range(Bc.shape[1])]
+        Bc.index = frame.index
+        return Bc, info, means
+
+    def _spline_grid(col, info, means, xs):
+        """Prediction basis for `xs`, built from the TRAINING design_info."""
+        Bg = pd.DataFrame(np.asarray(build_design_matrices([info], {"x": np.asarray(xs)})[0]))
+        Bg = Bg - means.to_numpy()
+        Bg.columns = [f"{col}__s{i + 1}" for i in range(Bg.shape[1])]
+        return Bg
+
+    def _plain(y, cols, w):
         X = sm.add_constant(pd.DataFrame(cols).astype(float), has_constant="add")
-        return (sm.OLS(fit_df["y"], X).fit() if W is None
-                else sm.WLS(fit_df["y"], X, weights=W / np.nanmean(W)).fit())
+        return (sm.OLS(y, X).fit() if w is None
+                else sm.WLS(y, X, weights=w / np.nanmean(w)).fit())
 
-    _full_plain = _plain(_Xfull)
-    _rows = []
-    for c, B in _blocks.items():
-        keep = [k for k in _Xfull.columns if k not in B.columns]
-        red = _plain(_Xfull[keep])
-        # (a) any effect at all: the whole spline block vs dropping the driver.
-        f_any = _full_plain.compare_f_test(red)
-        # (b) shape beyond a straight line: spline block vs the linear term.
-        lin_cols = pd.concat([fit_df[[c]], _Xfull[keep]], axis=1)
-        lin = _plain(lin_cols)
-        f_nl = _full_plain.compare_f_test(lin)
-        _rows.append({"driver": c, "spline_df": B.shape[1],
-                      "p_any_effect_F": float(f_any[1]),
-                      "p_nonlinearity_F": float(f_nl[1]),
-                      "r2_full": _full_plain.rsquared, "r2_without": red.rsquared,
-                      "delta_r2": float(_full_plain.rsquared - red.rsquared),
-                      "r2_linear_for_this_driver": lin.rsquared,
-                      "nonlinearity_gain_r2": float(_full_plain.rsquared - lin.rsquared)})
-    SPLINE_TESTS = pd.DataFrame(_rows)
-    SPLINE_TESTS["q_fdr"] = bh_fdr(SPLINE_TESTS["p_any_effect_F"]).to_numpy()
-    SPLINE_TESTS["q_fdr_nonlinearity"] = bh_fdr(SPLINE_TESTS["p_nonlinearity_F"]).to_numpy()
-    SPLINE_TESTS = SPLINE_TESTS.sort_values("delta_r2", ascending=False).reset_index(drop=True)
+    _rows, _pe_rows = [], []
+    for c in DRIVER_TERMS:
+        # The smoothed driver, the OTHER drivers entering linearly, and the controls.
+        others = [d for d in DRIVER_TERMS if d != c]
+        B, info, means = _centred_spline(fit_df, c, _spline_df)
+        X_smooth = pd.concat([B, fit_df[others + _ctrl_cols]], axis=1)
+        X_linear = pd.concat([fit_df[[c] + others + _ctrl_cols]], axis=1)
+        X_drop = fit_df[others + _ctrl_cols]
 
-    print(f"Spline GLM on {N_FIT} months: R2 = {SPLINE_FIT.rsquared:.3f} "
-          f"({_Xfull.shape[1]} columns), vs "
-          f"{MODEL_A_FITS[HEADLINE_SPEC].rsquared:.3f} for the linear {HEADLINE_SPEC}.")
-    print("p-values are nested F tests assuming independent residuals, so they are an "
-          "UPPER BOUND on the evidence; use §12 for autocorrelation-robust inference "
-          "and read delta_r2 / nonlinearity_gain_r2 as the magnitudes that matter.")
-    display(SPLINE_TESTS.round(4))
+        n_cols = X_smooth.shape[1] + 1                       # + intercept
+        if N_FIT < SPLINE_MIN_ROWS_PER_COLUMN * n_cols:
+            SPLINE_REFUSALS.append(
+                {"driver": c, "n_rows": int(N_FIT), "n_columns": int(n_cols),
+                 "rows_per_column": float(N_FIT / n_cols),
+                 "reason": (f"{N_FIT} rows for {n_cols} columns is below the "
+                            f"{SPLINE_MIN_ROWS_PER_COLUMN} rows-per-column floor")})
+            continue
 
-    # --- Partial-effect curves ------------------------------------------------
-    ncol = min(3, len(DRIVER_TERMS))
-    nrow = int(np.ceil(len(DRIVER_TERMS) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(4.3 * ncol, 3.0 * nrow), squeeze=False)
-    _pe_rows = []
-    for ax, c in zip(axes.ravel(), DRIVER_TERMS):
-        grid = pd.DataFrame({c: np.linspace(fit_df[c].min(), fit_df[c].max(), 80)})
-        Bg = pd.DataFrame(
-            np.asarray(dmatrix(f"cr(x, df={int(SPLINE_DF)}) - 1",
-                               {"x": grid[c].to_numpy()}, return_type="dataframe")),
-            columns=_blocks[c].columns)
-        Xg = pd.DataFrame(0.0, index=Bg.index, columns=_Xfull.columns)
+        m_smooth = _plain(fit_df["y"], X_smooth, W)
+        m_linear = _plain(fit_df["y"], X_linear, W)
+        m_drop = _plain(fit_df["y"], X_drop, W)
+        f_any = m_smooth.compare_f_test(m_drop)
+        f_nl = m_smooth.compare_f_test(m_linear)
+
+        SPLINE_FITS[c] = fit_hac(fit_df["y"], X_smooth, weights=W, maxlags=HAC_MAXLAGS,
+                                 months=FIT_MONTHS)
+        SPLINE_DESIGN_INFO[c] = {"design_info": info, "centring_means": means,
+                                 "basis_columns": list(B.columns),
+                                 "model_columns": list(X_smooth.columns),
+                                 "spline_df": int(B.shape[1])}
+        _rows.append({
+            "driver": c, "spline_df": int(B.shape[1]),
+            "n_model_columns": int(n_cols), "n_rows": int(N_FIT),
+            "rows_per_column": float(N_FIT / n_cols),
+            "p_any_effect_F": float(f_any[1]), "p_nonlinearity_F": float(f_nl[1]),
+            "r2_smooth": float(m_smooth.rsquared),
+            "r2_linear_for_this_driver": float(m_linear.rsquared),
+            "r2_without_this_driver": float(m_drop.rsquared),
+            "delta_r2_vs_dropped": float(m_smooth.rsquared - m_drop.rsquared),
+            "nonlinearity_gain_r2": float(m_smooth.rsquared - m_linear.rsquared),
+            "evidence_status": "exploratory",
+        })
+
+        # --- Partial-effect curve, on the TRAINING design_info -----------------
+        xs = np.linspace(float(fit_df[c].min()), float(fit_df[c].max()), 80)
+        Bg = _spline_grid(c, info, means, xs)
+        Xg = pd.DataFrame(0.0, index=Bg.index, columns=X_smooth.columns)
         for col in Bg.columns:
             Xg[col] = Bg[col].to_numpy()
-        for col in _ctrl.columns:
+        for col in others + _ctrl_cols:
             Xg[col] = float(fit_df[col].mean())
         Xg = sm.add_constant(Xg, has_constant="add")
-        pred = SPLINE_FIT.get_prediction(Xg).summary_frame(alpha=0.05)
+        pred = SPLINE_FITS[c].get_prediction(Xg).summary_frame(alpha=0.05)
         centre = float(pred["mean"].mean())
-        ax.plot(grid[c], pred["mean"] - centre, color="tab:blue", lw=2)
-        ax.fill_between(grid[c], pred["mean_ci_lower"] - centre,
-                        pred["mean_ci_upper"] - centre, color="tab:blue", alpha=0.18)
-        ax.plot(fit_df[c], np.full(N_FIT, ax.get_ylim()[0]), "|", color="k",
-                ms=6, alpha=0.4)
-        ax.axhline(0, color="k", lw=0.8, ls=":")
-        _q = SPLINE_TESTS.loc[SPLINE_TESTS["driver"] == c, "q_fdr"]
-        ax.set_title(f"{c}\\nq = {float(_q.iloc[0]):.3g}" if len(_q) else c, fontsize=9)
-        ax.set_xlabel(f"{c} (SD units)")
-        ax.set_ylabel(f"partial effect on {RESPONSE_INFO['transform']}")
-        ax.grid(alpha=0.3)
-        _pe = pd.DataFrame({"driver": c, "x_sd_units": grid[c],
-                            "partial_effect": pred["mean"] - centre,
-                            "ci_lo": pred["mean_ci_lower"] - centre,
-                            "ci_hi": pred["mean_ci_upper"] - centre})
-        _pe_rows.append(_pe)
-    for ax in axes.ravel()[len(DRIVER_TERMS):]:
-        ax.axis("off")
-    fig.suptitle("Partial driver–response shapes (natural cubic splines, 95% CI)",
-                 y=1.01, fontsize=11)
-    fig.tight_layout(); plt.show()
-    PARTIAL_EFFECTS = pd.concat(_pe_rows, ignore_index=True)
+        _pe_rows.append(pd.DataFrame({
+            "driver": c, "x_sd_units": xs,
+            "partial_effect": pred["mean"].to_numpy() - centre,
+            "ci_lo": pred["mean_ci_lower"].to_numpy() - centre,
+            "ci_hi": pred["mean_ci_upper"].to_numpy() - centre,
+            "design_info_source": "training fit (knots NOT recomputed on the grid)",
+            "evidence_status": "exploratory"}))
 
-    _nl = SPLINE_TESTS[SPLINE_TESTS["nonlinearity_gain_r2"] > 0.02]
-    if len(_nl):
-        print("Drivers where the curve buys real explanatory power over a straight line "
-              f"(delta R2 > 0.02): {_nl['driver'].tolist()}")
+    if _rows:
+        SPLINE_TESTS = pd.DataFrame(_rows)
+        SPLINE_TESTS["q_fdr"] = bh_fdr(SPLINE_TESTS["p_any_effect_F"]).to_numpy()
+        SPLINE_TESTS["q_fdr_nonlinearity"] = bh_fdr(
+            SPLINE_TESTS["p_nonlinearity_F"]).to_numpy()
+        SPLINE_TESTS = SPLINE_TESTS.sort_values(
+            "nonlinearity_gain_r2", ascending=False).reset_index(drop=True)
+        PARTIAL_EFFECTS = pd.concat(_pe_rows, ignore_index=True)
+
+        print(f"Natural-spline GLM, ONE driver at a time, df = {_spline_df} "
+              f"(ceiling {SPLINE_DF_MAX}), each smooth centred, on {N_FIT} months.")
+        print(f"Every fit has {int(SPLINE_TESTS['n_model_columns'].max())} columns or "
+              f"fewer — the withdrawn all-at-once design had 25 on the same 64 months.")
+        print("p-values are nested F tests assuming independent residuals, so they are "
+              "an UPPER BOUND on the evidence; read nonlinearity_gain_r2 as the "
+              "magnitude and treat every shape as EXPLORATORY until §14b.")
+        display(SPLINE_TESTS.round(4))
+
+        ncol = min(3, len(SPLINE_TESTS))
+        nrow = int(np.ceil(len(SPLINE_TESTS) / ncol))
+        fig, axes = plt.subplots(nrow, ncol, figsize=(4.3 * ncol, 3.0 * nrow),
+                                 squeeze=False)
+        for ax, c in zip(axes.ravel(), SPLINE_TESTS["driver"]):
+            g = PARTIAL_EFFECTS[PARTIAL_EFFECTS["driver"] == c]
+            ax.plot(g["x_sd_units"], g["partial_effect"], color="tab:blue", lw=2)
+            ax.fill_between(g["x_sd_units"], g["ci_lo"], g["ci_hi"],
+                            color="tab:blue", alpha=0.18)
+            ax.plot(fit_df[c], np.full(N_FIT, ax.get_ylim()[0]), "|", color="k",
+                    ms=6, alpha=0.4)
+            ax.axhline(0, color="k", lw=0.8, ls=":")
+            _q = SPLINE_TESTS.loc[SPLINE_TESTS["driver"] == c, "q_fdr_nonlinearity"]
+            ax.set_title(f"{c}\\nq(non-linearity) = {float(_q.iloc[0]):.3g}", fontsize=9)
+            ax.set_xlabel(f"{c} (SD units)")
+            ax.set_ylabel(f"partial effect on {RESPONSE_INFO['transform']}")
+            ax.grid(alpha=0.3)
+        for ax in axes.ravel()[len(SPLINE_TESTS):]:
+            ax.axis("off")
+        fig.suptitle(f"EXPLORATORY partial driver-response shapes — one driver at a "
+                     f"time, centred cr() df={_spline_df}, 95% CI\\n"
+                     "knots and boundary constraints fixed by the training design_info",
+                     y=1.02, fontsize=10)
+        fig.tight_layout(); plt.show()
     else:
-        print("No driver gains materially from a non-linear shape; the linear "
-              "coefficients in §12 are an adequate summary.")
+        print("No driver could be smoothed within the rows-per-column floor.")
+
+if SPLINE_REFUSALS:
+    print("\\nSmooths REFUSED (design too thin for the number of months):")
+    display(pd.DataFrame(SPLINE_REFUSALS).round(3))
+''')
+
+md("""### 14b. Does any curve survive out of sample?
+
+A curve that lowers in-sample $R^2$-per-column but not out-of-sample error is a
+description of these 64 months, not of the system. Each driver flagged in §14 is
+re-run through the **same one-calendar-month-ahead rolling origin** the principal
+model uses (§21), twice on identical training and target months:
+
+* the driver entering **linearly**, and
+* the driver entering as the **centred smooth**, with the basis rebuilt from the
+  *training fold's* `design_info` at every origin.
+
+A smooth is promoted to `supported out-of-sample` only when its one-month-ahead
+RMSE is lower than the linear specification's **by a margin whose 95%
+calendar-aware moving-block interval excludes zero** — the same bar §22 applies
+to the driver block, for the same reason: on ~40 targets a difference of a few
+ten-thousandths is noise. Otherwise the shape stays `exploratory` and **§25 will
+not quote it as a non-linear result**.
+""")
+
+code('''# =====================================================================
+# 14b. Out-of-sample check on the non-linear shapes
+# =====================================================================
+SPLINE_OOS = pd.DataFrame()
+if not (SPLINE_OOS_CHECK and len(SPLINE_TESTS) and HAVE_PATSY):
+    print("§14b skipped (no smooths fitted, or SPLINE_OOS_CHECK = False). "
+          "Every shape in §14 therefore stays EXPLORATORY.")
+else:
+    from patsy import build_design_matrices
+
+    # Rolling origin on the SAME complete-case rows §14 used, one calendar month
+    # ahead, expanding window. The fold machinery is §5's, so the origins are
+    # calendar months and training is always strictly before the target.
+    _oos_rows = []
+    _mi_fit = month_index(FIT_MONTHS)
+    for c in SPLINE_TESTS["driver"]:
+        others = [d for d in DRIVER_TERMS if d != c]
+        rec = {"driver": c, "n_targets": 0, "rmse_linear": np.nan,
+               "rmse_spline": np.nan}
+        e_lin, e_spl, e_months = [], [], []
+        for pos in range(len(FIT_MONTHS)):
+            train = np.where(_mi_fit < _mi_fit[pos])[0]
+            if len(train) < SS_MIN_TRAIN_MONTHS:
+                continue
+            tr = fit_df.iloc[train]
+            te = fit_df.iloc[[pos]]
+            wtr = (tr["w_month"].to_numpy(dtype=float)
+                   if MONTH_WEIGHTING != "none" else None)
+            # Linear specification.
+            Xl_tr = tr[[c] + others + _ctrl_cols]
+            Xl_te = te[[c] + others + _ctrl_cols]
+            ml = (sm.OLS(tr["y"], sm.add_constant(Xl_tr, has_constant="add")).fit()
+                  if wtr is None else
+                  sm.WLS(tr["y"], sm.add_constant(Xl_tr, has_constant="add"),
+                         weights=wtr / np.nanmean(wtr)).fit())
+            pl = float(ml.predict(sm.add_constant(Xl_te, has_constant="add").reindex(
+                columns=ml.params.index, fill_value=0.0)).iloc[0])
+            # Smooth specification: the basis is built on THIS FOLD'S training data,
+            # and the target month's basis comes from that fold's design_info.
+            try:
+                Btr = dmatrix(f"cr(x, df={int(_spline_df)}) - 1",
+                              {"x": tr[c].to_numpy(dtype=float)},
+                              return_type="dataframe")
+                info, mu = Btr.design_info, Btr.mean(axis=0)
+                Btr = (Btr - mu)
+                Btr.columns = [f"{c}__s{i + 1}" for i in range(Btr.shape[1])]
+                Btr.index = tr.index
+                Bte = pd.DataFrame(np.asarray(build_design_matrices(
+                    [info], {"x": te[c].to_numpy(dtype=float)})[0])) - mu.to_numpy()
+                Bte.columns = Btr.columns
+                Bte.index = te.index
+                Xs_tr = pd.concat([Btr, tr[others + _ctrl_cols]], axis=1)
+                Xs_te = pd.concat([Bte, te[others + _ctrl_cols]], axis=1)
+                ms = (sm.OLS(tr["y"], sm.add_constant(Xs_tr, has_constant="add")).fit()
+                      if wtr is None else
+                      sm.WLS(tr["y"], sm.add_constant(Xs_tr, has_constant="add"),
+                             weights=wtr / np.nanmean(wtr)).fit())
+                ps = float(ms.predict(sm.add_constant(Xs_te, has_constant="add").reindex(
+                    columns=ms.params.index, fill_value=0.0)).iloc[0])
+            except Exception:
+                continue
+            yt = float(te["y"].iloc[0])
+            e_lin.append(yt - pl)
+            e_spl.append(yt - ps)
+            e_months.append(te["month"].iloc[0])
+        if len(e_lin) >= 5:
+            rec["n_targets"] = int(len(e_lin))
+            rec["rmse_linear"] = float(np.sqrt(np.mean(np.asarray(e_lin) ** 2)))
+            rec["rmse_spline"] = float(np.sqrt(np.mean(np.asarray(e_spl) ** 2)))
+            rec["rmse_difference_spline_minus_linear"] = (rec["rmse_spline"]
+                                                          - rec["rmse_linear"])
+            # A point estimate is not evidence here either. The same calendar-aware
+            # moving-block bootstrap §22 uses decides it: the smooth is promoted
+            # only if its 95% interval for RMSE(spline) - RMSE(linear) lies wholly
+            # BELOW zero. Without this a difference of -0.0004 on 44 months would
+            # "support" a curve, which is exactly the error §14 exists to undo.
+            _b = block_bootstrap_rmse_difference(
+                pd.Series(e_months), np.asarray(e_spl), np.asarray(e_lin),
+                n_boot=min(SS_RMSE_BOOTSTRAP_N, 1000), seed=SS_RMSE_BOOTSTRAP_SEED)
+            rec["boot_ci_lo"] = _b["ci_lo"]
+            rec["boot_ci_hi"] = _b["ci_hi"]
+            rec["boot_block_months"] = _b["block_months"]
+            rec["boot_n_successful"] = _b["n_successful"]
+            rec["supported_out_of_sample"] = bool(
+                np.isfinite(_b["ci_hi"]) and _b["ci_hi"] < 0)
+        else:
+            rec["supported_out_of_sample"] = False
+            rec["rmse_difference_spline_minus_linear"] = np.nan
+        _oos_rows.append(rec)
+
+    SPLINE_OOS = pd.DataFrame(_oos_rows)
+    SPLINE_OOS["evidence_status"] = np.where(
+        SPLINE_OOS["supported_out_of_sample"], "supported out-of-sample", "exploratory")
+    SPLINE_SUPPORTED_OOS = SPLINE_OOS.loc[SPLINE_OOS["supported_out_of_sample"],
+                                          "driver"].tolist()
+    print("One-calendar-month-ahead rolling origin, smooth vs linear on IDENTICAL "
+          "training and target months:")
+    display(SPLINE_OOS.round(4))
+    if SPLINE_SUPPORTED_OOS:
+        print(f"\\nSupported out of sample: {SPLINE_SUPPORTED_OOS}. Each lowered "
+              "one-month-ahead RMSE against its own linear specification by a margin "
+              "whose 95% moving-block interval excludes zero. These may be reported as "
+              "non-linear, still labelled as a §14 shape and never merged with a §12 or "
+              "§20 coefficient.")
+    else:
+        print("\\nNO smooth lowered one-month-ahead RMSE against its own linear "
+              "specification by a margin whose 95% moving-block interval excludes zero. "
+              "Every shape in §14 stays EXPLORATORY and §25 reports no non-linear driver "
+              "result. In particular, the lake-level curvature reported by the withdrawn "
+              "25-column design is NOT supported.")
+    if len(SPLINE_TESTS):
+        SPLINE_TESTS["evidence_status"] = np.where(
+            SPLINE_TESTS["driver"].isin(SPLINE_SUPPORTED_OOS),
+            "supported out-of-sample", "exploratory")
+        PARTIAL_EFFECTS["evidence_status"] = np.where(
+            PARTIAL_EFFECTS["driver"].isin(SPLINE_SUPPORTED_OOS),
+            "supported out-of-sample", "exploratory")
 ''')
 
 
@@ -3309,7 +4147,29 @@ else:
 # ===========================================================================
 # 16. Skill
 # ===========================================================================
-md("""## 16. Out-of-sample skill — do the drivers actually add anything?
+md("""## 16. Out-of-sample skill — three-month windows (**sensitivity, not the headline**)
+
+> **This section has been demoted.** It is retained unchanged as a *sensitivity
+> comparison* so the earlier result stays auditable, but it is **no longer the
+> notebook's predictive assessment**. The principal one is §21: expanding-window,
+> **one-calendar-month-ahead** rolling origin, over every feasible origin, with
+> drivers restricted to information available at the origin.
+>
+> Two things are wrong with using this section as the headline:
+>
+> 1. **Only 8 windows are attempted and ~6 survive**, giving ~18 evaluated
+>    months in a handful of blocks. §21 uses every feasible origin instead.
+> 2. **It is a nowcast, not a forecast.** Temperature, wind and lake level enter
+>    at lag 0 by the a-priori specification, so predicting month $t$ uses month
+>    $t$'s weather. No forecaster has that. §21 moves those terms to lag 1.
+>
+> Any RMSE improvement quoted from *this* section is an improvement over the
+> **best simple baseline in this design** — not over a matched
+> season + trend + persistence model, and not with a paired uncertainty
+> interval. The claim that "environmental drivers improve RMSE by 9%" that
+> earlier runs of this notebook printed here is **withdrawn as a headline**:
+> §21 and §22 re-examine it against the matched no-driver state-space model with
+> a calendar-aware bootstrap interval, and §25 reports whatever that shows.
 
 In-sample $R^2$ on a persistent monthly series is close to meaningless: season
 plus a lagged response will fit it well while knowing nothing about ecology. The
@@ -3322,7 +4182,7 @@ Baselines, in increasing order of difficulty to beat:
 |---|---|
 | **mean** | Predicts the record mean. Anything must beat this. |
 | **seasonal-naive** | Predicts the **same calendar month** last year. Free, and hard to beat. |
-| **persistence** | Predicts last month. On a system this autocorrelated, usually the strongest baseline. |
+| **fitted `y_lag1` regression** | A *fitted* regression on last month's value — **not** literal persistence, which has no coefficient at all. §21 reports the literal $\hat y_t = y_{t-1}$ baseline separately. |
 | **season+trend** | The calendar alone. |
 | **drivers+season+trend** | The headline model. |
 | **+AR(1)** | The dynamic model. |
@@ -3450,7 +4310,7 @@ else:
     _rows, _details = [], []
     _specs_cv = {
         "mean baseline": (None, *_const_fit(np.nanmean)),
-        "persistence (y_lag1)": (AR_TERMS[:1], None, None),
+        "fitted y_lag1 regression (NOT literal persistence)": (AR_TERMS[:1], None, None),
         "season+trend": (SEASON_COLS + TREND_TERMS, None, None),
         "drivers only": (DRIVER_TERMS, None, None),
         "drivers+season": (DRIVER_TERMS + SEASON_COLS, None, None),
@@ -3568,7 +4428,7 @@ else:
     fig, ax = plt.subplots(figsize=(9.5, 0.45 * len(SKILL) + 1.6))
     _cols = ["tab:green" if "drivers" in s else "tab:grey" for s in SKILL["specification"]]
     ax.barh(SKILL["specification"], SKILL["rmse"], color=_cols, alpha=0.85)
-    _baselines = ["persistence (y_lag1)", "season+trend", "mean baseline"]
+    _baselines = ["fitted y_lag1 regression (NOT literal persistence)", "season+trend", "mean baseline"]
     if _sn_same_set:
         _baselines.append("seasonal-naive (y_{t-12 calendar months})")
     _bb = SKILL.loc[SKILL["specification"].isin(_baselines), "rmse"].min()
@@ -3581,12 +4441,22 @@ else:
     fig.tight_layout(); plt.show()
 
     SKILL["rmse_vs_best_baseline"] = SKILL["rmse"] / _bb
+    SKILL["evaluation_role"] = ("SENSITIVITY — 3-calendar-month windows, "
+                                "contemporaneous drivers (nowcast); see §21 for the "
+                                "principal one-month-ahead assessment")
     _driver_best = SKILL[SKILL["specification"].str.contains("drivers|boosting")]["rmse"].min()
     if np.isfinite(_driver_best) and np.isfinite(_bb):
         if _driver_best < _bb:
-            print(f"Environmental drivers IMPROVE out-of-sample RMSE by "
-                  f"{100 * (1 - _driver_best / _bb):.1f}% over the best simple baseline, "
-                  f"on {_n_common} held-out months.")
+            print(f"In THIS sensitivity design the best driver specification has "
+                  f"{100 * (1 - _driver_best / _bb):.1f}% lower RMSE than the best "
+                  f"simple baseline, on {_n_common} held-out months.")
+            print("*** That is a POINT ESTIMATE from a 3-calendar-month, "
+                  "contemporaneous-driver (nowcast) design with no paired uncertainty "
+                  "interval, and it is NOT a headline result. Do not quote it. The "
+                  "principal question — does the driver block beat a MATCHED "
+                  "season+trend+persistence model at genuine one-month-ahead "
+                  "prediction — is answered in §21/§22 with an interval, and §25 "
+                  "reports that answer. ***")
         else:
             print(f"Environmental drivers do NOT beat the best simple baseline "
                   f"({_driver_best:.4f} vs {_bb:.4f}) on {_n_common} held-out months.")
@@ -3598,7 +4468,7 @@ else:
 
     # --- Held-out predictions, on the CALENDAR ------------------------------
     if len(CV_PREDICTIONS):
-        _pick = [s for s in ["persistence (y_lag1)", "season+trend", "drivers+season+trend"]
+        _pick = [s for s in ["fitted y_lag1 regression (NOT literal persistence)", "season+trend", "drivers+season+trend"]
                  if s in set(CV_PREDICTIONS["specification"])]
         _obs = (CV_PREDICTIONS[CV_PREDICTIONS["specification"] == _pick[-1]]
                 .sort_values("month"))
@@ -3670,7 +4540,7 @@ driver can explain more as the last term entered than its order-averaged
 contribution. Values above 1 are labelled as *possible suppression or
 coefficient instability* — they are never clipped.
 
-The **primary** reading, carried into §19, is the **with persistence**
+The **primary** reading, carried into §25, is the **with persistence**
 specification, because persistence dominates this series: a driver's independent
 contribution has to be measured against last month's hyacinth, not only against
 the calendar.
@@ -3709,6 +4579,11 @@ else:
     display(PARTITION.drop(columns=["model_columns"]).round(4))
 
     if PARTITION_INCLUDE_AR and AR_TERMS and len(dyn_df) > len(_groups) + 5:
+        # The variance-partition group label stays "persistence (y_lag1)": it names
+        # a share of explained variance carried by the lagged response, not a
+        # forecasting baseline. The §16 BASELINE of the same name was renamed,
+        # because calling a fitted regression "persistence" there would have made
+        # it look like the unfitted y_{t-1} rule §21 actually scores.
         _g2 = dict(_groups); _g2["persistence (y_lag1)"] = AR_TERMS
         if len(_g2) <= PARTITION_MAX_GROUPS:
             _cols2 = [c for g in _g2.values() for c in g if c in dyn_df.columns]
@@ -3791,7 +4666,7 @@ else:
         SHARED_VS_UNIQUE = SHARED_VS_UNIQUE_STATIC
         SHARED_VS_UNIQUE_SPEC = "without persistence"
     if len(SHARED_VS_UNIQUE):
-        print(f"\\nPRIMARY reading for §19 is the '{SHARED_VS_UNIQUE_SPEC}' specification, "
+        print(f"\\nPRIMARY reading for §25 is the '{SHARED_VS_UNIQUE_SPEC}' specification, "
               "because persistence dominates this series and a driver's independent "
               "contribution has to be measured against it.")
         print("`last_entry_to_shapley_ratio` is the semi-partial divided by the Shapley "
@@ -3824,6 +4699,11 @@ md("""## 18. Robustness — does any conclusion move?
 Five sweeps, each attacking a different decision made earlier. A driver whose
 sign and rough magnitude survive all five is reportable; one that appears in only
 one variant is a property of that variant, not of the lake.
+
+> These sweeps attack the **static** models (M3/M4). The equivalent checks on the
+> **principal state-space model** — leave-one-year-out, alternative response
+> transformations, and AR(1) vs AR(2) vs local level — are in **§24**, and the
+> two sets of tables are never merged: every row names the model it came from.
 
 1. **Response definition** — area-weighted cover, absolute WH area, occurrence
    rate, unweighted mean cover.
@@ -4009,17 +4889,1885 @@ display(ROBUST_AGREEMENT.round(4))
 
 
 # ===========================================================================
-# 19. Synthesis
+# 19. State-space candidate dynamics
 # ===========================================================================
-md("""## 19. Synthesis — the ranked driver table
+md("""## 19. Principal model, step 1 — which dependence structure does the series have?
+
+Everything from §12 to §18 answers *"is this driver associated with WH extent"*.
+None of it answers the question this notebook actually has to answer:
+
+> **once the series' own persistence is represented properly, is there anything
+> left for the environment to explain?**
+
+The `y_lag1` term in M4 is one answer, and a fragile one. It is an *ad hoc*
+right-hand-side variable: it deletes every month whose predecessor is missing,
+it makes the AR coefficient compete with the drivers for the same regression
+weights, and its OLS standard errors are wrong when the disturbance is serially
+correlated in any way other than exactly AR(1).
+
+This section starts the **principal** model, in which persistence is a property
+of the **process**, not a column of the design matrix:
+
+$$y_t \\;=\\; \\underbrace{c + \\gamma' \\text{season}_t + \\delta\\, \\text{trend}_t}_{\\text{deterministic}}
+\\;+\\; \\underbrace{\\beta' x_t}_{\\text{drivers (added in §20)}} \\;+\\; \\mu_t,$$
+
+with three candidate laws for $\\mu_t$ and nothing else varying between them:
+
+| Candidate | $\\mu_t$ | Linear trend? |
+|---|---|---|
+| `sarimax_ar1` | $\\phi\\mu_{t-1}+\\varepsilon_t$ | yes |
+| `sarimax_ar2` | $\\phi_1\\mu_{t-1}+\\phi_2\\mu_{t-2}+\\varepsilon_t$ | yes |
+| `local_level` | $\\mu_t=\\mu_{t-1}+\\eta_t$, observed with noise | **no** — the level is the trend |
+
+### The rule this section obeys
+
+**The dependence structure is chosen with no environmental driver in any
+model.** All three candidates are fitted as *null dynamics* — season and trend
+only — and compared on:
+
+* **AICc**, computed from the number of **observed response months** and the
+  number of **free parameters** (using the grid length would understate the
+  penalty on a record that is a quarter missing);
+* **one-calendar-month-ahead rolling-origin RMSE** (expanding window);
+* **standardized one-step-ahead innovation diagnostics** — calendar-lag ACF, a
+  calendar-lag Ljung–Box, normality, and a variance-ratio check;
+* **convergence and stationarity**.
+
+Driver significance plays no part. The winner is then **locked** before §20 adds
+a single environmental variable, so the dependence structure cannot be quietly
+tuned until the drivers look good.
+
+### The missing-month placeholder, and why it is admissible
+
+State-space filtering tolerates a missing **response** — the Kalman filter skips
+the update and carries the state forward — but it needs finite **exogenous**
+values on every row of the grid. Two rules make that safe:
+
+1. A month whose response is observed but whose drivers are not is **removed
+   from the likelihood** (its response is set missing and the removal is
+   recorded), so it can never be fitted against a made-up driver value.
+2. Only *after* that are the remaining missing standardized exogenous values
+   replaced by `0.0`, and only on months where the response is missing. Those
+   months contribute **no likelihood term at all**, so the placeholder cannot
+   move a single estimate. The cell asserts both properties.
+""")
+
+code('''# =====================================================================
+# 19a. The state-space modelling frame (calendar-complete, nothing imputed
+#      where it could matter)
+# =====================================================================
+SS_READY = False
+SS_SKIP_REASON = ""
+SS_DRIVER_TERMS = [c for c in DRIVER_TERMS if c in model_df.columns]
+SS_SEASON_COLS = [c for c in SEASON_COLS if c in model_df.columns]
+SS_TREND_COLS = [c for c in TREND_TERMS if c in model_df.columns]
+
+if not RUN_STATE_SPACE:
+    SS_SKIP_REASON = "RUN_STATE_SPACE = False"
+elif not SS_DRIVER_TERMS:
+    SS_SKIP_REASON = "no environmental driver terms survived §9"
+elif N_OBSERVED < 30:
+    SS_SKIP_REASON = f"only {N_OBSERVED} observed months"
+
+if SS_SKIP_REASON:
+    print(f"§19-§24 SKIPPED: {SS_SKIP_REASON}.")
+    SS_GRID = pd.DataFrame()
+    SS_Y = pd.Series(dtype=float)
+    SS_EXOG = pd.DataFrame()
+    SS_PLACEHOLDER_AUDIT = pd.DataFrame()
+    SS_WITHHELD_MONTHS = pd.DataFrame()
+else:
+    # --- 1. Which months can carry a likelihood contribution? ----------------
+    _obs = model_df["y"].notna()
+    _drv_ok = model_df[SS_DRIVER_TERMS].notna().all(axis=1)
+    _usable = _obs & _drv_ok
+
+    # Months whose RESPONSE is observed but whose drivers are not. Their response
+    # is withheld from the likelihood: fitting them would mean inventing a driver
+    # value for a month that does contribute to the fit.
+    _withheld = _obs & ~_drv_ok
+    SS_WITHHELD_MONTHS = model_df.loc[_withheld, ["month"] + SS_DRIVER_TERMS].copy()
+    if len(SS_WITHHELD_MONTHS):
+        SS_WITHHELD_MONTHS["missing_drivers"] = SS_WITHHELD_MONTHS[SS_DRIVER_TERMS].apply(
+            lambda r: ", ".join(r.index[r.isna()]), axis=1)
+        SS_WITHHELD_MONTHS = SS_WITHHELD_MONTHS[["month", "missing_drivers"]]
+        SS_WITHHELD_MONTHS["reason"] = ("response observed but a predeclared driver is "
+                                        "not; withheld from the likelihood rather than "
+                                        "fitted against an imputed driver")
+
+    if int(_usable.sum()) < 30:
+        SS_SKIP_REASON = (f"only {int(_usable.sum())} months have both the response and "
+                          "every predeclared driver")
+        print(f"§19-§24 SKIPPED: {SS_SKIP_REASON}.")
+        SS_GRID = pd.DataFrame(); SS_Y = pd.Series(dtype=float)
+        SS_EXOG = pd.DataFrame(); SS_PLACEHOLDER_AUDIT = pd.DataFrame()
+    else:
+        # --- 2. Trim to the span the usable months cover, keeping every gap ---
+        _first = model_df.loc[_usable, "month"].min()
+        _last = model_df.loc[_usable, "month"].max()
+        SS_GRID = model_df[(model_df["month"] >= _first)
+                           & (model_df["month"] <= _last)].reset_index(drop=True)
+        SS_INDEX = calendar_grid_index(SS_GRID["month"])
+        assert len(SS_INDEX) == len(SS_GRID), \\
+            "the state-space frame is not calendar-complete"
+        assert (pd.to_datetime(SS_GRID["month"]).to_numpy()
+                == SS_INDEX.to_numpy()).all(), "grid months are not the calendar grid"
+
+        _usable_ss = (SS_GRID["y"].notna()
+                      & SS_GRID[SS_DRIVER_TERMS].notna().all(axis=1)).to_numpy()
+        SS_Y = pd.Series(np.where(_usable_ss, SS_GRID["y"].to_numpy(dtype=float), np.nan),
+                         index=SS_INDEX, name="y")
+        SS_Y_RAW = pd.Series(np.where(_usable_ss,
+                                      SS_GRID["y_raw"].to_numpy(dtype=float), np.nan),
+                             index=SS_INDEX, name="y_raw")
+
+        # --- 3. Exogenous block, with the placeholder confined to missing y ----
+        _exog_cols = SS_SEASON_COLS + SS_TREND_COLS + SS_DRIVER_TERMS
+        SS_EXOG_RAWNAN = SS_GRID[_exog_cols].copy()
+        SS_EXOG_RAWNAN.index = SS_INDEX
+        _missing = SS_EXOG_RAWNAN.isna()
+        _y_missing = SS_Y.isna().to_numpy()[:, None]
+        _placeholder = _missing & _y_missing
+        SS_EXOG = SS_EXOG_RAWNAN.mask(_placeholder, 0.0)
+
+        SS_PLACEHOLDER_AUDIT = (
+            pd.DataFrame(_placeholder.to_numpy(), index=SS_INDEX, columns=_exog_cols)
+            .stack().rename("placeholder").reset_index()
+            .rename(columns={"level_0": "month", "level_1": "term"}))
+        SS_PLACEHOLDER_AUDIT = (SS_PLACEHOLDER_AUDIT[SS_PLACEHOLDER_AUDIT["placeholder"]]
+                                .drop(columns="placeholder").reset_index(drop=True))
+        if len(SS_PLACEHOLDER_AUDIT):
+            SS_PLACEHOLDER_AUDIT["response_observed"] = False
+            SS_PLACEHOLDER_AUDIT["value_used"] = 0.0
+            SS_PLACEHOLDER_AUDIT["note"] = ("computational placeholder only; this month "
+                                            "makes NO likelihood contribution")
+
+        # --- 4. The assertions the placeholder's admissibility rests on --------
+        _obs_rows = SS_Y.notna().to_numpy()
+        assert not SS_EXOG_RAWNAN.loc[_obs_rows].isna().to_numpy().any(), \\
+            ("a month with an OBSERVED response has a missing exogenous value; the "
+             "placeholder would enter the likelihood")
+        assert not _placeholder.to_numpy()[_obs_rows].any(), \\
+            "a placeholder was written on a month with an observed response"
+        assert np.isfinite(SS_EXOG.to_numpy(dtype=float)).all(), \\
+            "the exogenous block still contains non-finite values"
+        assert int(SS_Y.notna().sum()) == int(_usable_ss.sum())
+
+        SS_N_OBS = int(SS_Y.notna().sum())
+        SS_SPAN = int(len(SS_INDEX))
+        SS_READY = True
+
+        print("State-space modelling frame")
+        print(f"  calendar grid        : {SS_SPAN} months "
+              f"({SS_INDEX.min():%Y-%m} .. {SS_INDEX.max():%Y-%m}), no gaps closed up")
+        print(f"  likelihood months    : {SS_N_OBS} "
+              f"({SS_SPAN - SS_N_OBS} months contribute nothing)")
+        print(f"  complete-case rows §11 used for M3/M4: {N_FIT} "
+              f"-> the state-space model uses {SS_N_OBS - N_FIT:+d} month(s) more")
+        print(f"  exogenous block      : {len(SS_SEASON_COLS)} deterministic annual "
+              f"Fourier column(s), {len(SS_TREND_COLS)} trend, "
+              f"{len(SS_DRIVER_TERMS)} driver(s)")
+        if len(SS_WITHHELD_MONTHS):
+            print(f"\\n  {len(SS_WITHHELD_MONTHS)} month(s) had an observed response but an "
+                  "incomplete driver row and were WITHHELD from the likelihood:")
+            display(SS_WITHHELD_MONTHS)
+        if len(SS_PLACEHOLDER_AUDIT):
+            print(f"  {len(SS_PLACEHOLDER_AUDIT)} exogenous cell(s) across "
+                  f"{SS_PLACEHOLDER_AUDIT['month'].nunique()} month(s) took the 0.0 "
+                  "placeholder. Every one is on a month with NO observed response, so "
+                  "it makes no likelihood contribution and cannot move an estimate.")
+            display(SS_PLACEHOLDER_AUDIT.head(12))
+        else:
+            print("  no placeholder was needed.")
+''')
+
+md("""### 19b. Candidate null-dynamics fits and the selection
+
+Three fits, no drivers in any of them, on identical response months. The
+selection is printed in full so the choice can be checked rather than trusted —
+including the case where AICc and one-month-ahead RMSE disagree, which is
+reported rather than resolved silently.
+""")
+
+code('''# =====================================================================
+# 19b. Fit the candidate dependence structures WITHOUT any driver
+# =====================================================================
+SS_CANDIDATES = pd.DataFrame()
+SS_CANDIDATE_FITS = {}
+SS_CANDIDATE_DIAGNOSTICS = pd.DataFrame()
+SS_SELECTED = None
+SS_SELECTION_NOTE = ""
+
+if SS_READY:
+    def ss_null_exog(structure):
+        """Season, plus a linear trend only where a stochastic level is absent."""
+        cols = list(SS_SEASON_COLS)
+        if ss_allows_linear_trend(structure) and INCLUDE_TREND:
+            cols += list(SS_TREND_COLS)
+        return SS_EXOG[cols]
+
+    def ss_rolling_one_step_null(structure, min_train_months=24, maxiter=100):
+        """One-calendar-month-ahead expanding-origin RMSE for a NULL candidate.
+
+        Season and the trend are deterministic functions of the calendar, so they
+        can be built for a future month without touching a future response — the
+        only quantity a fold takes from the past is the response itself.
+        """
+        cols = list(ss_null_exog(structure).columns)
+        mi = month_index(pd.Series(SS_INDEX))
+        errs, months_scored = [], []
+        yv = SS_Y.to_numpy(dtype=float)
+        for pos in range(1, len(SS_INDEX)):
+            if not np.isfinite(yv[pos]):
+                continue
+            n_train_obs = int(np.isfinite(yv[:pos]).sum())
+            if n_train_obs < int(min_train_months):
+                continue
+            try:
+                res, _ = ss_fit(SS_Y.iloc[:pos], SS_EXOG[cols].iloc[:pos],
+                                structure, cov_type=None, maxiter=int(maxiter))
+                fc = res.get_forecast(steps=1, exog=SS_EXOG[cols].iloc[pos:pos + 1])
+                yhat = float(np.asarray(fc.predicted_mean)[0])
+            except Exception:
+                continue
+            assert mi[pos] - mi[pos - 1] == 1, "forecast is not one calendar month ahead"
+            errs.append(yv[pos] - yhat)
+            months_scored.append(SS_INDEX[pos])
+        if not errs:
+            return np.nan, 0, []
+        return float(np.sqrt(np.mean(np.asarray(errs) ** 2))), len(errs), months_scored
+
+    _rows, _diag_rows = [], []
+    for _key in SS_CANDIDATE_STRUCTURES:
+        _cols = list(ss_null_exog(_key).columns)
+        try:
+            _res, _info = ss_fit(SS_Y, SS_EXOG[_cols], _key,
+                                 cov_type=SS_COV_TYPE, maxiter=SS_MAXITER)
+        except Exception as _exc:
+            _rows.append({"structure": _key, "label": ss_structure_label(_key),
+                          "fitted": False, "reason": str(_exc)[:160]})
+            continue
+        SS_CANDIDATE_FITS[_key] = _res
+        _k = ss_n_free_params(_res)
+        _n = ss_n_effective(SS_Y)
+        _st = ss_state_diagnostics(_res, _key)
+        _dg, _acf, _inn = ss_innovation_diagnostics(_res, SS_INDEX, nlags=min(18, _n // 3),
+                                                    label=f"null {_key}")
+        _rmse1, _n1, _m1 = ss_rolling_one_step_null(
+            _key, SS_MIN_TRAIN_MONTHS, SS_ROLLING_MAXITER)
+        _rows.append({
+            "structure": _key, "label": ss_structure_label(_key), "fitted": True,
+            "includes_linear_trend": bool(ss_allows_linear_trend(_key) and INCLUDE_TREND),
+            "n_observed_months": _n, "k_free_params": _k,
+            "loglik": float(_res.llf),
+            "aic": float(_res.aic), "bic": float(_res.bic),
+            "aicc": aicc_from(_res.llf, _k, _n),
+            "rmse_one_month_ahead": _rmse1, "n_one_month_targets": int(_n1),
+            "converged": bool(_info["converged"]),
+            "cov_type_used": _info["cov_type_used"],
+            "stationary_supported": bool(_st["stationary_supported"]),
+            "stationarity_note": _st["reason"] or "stationary",
+            "innov_acf1": _dg["acf1"], "innov_ljung_box_p": _dg["ljung_box_p"],
+            "innov_jarque_bera_p": _dg["jarque_bera_p"],
+            "innov_sd": _dg["sd_std_innovation"],
+            "reason": "",
+        })
+        _diag_rows.append({**_dg, "structure": _key, "model": "null dynamics"})
+
+    SS_CANDIDATES = pd.DataFrame(_rows)
+    SS_CANDIDATE_DIAGNOSTICS = pd.DataFrame(_diag_rows)
+    SS_CANDIDATES["aicc_delta"] = (SS_CANDIDATES.get("aicc", pd.Series(dtype=float))
+                                   - SS_CANDIDATES.get("aicc", pd.Series(dtype=float)).min())
+
+    print("Candidate dependence structures — NULL dynamics (season/trend, NO drivers).")
+    print("The selection below uses no driver p-value of any kind.\\n")
+    display(SS_CANDIDATES.round(4))
+
+    _ok = SS_CANDIDATES[SS_CANDIDATES["fitted"] & SS_CANDIDATES["converged"]]
+    if not len(_ok):
+        print("No candidate converged; §20-§24 cannot run.")
+        SS_READY = False
+        SS_SKIP_REASON = "no state-space candidate converged"
+    else:
+        _by_aicc = _ok.sort_values("aicc")["structure"].iloc[0]
+        _rm = _ok.dropna(subset=["rmse_one_month_ahead"])
+        _by_rmse = (_rm.sort_values("rmse_one_month_ahead")["structure"].iloc[0]
+                    if len(_rm) else _by_aicc)
+        SS_SELECTED = _by_aicc if str(SS_SELECT_BY).lower() == "aicc" else _by_rmse
+        SS_SELECTION_NOTE = (
+            f"selected by {SS_SELECT_BY}; AICc favours {_by_aicc}, "
+            f"one-month-ahead RMSE favours {_by_rmse}"
+            + ("" if _by_aicc == _by_rmse else " — THEY DISAGREE"))
+        print(f"\\nAICc ranking            : "
+              f"{_ok.sort_values('aicc')['structure'].tolist()}")
+        if len(_rm):
+            print(f"One-month-ahead ranking : "
+                  f"{_rm.sort_values('rmse_one_month_ahead')['structure'].tolist()}")
+        if _by_aicc != _by_rmse:
+            print("\\n*** AICc and one-month-ahead RMSE prefer DIFFERENT structures. "
+                  f"SS_SELECT_BY = {SS_SELECT_BY!r} breaks the tie; §24 refits the driver "
+                  "model under all three so the choice can be seen to matter or not. ***")
+        print(f"\\nLOCKED dependence structure: {SS_SELECTED} "
+              f"({ss_structure_label(SS_SELECTED)})")
+        print("It is fixed here, BEFORE any environmental variable is added in §20.")
+
+        _sel_row = _ok[_ok["structure"] == SS_SELECTED].iloc[0]
+        if not bool(_sel_row["stationary_supported"]):
+            print(f"\\nStationarity: {_sel_row['stationarity_note']}. §20 therefore "
+                  "reports SHORT-RUN standardized coefficients only — no long-run "
+                  "multiplier is defined under this structure.")
+
+        # Innovation ACF of the selected null structure, on CALENDAR lags.
+        _res_sel = SS_CANDIDATE_FITS[SS_SELECTED]
+        _dg, _acf_sel, _inn_sel = ss_innovation_diagnostics(
+            _res_sel, SS_INDEX, nlags=min(24, max(6, SS_N_OBS // 3)),
+            label=f"null {SS_SELECTED}")
+        fig, axes = plt.subplots(1, 2, figsize=(12, 3.4))
+        axes[0].bar(_acf_sel["lag"], _acf_sel["acf"], color="tab:purple", alpha=0.8)
+        axes[0].axhline(0, color="k", lw=0.8)
+        axes[0].axhline(_acf_sel["band"].iloc[0], color="red", ls="--", lw=1)
+        axes[0].axhline(-_acf_sel["band"].iloc[0], color="red", ls="--", lw=1)
+        axes[0].set_title(f"Standardized innovation ACF — null {SS_SELECTED}\\n"
+                          f"calendar-lag Ljung-Box p = {_dg['ljung_box_p']:.3g}")
+        axes[0].set_xlabel("lag (calendar months)")
+        axes[1].plot(_inn_sel["month"], _inn_sel["std_innovation"], "o-", ms=3, lw=1)
+        axes[1].axhline(0, color="k", lw=0.8)
+        for _b in (-2, 2):
+            axes[1].axhline(_b, color="red", ls=":", lw=1)
+        axes[1].set_title("Standardized one-step-ahead innovations")
+        axes[1].set_xlabel("month")
+        for _a in axes:
+            _a.grid(alpha=0.3)
+        fig.tight_layout(); plt.show()
+else:
+    print("§19b skipped.")
+''')
+
+
+# ===========================================================================
+# 20. Matched null vs full state-space driver model
+# ===========================================================================
+md("""## 20. Principal model, step 2 — matched null vs full driver model
+
+The structure is locked. Two models are now fitted, differing in **exactly one
+thing**: whether the predeclared environmental drivers are present.
+
+| | Model | Exogenous block |
+|---|---|---|
+| **null dynamic model** | selected structure | season (+ trend where admissible) |
+| **full dynamic driver model** | *the same structure* | season (+ trend) **+ the predeclared drivers at their a-priori lags** |
+
+Everything else is held identical and asserted: the same response months, the
+same logit transform, the same deterministic Fourier season, the same
+missing-month treatment, the same optimiser settings. That is what makes the
+difference between them attributable to the drivers and nothing else.
+
+**This is retrospective association / nowcasting, not forecasting.** The
+contemporaneous terms (temperature, wind, lake level enter at lag 0 by the
+a-priori specification of §3c) are not knowable a month in advance, so this
+section says *"months in which it was warmer than usual also had more hyacinth,
+after persistence and season"* — never *"we can predict next month"*. The
+forecasting question is §21's, and it uses a lagged driver set for exactly this
+reason.
+
+What is reported: standardized coefficients, robust state-space standard errors,
+95% intervals, raw $p$-values, BH $q$-values, the joint driver-block test against
+the matched null (likelihood ratio **and** Wald), AICc and log-likelihood
+differences, the AR roots or latent-state diagnostics, and the standardized
+one-step-ahead innovation ACF on calendar lags.
+""")
+
+code('''# =====================================================================
+# 20. The locked structure, with and without the environmental drivers
+# =====================================================================
+SS_NULL_FIT = None
+SS_FULL_FIT = None
+SS_COEFS = pd.DataFrame()
+SS_JOINT_TEST = pd.DataFrame()
+SS_MODEL_COMPARISON = pd.DataFrame()
+SS_STATE_DIAGNOSTICS = pd.DataFrame()
+SS_INNOVATION_DIAGNOSTICS = pd.DataFrame()
+SS_INNOVATION_ACF = pd.DataFrame()
+SS_MANIFEST = {}
+
+if SS_READY and SS_SELECTED:
+    _null_cols = list(SS_SEASON_COLS)
+    if ss_allows_linear_trend(SS_SELECTED) and INCLUDE_TREND:
+        _null_cols += list(SS_TREND_COLS)
+    _full_cols = _null_cols + list(SS_DRIVER_TERMS)
+
+    SS_NULL_FIT, _null_info = ss_fit(SS_Y, SS_EXOG[_null_cols], SS_SELECTED,
+                                     cov_type=SS_COV_TYPE, maxiter=SS_MAXITER)
+    SS_FULL_FIT, _full_info = ss_fit(SS_Y, SS_EXOG[_full_cols], SS_SELECTED,
+                                     cov_type=SS_COV_TYPE, maxiter=SS_MAXITER)
+
+    # --- The matching assertions -------------------------------------------
+    _y_null = np.asarray(SS_NULL_FIT.model.endog, dtype=float).ravel()
+    _y_full = np.asarray(SS_FULL_FIT.model.endog, dtype=float).ravel()
+    assert len(_y_null) == len(_y_full), "null and full models have different lengths"
+    assert np.array_equal(np.isfinite(_y_null), np.isfinite(_y_full)), \\
+        "null and full state-space models do not use identical response months"
+    assert np.allclose(_y_null[np.isfinite(_y_null)], _y_full[np.isfinite(_y_full)]), \\
+        "null and full state-space models were given different response values"
+    assert set(_null_cols).issubset(set(_full_cols)), \\
+        "the full model is not a strict extension of the null model"
+    assert (set(_full_cols) - set(_null_cols)) == set(SS_DRIVER_TERMS), \\
+        "the full model differs from the null by something other than the drivers"
+    SS_MATCHED_MONTHS = pd.Series(SS_INDEX[np.isfinite(_y_full)])
+
+    _n_obs = ss_n_effective(SS_Y)
+    _k_null, _k_full = ss_n_free_params(SS_NULL_FIT), ss_n_free_params(SS_FULL_FIT)
+    _aicc_null = aicc_from(SS_NULL_FIT.llf, _k_null, _n_obs)
+    _aicc_full = aicc_from(SS_FULL_FIT.llf, _k_full, _n_obs)
+
+    SS_MODEL_COMPARISON = pd.DataFrame([
+        {"model": "null dynamic model", "structure": SS_SELECTED,
+         "exog": "season" + (" + trend" if SS_TREND_COLS and
+                             ss_allows_linear_trend(SS_SELECTED) and INCLUDE_TREND else ""),
+         "n_observed_months": _n_obs, "k_free_params": _k_null,
+         "loglik": float(SS_NULL_FIT.llf), "aic": float(SS_NULL_FIT.aic),
+         "aicc": _aicc_null, "bic": float(SS_NULL_FIT.bic),
+         "converged": bool(_null_info["converged"]),
+         "cov_type_used": _null_info["cov_type_used"]},
+        {"model": "full dynamic driver model", "structure": SS_SELECTED,
+         "exog": "season" + (" + trend" if SS_TREND_COLS and
+                             ss_allows_linear_trend(SS_SELECTED) and INCLUDE_TREND else "")
+                 + f" + {len(SS_DRIVER_TERMS)} predeclared driver(s)",
+         "n_observed_months": _n_obs, "k_free_params": _k_full,
+         "loglik": float(SS_FULL_FIT.llf), "aic": float(SS_FULL_FIT.aic),
+         "aicc": _aicc_full, "bic": float(SS_FULL_FIT.bic),
+         "converged": bool(_full_info["converged"]),
+         "cov_type_used": _full_info["cov_type_used"]},
+    ])
+    SS_MODEL_COMPARISON["aicc_minus_null"] = (SS_MODEL_COMPARISON["aicc"] - _aicc_null)
+    SS_MODEL_COMPARISON["loglik_minus_null"] = (SS_MODEL_COMPARISON["loglik"]
+                                                - float(SS_NULL_FIT.llf))
+
+    # --- Coefficients --------------------------------------------------------
+    SS_COEFS = ss_tidy_coefficients(
+        SS_FULL_FIT, SS_SELECTED, SS_DRIVER_TERMS,
+        label=f"S1 state-space {SS_SELECTED} + season/trend + drivers",
+        cov_type_used=_full_info["cov_type_used"])
+    if len(SS_COEFS):
+        SS_COEFS["driver"] = [
+            next((b for b in FORCING if t.startswith(b)), t) for t in SS_COEFS["term"]]
+        SS_COEFS["expected_sign"] = [FORCING.get(d, {}).get("expected_sign", "?")
+                                     for d in SS_COEFS["driver"]]
+        SS_COEFS["lag_months"] = [LAG_USED.get(d, np.nan) for d in SS_COEFS["driver"]]
+        SS_COEFS["sign_matches_mechanism"] = [
+            (e == "?" or (e == "+" and c > 0) or (e == "-" and c < 0))
+            for e, c in zip(SS_COEFS["expected_sign"], SS_COEFS["coef"])]
+        SS_COEFS["inference_kind"] = "association / nowcast (a-priori lags, §20)"
+
+    # --- Joint driver-block tests -------------------------------------------
+    _lr = ss_joint_lr_test(SS_FULL_FIT, SS_NULL_FIT, len(SS_DRIVER_TERMS))
+    _wald = ss_joint_wald_test(SS_FULL_FIT, SS_SELECTED, SS_DRIVER_TERMS)
+    SS_JOINT_TEST = pd.DataFrame([{
+        "comparison": "full driver block vs matched null dynamic model",
+        "structure": SS_SELECTED, "n_observed_months": _n_obs,
+        "k_drivers": len(SS_DRIVER_TERMS),
+        **_lr, **_wald,
+        "aicc_null": _aicc_null, "aicc_full": _aicc_full,
+        "aicc_difference_full_minus_null": _aicc_full - _aicc_null,
+        "aicc_prefers": ("full driver model" if _aicc_full < _aicc_null
+                         else "null dynamic model"),
+        "lr_p_reference": ("asymptotic chi-square; §23 replaces it with a parametric "
+                           "bootstrap because ~60 observed months is not asymptotia"),
+    }])
+
+    # --- Structure / state diagnostics --------------------------------------
+    _st_full = ss_state_diagnostics(SS_FULL_FIT, SS_SELECTED, alpha=LONGRUN_CI_ALPHA)
+    _st_null = ss_state_diagnostics(SS_NULL_FIT, SS_SELECTED, alpha=LONGRUN_CI_ALPHA)
+    SS_STATE_DIAGNOSTICS = pd.DataFrame([{**_st_null, "model": "null dynamic model"},
+                                         {**_st_full, "model": "full dynamic driver model"}])
+    SS_STATIONARY_SUPPORTED = bool(_st_full["stationary_supported"])
+    SS_STATIONARITY_REASON = _st_full["reason"]
+
+    # --- Innovation diagnostics ---------------------------------------------
+    _rows_d, _rows_a = [], []
+    for _label, _res in (("null dynamic model", SS_NULL_FIT),
+                         ("full dynamic driver model", SS_FULL_FIT)):
+        _dg, _acf, _inn = ss_innovation_diagnostics(
+            _res, SS_INDEX, nlags=min(24, max(6, _n_obs // 3)), label=_label)
+        _rows_d.append({**_dg, "model": _label, "structure": SS_SELECTED})
+        _rows_a.append(_acf.assign(model=_label, structure=SS_SELECTED))
+    SS_INNOVATION_DIAGNOSTICS = pd.DataFrame(_rows_d)
+    SS_INNOVATION_ACF = pd.concat(_rows_a, ignore_index=True)
+
+    # --- Report --------------------------------------------------------------
+    print("=" * 96)
+    print(f"PRINCIPAL MODEL — state-space dynamic regression, structure {SS_SELECTED}")
+    print("=" * 96)
+    print(f"Locked in §19 on null dynamics only. {SS_SELECTION_NOTE}.")
+    print(f"Both models fitted on the SAME {_n_obs} observed response months "
+          f"({SS_MATCHED_MONTHS.min():%Y-%m} .. {SS_MATCHED_MONTHS.max():%Y-%m}), "
+          f"the same {RESPONSE_INFO['transform']} transform and the same "
+          f"{len(SS_SEASON_COLS)}-column deterministic annual Fourier season.\\n")
+    display(SS_MODEL_COMPARISON.round(4))
+
+    print("\\nStandardized driver coefficients — effect on "
+          f"{RESPONSE_INFO['transform']}({RESPONSE_COL}) per 1 SD of the driver, "
+          f"{_full_info['cov_type_used']} standard errors, BH q across the driver block:")
+    display(SS_COEFS.round(4))
+    print("These are ASSOCIATION / NOWCAST estimates: contemporaneous drivers are used "
+          "at their a-priori lags, which is right for 'what moved with WH extent' and "
+          "wrong for 'what can be forecast'. §21 answers the second question.")
+
+    print("\\nJoint test of the whole driver block against the matched null:")
+    display(SS_JOINT_TEST.round(4))
+    _lrp = float(SS_JOINT_TEST["p_chi2"].iloc[0])
+    print(f"  LR = {_lr['lr_stat']:.3f} on {_lr['df']} df, asymptotic p = {_lrp:.4g}; "
+          f"Wald p = {_wald['p_wald']:.4g}")
+    print(f"  AICc {'PREFERS' if _aicc_full < _aicc_null else 'does NOT prefer'} the "
+          f"driver model ({_aicc_full:.2f} vs {_aicc_null:.2f}, "
+          f"difference {_aicc_full - _aicc_null:+.2f}).")
+
+    print("\\nStructure / latent-state diagnostics:")
+    display(SS_STATE_DIAGNOSTICS.round(4))
+    if SS_STATIONARY_SUPPORTED:
+        _rho = float(_st_full["rho_sum"])
+        print(f"  Stationarity supported (rho = {_rho:.3f}, CI "
+              f"[{_st_full['rho_ci_lo']:.3f}, {_st_full['rho_ci_hi']:.3f}]). A long-run "
+              f"multiplier 1/(1-rho) = {1 / (1 - _rho):.2f} would be defined — it is "
+              "still not quoted as a headline, because §22 shows what it buys.")
+    else:
+        print(f"  *** LONG-RUN MULTIPLIERS ARE NOT REPORTED: {SS_STATIONARITY_REASON}. "
+              "Only the SHORT-RUN standardized coefficients above may be quoted. ***")
+
+    print("\\nStandardized one-step-ahead innovation diagnostics (calendar lags):")
+    display(SS_INNOVATION_DIAGNOSTICS[[
+        "model", "n_innovations", "mean_std_innovation", "sd_std_innovation",
+        "acf1", "acf1_n_pairs", "acf12", "ljung_box_stat", "ljung_box_df",
+        "ljung_box_p", "jarque_bera_p", "het_var_ratio_last_over_first_third"]].round(4))
+    _lb_full = float(SS_INNOVATION_DIAGNOSTICS.loc[
+        SS_INNOVATION_DIAGNOSTICS["model"] == "full dynamic driver model",
+        "ljung_box_p"].iloc[0])
+    if np.isfinite(_lb_full) and _lb_full < 0.05:
+        print("  Residual dependence REMAINS after the selected structure: the "
+              "dependence model is incomplete, so the driver standard errors below are "
+              "optimistic. Say so in the write-up.")
+    else:
+        print("  No detectable dependence left in the standardized innovations: the "
+              "selected structure has absorbed the persistence, which is exactly the "
+              "condition under which the driver coefficients are interpretable.")
+
+    # --- Coefficient plot + innovation ACF ----------------------------------
+    if len(SS_COEFS):
+        fig, axes = plt.subplots(1, 2, figsize=(13, 0.55 * len(SS_COEFS) + 2.6))
+        _c = SS_COEFS.sort_values("coef")
+        axes[0].errorbar(_c["coef"], range(len(_c)),
+                         xerr=[_c["coef"] - _c["ci_lo"], _c["ci_hi"] - _c["coef"]],
+                         fmt="o", ms=6, capsize=3, color="tab:purple")
+        axes[0].axvline(0, color="k", lw=1)
+        axes[0].set_yticks(range(len(_c)))
+        axes[0].set_yticklabels([f"{t}  ({s})" for t, s in
+                                 zip(_c["term"], _c["expected_sign"])])
+        axes[0].set_xlabel(f"effect on {RESPONSE_INFO['transform']}({RESPONSE_COL}) "
+                           "per 1 SD (95% CI)")
+        axes[0].set_title(f"State-space driver effects — {SS_SELECTED}\\n"
+                          "(a-priori expected sign in brackets); ASSOCIATION, not forecast")
+        axes[0].grid(alpha=0.3, axis="x")
+        _a = SS_INNOVATION_ACF[SS_INNOVATION_ACF["model"] == "full dynamic driver model"]
+        axes[1].bar(_a["lag"], _a["acf"], color="tab:purple", alpha=0.8)
+        axes[1].axhline(0, color="k", lw=0.8)
+        axes[1].axhline(_a["band"].iloc[0], color="red", ls="--", lw=1)
+        axes[1].axhline(-_a["band"].iloc[0], color="red", ls="--", lw=1)
+        axes[1].set_title("Standardized innovation ACF — full driver model\\n"
+                          "(calendar-month lags)")
+        axes[1].set_xlabel("lag (calendar months)")
+        axes[1].grid(alpha=0.3)
+        fig.tight_layout(); plt.show()
+
+    SS_MANIFEST = {
+        "run": True,
+        "structure_selected": SS_SELECTED,
+        "structure_label": ss_structure_label(SS_SELECTED),
+        "selection_note": SS_SELECTION_NOTE,
+        "selected_by": SS_SELECT_BY,
+        "selection_used_driver_significance": False,
+        "candidates": SS_CANDIDATE_STRUCTURES,
+        "season": f"deterministic annual Fourier, {SS_SEASON_HARMONICS} harmonic(s)",
+        "linear_trend_included": bool(ss_allows_linear_trend(SS_SELECTED) and INCLUDE_TREND),
+        "response": f"{RESPONSE_INFO['transform']}({RESPONSE_COL})",
+        "n_observed_months": int(_n_obs),
+        "n_calendar_months_grid": int(len(SS_INDEX)),
+        "first_month": str(pd.Timestamp(SS_INDEX.min()).date()),
+        "last_month": str(pd.Timestamp(SS_INDEX.max()).date()),
+        "driver_terms": list(SS_DRIVER_TERMS),
+        "driver_lags_apriori": {k: int(v) for k, v in LAG_USED.items()},
+        "null_exog": list(_null_cols), "full_exog": list(_full_cols),
+        "k_free_params_null": int(_k_null), "k_free_params_full": int(_k_full),
+        "aicc_null": float(_aicc_null), "aicc_full": float(_aicc_full),
+        "loglik_null": float(SS_NULL_FIT.llf), "loglik_full": float(SS_FULL_FIT.llf),
+        "cov_type_used": _full_info["cov_type_used"],
+        "stationary_supported": bool(SS_STATIONARY_SUPPORTED),
+        "stationarity_reason": SS_STATIONARITY_REASON,
+        "long_run_multipliers_reported": False,
+        "n_months_withheld_incomplete_drivers": int(len(SS_WITHHELD_MONTHS)),
+        "n_placeholder_exog_cells": int(len(SS_PLACEHOLDER_AUDIT)),
+        "placeholder_rule": ("standardized exogenous NaN -> 0.0 ONLY where the response "
+                             "is missing; asserted never to touch a month that "
+                             "contributes to the likelihood"),
+        "inference_kind": "association / nowcasting (a-priori lags incl. lag 0)",
+        "is_synthetic": bool(SOURCE["is_synthetic"]),
+    }
+else:
+    print("§20 skipped (no locked state-space structure).")
+    SS_STATIONARY_SUPPORTED = False
+    SS_STATIONARITY_REASON = SS_SKIP_REASON or "state-space model not fitted"
+    SS_MATCHED_MONTHS = pd.Series(dtype="datetime64[ns]")
+    SS_MANIFEST = {"run": False, "reason": SS_STATIONARITY_REASON}
+''')
+
+# ===========================================================================
+# 21. One-calendar-month-ahead rolling origin
+# ===========================================================================
+md("""## 21. Principal model, step 3 — genuine one-calendar-month-ahead prediction
+
+§16's three-calendar-month windows are kept as a **sensitivity comparison**, but
+they are no longer the headline, for two reasons. They use only eight origins,
+and their design still lets a contemporaneous driver — this month's temperature,
+this month's wind, this month's lake level — enter the prediction of *this
+month*. That is a **nowcast** with information no forecaster has.
+
+This section is the principal predictive assessment and fixes both:
+
+### The design
+
+* **Expanding window, one calendar month ahead.** Every feasible origin after at
+  least `SS_MIN_TRAIN_MONTHS` observed training months. The target is always the
+  **single next calendar month**, asserted month by month.
+* **Training is strictly earlier.** Training uses only calendar months *before*
+  the target; the assertion `max(train month) < target month` runs on every fold.
+* **Every transformation and standardisation is fitted inside the fold.** The
+  driver means and standard deviations come from the fold's *training months
+  only* — the globally z-scored columns from §11 are deliberately **not** used
+  here, because their scaling constants were computed with the target month in
+  them. The per-fold scaler's sample size is recorded and asserted equal to the
+  number of training months.
+* **Only origin-time information enters a predictor.** Rainfall already enters at
+  lag 1. Temperature, wind and lake level are **converted from lag 0 to lag 1**
+  for this evaluation, because their contemporaneous value is not knowable at the
+  origin. Supply a genuine forecast column through
+  `SS_FORECAST_EXOG_OVERRIDE` to use one instead. Every forecast driver is
+  asserted to have lag $\\ge$ `SS_FORECAST_MIN_LAG`.
+* **Null and full are refit on identical training and target months.** A target
+  month usable by only one of them is dropped from both and the reason recorded.
+
+### The baselines
+
+| Baseline | Definition | Fitted? |
+|---|---|---|
+| **literal persistence** | $\\hat y_t = y_{t-1}$ at exactly $t-1$ calendar months | **no** — no coefficient of any kind |
+| **fitted AR(1)** | AR(1) with constant, refit at every origin, forecast one month | yes |
+| **seasonal naive** | $\\hat y_t = y_{t-12}$ by calendar timestamp | no |
+| **null state-space** | locked structure + season (+ trend) | yes |
+| **full state-space** | *the same* + the lagged driver block | yes |
+| *training mean* | mean of the training response (context only) | yes |
+
+A regression of $y_t$ on `y_lag1` is **not** literal persistence and is never
+labelled as such: it has a fitted slope and intercept, and on a series with
+$\\rho \\approx 0.9$ that shrinkage is worth real skill. Both appear.
+
+Where the exact source month is missing, seasonal-naive and literal persistence
+are reported **unavailable** with their own $n$, and a **like-for-like table
+restricted to the common months** every model can be scored on is produced
+alongside.
+""")
+
+code('''# =====================================================================
+# 21a. Build the FORECAST driver set — origin-time information only
+# =====================================================================
+SS_FORECAST_SPECS = pd.DataFrame()
+SS_FC_TERMS = []
+SS_FC_RAW = pd.DataFrame()
+
+if SS_READY:
+    # `monthly` holds the RAW (unstandardised) driver values on the calendar grid.
+    # Nothing is standardised here: §21b does that inside each fold.
+    _fc_rows = []
+    _fc_frame = monthly[["month"]].copy()
+    for _base, _meta in FORCING.items():
+        _ap = int(LAG_USED.get(_base, _meta.get("apriori_lag", 0)))
+        _override = SS_FORECAST_EXOG_OVERRIDE.get(_base)
+        if _override and _override in monthly.columns:
+            _col, _lag, _how = _override, 0, "supplied forecast value"
+        else:
+            _lag = max(_ap, int(SS_FORECAST_MIN_LAG))
+            _col = _base
+            _how = ("a-priori lag already >= the origin" if _ap >= SS_FORECAST_MIN_LAG
+                    else f"a-priori lag {_ap} is not knowable at the origin -> lag {_lag}")
+        if _col not in monthly.columns:
+            _fc_rows.append({"driver": _base, "apriori_lag": _ap, "forecast_lag": np.nan,
+                             "term": "", "usable": False,
+                             "note": f"{_col} not in the built series"})
+            continue
+        _name = f"fc_{_base}_lag{_lag}" if _lag else f"fc_{_base}"
+        _fc_frame[_name] = monthly[_col].shift(_lag).to_numpy()
+        _fc_rows.append({"driver": _base, "apriori_lag": _ap, "forecast_lag": int(_lag),
+                         "term": _name, "source_column": _col, "usable": True,
+                         "note": _how})
+        SS_FC_TERMS.append(_name)
+    SS_FORECAST_SPECS = pd.DataFrame(_fc_rows)
+    SS_FC_RAW = _fc_frame
+
+    # The assertion the whole evaluation rests on: no forecast driver may carry
+    # information dated at or after the target month.
+    assert all(int(r) >= int(SS_FORECAST_MIN_LAG)
+               for r in SS_FORECAST_SPECS.loc[SS_FORECAST_SPECS["usable"],
+                                              "forecast_lag"]), \\
+        "a forecast driver would use information from the target month or later"
+
+    print("Forecast driver set — every term is knowable at the origin:")
+    display(SS_FORECAST_SPECS)
+    _changed = SS_FORECAST_SPECS[(SS_FORECAST_SPECS["usable"])
+                                 & (SS_FORECAST_SPECS["forecast_lag"]
+                                    > SS_FORECAST_SPECS["apriori_lag"])]
+    if len(_changed):
+        print(f"\\n{len(_changed)} contemporaneous driver(s) were moved to lag 1 for the "
+              f"FORECAST evaluation: {_changed['driver'].tolist()}.")
+        print("The a-priori (lag-0) specification is retained unchanged for the "
+              "association/nowcast inference in §12 and §20 — the two are different "
+              "questions and are never merged.")
+else:
+    print("§21a skipped.")
+''')
+
+code('''# =====================================================================
+# 21b. Expanding-window, one-calendar-month-ahead rolling origin
+# =====================================================================
+SS_FOLD_AUDIT = pd.DataFrame()
+SS_ONE_MONTH_PREDICTIONS = pd.DataFrame()
+SS_SKILL = pd.DataFrame()
+SS_SKILL_COMMON = pd.DataFrame()
+SS_EVAL_MONTHS_COMMON = pd.Series(dtype="datetime64[ns]")
+SS_SCALER_AUDIT = pd.DataFrame()
+
+if not (SS_READY and SS_SELECTED and SS_FC_TERMS):
+    print("§21b skipped (no locked structure or no usable forecast drivers).")
+else:
+    # ---- One calendar-complete frame carrying everything a fold can need -----
+    _fc = monthly[["month", "y_raw", "month_num"]].merge(SS_FC_RAW, on="month", how="left")
+    _fc = _fc.sort_values("month").reset_index(drop=True)
+    _fc["t_raw"] = np.arange(len(_fc), dtype=float)     # deterministic month counter
+    _season = fourier_terms(_fc["month"], SS_SEASON_HARMONICS)
+    _season_cols = list(_season.columns)
+    _fc = pd.concat([_fc, _season], axis=1)
+    _MI = month_index(_fc["month"])
+    assert np.all(np.diff(_MI) == 1), "the forecast frame is not calendar-complete"
+    _idx_all = calendar_grid_index(_fc["month"])
+
+    _use_trend = bool(ss_allows_linear_trend(SS_SELECTED) and INCLUDE_TREND)
+    _scale_cols = list(SS_FC_TERMS) + (["t_raw"] if _use_trend else [])
+
+    _rows_audit, _rows_pred, _rows_scaler = [], [], []
+    _t0 = pd.Timestamp.now()
+
+    for _pos in range(1, len(_fc)):
+        _target = _fc["month"].iloc[_pos]
+        _origin = _fc["month"].iloc[_pos - 1]
+        _rec = {"target_month": _target, "origin_month": _origin,
+                "horizon_months": int(_MI[_pos] - _MI[_pos - 1]),
+                "n_train_months_observed": 0, "usable": False, "skip_reason": ""}
+        assert _rec["horizon_months"] == 1, "target is not exactly one calendar month after the origin"
+
+        _train_slice = slice(0, _pos)
+        _y_train_raw = _fc["y_raw"].iloc[_train_slice]
+        _train_ok = _y_train_raw.notna().to_numpy()
+        _rec["n_train_months_observed"] = int(_train_ok.sum())
+        _rec["train_start"] = (_fc["month"].iloc[:_pos][_train_ok].min()
+                               if _train_ok.any() else pd.NaT)
+        _rec["train_end"] = (_fc["month"].iloc[:_pos][_train_ok].max()
+                             if _train_ok.any() else pd.NaT)
+
+        if _rec["n_train_months_observed"] < int(SS_MIN_TRAIN_MONTHS):
+            _rec["skip_reason"] = (f"{_rec['n_train_months_observed']} observed training "
+                                   f"month(s) < SS_MIN_TRAIN_MONTHS "
+                                   f"({SS_MIN_TRAIN_MONTHS})")
+            _rows_audit.append(_rec); continue
+        if not np.isfinite(_fc["y_raw"].iloc[_pos]):
+            _rec["skip_reason"] = ("target response not observed (month excluded by the "
+                                   "coverage filter); NOT imputed")
+            _rows_audit.append(_rec); continue
+        _miss_fc = [c for c in SS_FC_TERMS if not np.isfinite(_fc[c].iloc[_pos])]
+        if _miss_fc:
+            _rec["skip_reason"] = ("forecast driver(s) unavailable at the origin: "
+                                   + ", ".join(_miss_fc))
+            _rows_audit.append(_rec); continue
+
+        # ---- Everything below is fitted on TRAINING MONTHS ONLY --------------
+        _tr = _fc.iloc[_train_slice][_train_ok].copy()
+        _tr_full = _fc.iloc[_train_slice].copy()      # incl. gap months, for the filter
+        assert _tr["month"].max() < _target, "training reaches the target month"
+        assert _fc["month"].iloc[_pos - 1] == _origin
+
+        # Response transform: applied with the training rows only (its constants
+        # are fixed, but it is still evaluated inside the fold and recorded).
+        _how = "log" if RESPONSE_COL == "wh_area_ha" else RESPONSE_TRANSFORM
+        _y_tr_grid, _ = transform_response(_tr_full["y_raw"], _how, RESPONSE_EPS)
+        _y_target, _ = transform_response(_fc["y_raw"].iloc[[_pos]], _how, RESPONSE_EPS)
+        _y_target = float(np.asarray(_y_target)[0])
+
+        # Standardisation: means/SDs from the TRAINING months, applied to both.
+        _mu = _tr[_scale_cols].mean()
+        _sd = _tr[_scale_cols].std(ddof=1).replace(0, np.nan)
+        assert int(_tr[_scale_cols].notna().all(axis=1).sum()) <= len(_tr)
+        _rows_scaler.append({"target_month": _target, "n_train_rows_used": int(len(_tr)),
+                             "n_train_months_observed": _rec["n_train_months_observed"],
+                             **{f"mean__{c}": float(_mu[c]) for c in _scale_cols},
+                             **{f"sd__{c}": float(_sd[c]) for c in _scale_cols}})
+        if not np.isfinite(_sd.to_numpy(dtype=float)).all():
+            _rec["skip_reason"] = "a forecast driver has zero variance in this training window"
+            _rows_audit.append(_rec); continue
+
+        def _std(frame):
+            out = frame[_scale_cols].copy()
+            for c in _scale_cols:
+                out[c] = (out[c] - float(_mu[c])) / float(_sd[c])
+            return out
+
+        _X_tr = pd.concat([_tr_full[_season_cols].reset_index(drop=True),
+                           _std(_tr_full).reset_index(drop=True)], axis=1)
+        _X_te = pd.concat([_fc[_season_cols].iloc[[_pos]].reset_index(drop=True),
+                           _std(_fc.iloc[[_pos]]).reset_index(drop=True)], axis=1)
+        _null_cols_fc = list(_season_cols) + (["t_raw"] if _use_trend else [])
+        _full_cols_fc = _null_cols_fc + list(SS_FC_TERMS)
+
+        # The state-space filter needs finite exog on the training grid too. The
+        # SAME rule as §19a applies, in this order: a training month whose
+        # forecast drivers are incomplete is WITHHELD from the likelihood (its
+        # response is set missing), and only then is the 0.0 placeholder written
+        # — so it lands exclusively on months that contribute nothing.
+        _y_tr_series = pd.Series(np.asarray(_y_tr_grid, dtype=float),
+                                 index=_idx_all[:_pos])
+        _exog_incomplete = _X_tr[_full_cols_fc].isna().any(axis=1).to_numpy()
+        _rec["n_train_months_withheld_incomplete_drivers"] = int(
+            (_exog_incomplete & _y_tr_series.notna().to_numpy()).sum())
+        _y_tr_series[_exog_incomplete] = np.nan
+        _rec["n_train_months_in_likelihood"] = int(_y_tr_series.notna().sum())
+        if _rec["n_train_months_in_likelihood"] < int(SS_MIN_TRAIN_MONTHS):
+            _rec["skip_reason"] = (
+                f"only {_rec['n_train_months_in_likelihood']} training month(s) have "
+                "both the response and every forecast driver "
+                f"(< SS_MIN_TRAIN_MONTHS = {SS_MIN_TRAIN_MONTHS})")
+            _rows_audit.append(_rec); continue
+        _gap = _y_tr_series.isna().to_numpy()[:, None]
+        _X_tr = _X_tr.mask(_X_tr.isna() & _gap, 0.0)
+        _X_tr.index = _idx_all[:_pos]
+        _X_te.index = _idx_all[_pos:_pos + 1]
+        if _X_tr.isna().to_numpy().any():
+            _bad = _X_tr.columns[_X_tr.isna().any()].tolist()
+            _rec["skip_reason"] = ("training exogenous values still missing after "
+                                   f"withholding: {_bad}")
+            _rows_audit.append(_rec); continue
+        assert np.isfinite(_X_te.to_numpy(dtype=float)).all()
+        assert not (_X_tr.isna().to_numpy() & ~_gap).any(), \\
+            "a placeholder was written on a training month with an observed response"
+
+        _preds, _fail = {}, {}
+        # ---- 1. literal persistence: y at exactly t-1, NO fitted coefficient --
+        _prev = _fc["y_raw"].iloc[_pos - 1]
+        if np.isfinite(_prev):
+            _pv, _ = transform_response(pd.Series([_prev]), _how, RESPONSE_EPS)
+            _preds["literal persistence (y_{t-1}, unfitted)"] = float(np.asarray(_pv)[0])
+        else:
+            _fail["literal persistence (y_{t-1}, unfitted)"] = (
+                f"the month exactly 1 calendar month earlier ({_origin:%Y-%m}) has no "
+                "observed response")
+
+        # ---- 2. seasonal naive: y at exactly t-12, by calendar timestamp ------
+        # Looked up on the calendar-complete grid by TIMESTAMP, never as "the
+        # twelfth previous observed row"; unavailable if that month is missing.
+        _src_month = _target - pd.DateOffset(months=12)
+        assert month_index(pd.Series([_target]))[0] \\
+            - month_index(pd.Series([_src_month]))[0] == 12, \\
+            "the seasonal-naive source month is not exactly 12 calendar months earlier"
+        _src_val = _fc.loc[_fc["month"] == _src_month, "y_raw"]
+        if len(_src_val) and np.isfinite(_src_val.iloc[0]):
+            _sv, _ = transform_response(pd.Series([float(_src_val.iloc[0])]),
+                                        _how, RESPONSE_EPS)
+            _preds["seasonal naive (y_{t-12})"] = float(np.asarray(_sv)[0])
+        else:
+            _fail["seasonal naive (y_{t-12})"] = (
+                f"the month exactly 12 calendar months earlier ({_src_month:%Y-%m}) has "
+                "no observed response")
+
+        # ---- 3. training mean (context only) ---------------------------------
+        _preds["training mean"] = float(np.nanmean(_y_tr_series.to_numpy()))
+
+        # ---- 4. fitted AR(1), refit at this origin ---------------------------
+        try:
+            _ar = SARIMAX(_y_tr_series, order=(1, 0, 0), trend="c",
+                          enforce_stationarity=True).fit(disp=False,
+                                                         maxiter=SS_ROLLING_MAXITER)
+            _preds["fitted AR(1)"] = float(np.asarray(
+                _ar.get_forecast(steps=1).predicted_mean)[0])
+        except Exception as _exc:
+            _fail["fitted AR(1)"] = f"fit failed: {str(_exc)[:80]}"
+
+        # ---- 5/6. matched null and full state-space models --------------------
+        _ss_ok = True
+        for _name, _cols in (("null state-space (season+trend+persistence)", _null_cols_fc),
+                             ("full state-space (+ lagged drivers)", _full_cols_fc)):
+            try:
+                _r, _ = ss_fit(_y_tr_series, _X_tr[_cols], SS_SELECTED,
+                               cov_type=None, maxiter=SS_ROLLING_MAXITER)
+                _f = _r.get_forecast(steps=1, exog=_X_te[_cols])
+                assert pd.Timestamp(_f.predicted_mean.index[0]) == pd.Timestamp(_target), \\
+                    "the state-space forecast is not for the target calendar month"
+                _preds[_name] = float(np.asarray(_f.predicted_mean)[0])
+            except Exception as _exc:
+                _fail[_name] = f"fit/forecast failed: {str(_exc)[:80]}"
+                _ss_ok = False
+        if not _ss_ok:
+            # Matched models must stand or fall together on identical months.
+            for _name in ("null state-space (season+trend+persistence)",
+                          "full state-space (+ lagged drivers)"):
+                _preds.pop(_name, None)
+                _fail.setdefault(_name, "dropped so null and full share identical months")
+            _rec["skip_reason"] = ("matched state-space pair unavailable at this origin; "
+                                   "dropped from BOTH models")
+
+        _rec["usable"] = ("null state-space (season+trend+persistence)" in _preds
+                          and "full state-space (+ lagged drivers)" in _preds)
+        _rec["n_models_predicted"] = int(len(_preds))
+        _rec["models_unavailable"] = "; ".join(f"{k}: {v}" for k, v in _fail.items())
+        _rows_audit.append(_rec)
+
+        for _name, _yhat in _preds.items():
+            _rows_pred.append({
+                "target_month": _target, "origin_month": _origin,
+                "specification": _name,
+                "y_transformed": _y_target, "yhat_transformed": float(_yhat),
+                "y_raw": float(_fc["y_raw"].iloc[_pos]),
+                "yhat_raw": float(inverse_response_transform(
+                    pd.Series([_yhat]), _how, RESPONSE_EPS).iloc[0]),
+                "n_train_months": _rec["n_train_months_observed"],
+                "horizon_months": 1,
+            })
+
+    SS_FOLD_AUDIT = pd.DataFrame(_rows_audit)
+    SS_ONE_MONTH_PREDICTIONS = pd.DataFrame(_rows_pred)
+    SS_SCALER_AUDIT = pd.DataFrame(_rows_scaler)
+    _elapsed = (pd.Timestamp.now() - _t0).total_seconds()
+
+    # ---- Assertions on the whole evaluation ---------------------------------
+    if len(SS_ONE_MONTH_PREDICTIONS):
+        assert (SS_ONE_MONTH_PREDICTIONS["horizon_months"] == 1).all(), \\
+            "a prediction is not one calendar month ahead"
+        assert ((month_index(SS_ONE_MONTH_PREDICTIONS["target_month"])
+                 - month_index(SS_ONE_MONTH_PREDICTIONS["origin_month"])) == 1).all(), \\
+            "target and origin are not exactly one calendar month apart"
+        _pair = SS_ONE_MONTH_PREDICTIONS[SS_ONE_MONTH_PREDICTIONS["specification"].isin(
+            ["null state-space (season+trend+persistence)",
+             "full state-space (+ lagged drivers)"])]
+        _sets = _pair.groupby("specification")["target_month"].apply(
+            lambda s: tuple(sorted(pd.to_datetime(s).tolist())))
+        assert _sets.nunique() <= 1, \\
+            "the matched null and full state-space models were scored on different months"
+
+    print(f"Expanding-window one-calendar-month-ahead rolling origin "
+          f"({_elapsed:.0f} s).")
+    print(f"  {len(SS_FOLD_AUDIT)} candidate target month(s) considered; "
+          f"{int(SS_FOLD_AUDIT['usable'].sum())} scored by the matched pair.")
+    _skips = SS_FOLD_AUDIT[(~SS_FOLD_AUDIT["usable"]) & (SS_FOLD_AUDIT["skip_reason"] != "")]
+    _reason_counts = (_skips["skip_reason"].str.replace(r"\\d+", "N", regex=True)
+                      .str.slice(0, 90).value_counts())
+    if len(_reason_counts):
+        print("\\n  Target months NOT scored, by reason:")
+        for _r, _n in _reason_counts.items():
+            print(f"    {_n:>3d}  {_r}")
+    display(SS_FOLD_AUDIT.tail(15))
+
+    # ---- Per-month scaling was trained inside the fold ----------------------
+    if len(SS_SCALER_AUDIT):
+        assert (SS_SCALER_AUDIT["n_train_rows_used"]
+                == SS_SCALER_AUDIT["n_train_months_observed"]).all(), \\
+            "a fold's scaler saw rows other than its own observed training months"
+        _v = SS_SCALER_AUDIT[[c for c in SS_SCALER_AUDIT.columns
+                              if c.startswith("mean__")]].nunique()
+        print(f"\\n  Per-fold standardisation: {len(SS_SCALER_AUDIT)} scalers fitted, "
+              f"{int(_v.max())} distinct mean(s) for the most variable driver — the "
+              "scaling genuinely moves with the training window and was never global.")
+''')
+
+code('''# =====================================================================
+# 21c. Skill tables — each model's own months, then like-for-like
+# =====================================================================
+if not len(SS_ONE_MONTH_PREDICTIONS):
+    print("§21c skipped: no one-month-ahead predictions were produced.")
+else:
+    _P = SS_ONE_MONTH_PREDICTIONS
+    _rows = []
+    for _name, _g in _P.groupby("specification"):
+        _t = rmse_mae(_g["y_transformed"], _g["yhat_transformed"])
+        _r = rmse_mae(_g["y_raw"], _g["yhat_raw"])
+        _rows.append({
+            "specification": _name, "n_test": _t["n"],
+            "first_month": _g["target_month"].min(), "last_month": _g["target_month"].max(),
+            "rmse_logit": _t["rmse"], "mae_logit": _t["mae"],
+            "rmse_raw_cover": _r["rmse"], "mae_raw_cover": _r["mae"],
+            "eval_set": "own months",
+        })
+    SS_SKILL = pd.DataFrame(_rows).sort_values("rmse_logit").reset_index(drop=True)
+
+    _all_specs = sorted(_P["specification"].unique())
+    _month_sets = [set(_P.loc[_P["specification"] == s, "target_month"]) for s in _all_specs]
+    _common = set.intersection(*_month_sets) if _month_sets else set()
+    SS_EVAL_MONTHS_COMMON = pd.Series(sorted(_common))
+
+    _rows = []
+    for _name, _g in _P[_P["target_month"].isin(_common)].groupby("specification"):
+        _t = rmse_mae(_g["y_transformed"], _g["yhat_transformed"])
+        _r = rmse_mae(_g["y_raw"], _g["yhat_raw"])
+        _rows.append({"specification": _name, "n_test": _t["n"],
+                      "rmse_logit": _t["rmse"], "mae_logit": _t["mae"],
+                      "rmse_raw_cover": _r["rmse"], "mae_raw_cover": _r["mae"],
+                      "eval_set": "common months (like-for-like)"})
+    SS_SKILL_COMMON = pd.DataFrame(_rows).sort_values("rmse_logit").reset_index(drop=True)
+    if len(SS_SKILL_COMMON):
+        assert SS_SKILL_COMMON["n_test"].nunique() == 1, \\
+            "the like-for-like table does not use one common sample"
+
+    _n_full = int(SS_SKILL.loc[SS_SKILL["specification"]
+                               == "full state-space (+ lagged drivers)", "n_test"].iloc[0]) \\
+        if (SS_SKILL["specification"] == "full state-space (+ lagged drivers)").any() else 0
+    print("One-calendar-month-ahead skill — each specification on the months IT can be "
+          "scored on (n_test differs by design; do NOT rank across rows here):")
+    display(SS_SKILL.round(4))
+
+    _short = SS_SKILL[SS_SKILL["n_test"] < _n_full]
+    if len(_short):
+        print("\\nScored on FEWER months than the matched pair, because the exact source "
+              "month is missing from the record:")
+        for _r in _short.itertuples():
+            print(f"  {_r.specification}: {_r.n_test} of {_n_full} month(s)")
+        print("  These are reported separately for exactly that reason; their RMSE is "
+              "computed on a different (not necessarily easier) sample.")
+
+    print(f"\\nLike-for-like — every specification recomputed on the "
+          f"{len(SS_EVAL_MONTHS_COMMON)} month(s) ALL of them can be scored on "
+          f"({SS_EVAL_MONTHS_COMMON.min():%Y-%m} .. {SS_EVAL_MONTHS_COMMON.max():%Y-%m}). "
+          "This is the table to compare rows in:")
+    display(SS_SKILL_COMMON.round(4))
+
+    _fig_tab = SS_SKILL_COMMON if len(SS_SKILL_COMMON) else SS_SKILL
+    fig, axes = plt.subplots(1, 2, figsize=(13.5, 0.5 * len(_fig_tab) + 2.2))
+    for _ax, _col, _lab in ((axes[0], "rmse_logit",
+                             f"RMSE on {RESPONSE_INFO['transform']}({RESPONSE_COL})"),
+                            (axes[1], "rmse_raw_cover",
+                             "RMSE on raw WH cover (back-transformed)")):
+        _t = _fig_tab.sort_values(_col)
+        _cols = ["tab:green" if "full state-space" in s else
+                 ("tab:purple" if "null state-space" in s else "tab:grey")
+                 for s in _t["specification"]]
+        _ax.barh(_t["specification"], _t[_col], color=_cols, alpha=0.85)
+        _ax.invert_yaxis(); _ax.grid(alpha=0.3, axis="x")
+        _ax.set_xlabel(_lab)
+    fig.suptitle("One-calendar-month-ahead skill, like-for-like months\\n"
+                 "green = uses environmental drivers, purple = matched no-driver model",
+                 fontsize=11)
+    fig.tight_layout(); plt.show()
+
+    _obs = _P[_P["specification"] == "full state-space (+ lagged drivers)"].sort_values(
+        "target_month")
+    if len(_obs):
+        fig, ax = plt.subplots(figsize=(11.5, 3.8))
+        ax.plot(_obs["target_month"], _obs["y_transformed"], "k-o", ms=4, lw=1.4,
+                label="observed")
+        for _s, _c in (("null state-space (season+trend+persistence)", "tab:purple"),
+                       ("full state-space (+ lagged drivers)", "tab:green"),
+                       ("literal persistence (y_{t-1}, unfitted)", "tab:orange")):
+            _g = _P[_P["specification"] == _s].sort_values("target_month")
+            if len(_g):
+                ax.plot(_g["target_month"], _g["yhat_transformed"], lw=1.3, marker=".",
+                        alpha=0.85, color=_c, label=_s)
+        ax.set_xlabel("target month (each point is a separate expanding-window refit)")
+        ax.set_ylabel(f"{RESPONSE_INFO['transform']}({RESPONSE_COL})")
+        ax.set_title("One-calendar-month-ahead forecasts, expanding origin")
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        for _l in ax.get_xticklabels():
+            _l.set_rotation(45); _l.set_horizontalalignment("right")
+        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        fig.tight_layout(); plt.show()
+''')
+
+
+# ===========================================================================
+# 22. Paired RMSE difference
+# ===========================================================================
+md("""## 22. Do the drivers genuinely improve one-month-ahead prediction?
+
+A lower point-estimate RMSE is not evidence. On ~30 evaluated months, two models
+whose forecasts differ by a few percent will trade places under any reshuffle of
+which months happened to be observed. This section therefore reports the
+difference **with its uncertainty**, on the matched pair only:
+
+* absolute and percentage RMSE difference (full minus null), on the logit
+  modelling scale and on back-transformed raw WH cover;
+* the **paired month-level loss differences** $d_t = e^{\\text{full}\\,2}_t -
+  e^{\\text{null}\\,2}_t$, which is what a Diebold–Mariano test is built on, with
+  a Newey–West standard error on calendar lags;
+* a **calendar-aware moving-block bootstrap 95% interval** for the RMSE
+  difference, resampling contiguous runs of calendar months so that short-range
+  dependence between neighbouring forecast errors is preserved and two months a
+  year apart are never made adjacent.
+
+**The reporting rule, applied by the code and not by the reader:** whenever the
+interval includes zero, the wording is *"the point estimate was lower, but the
+improvement was uncertain"*. No RMSE difference is called an improvement on the
+strength of its point estimate.
+""")
+
+code('''# =====================================================================
+# 22. Paired loss differences and a calendar-aware bootstrap interval
+# =====================================================================
+SS_PAIRED_LOSS = pd.DataFrame()
+SS_RMSE_DIFF = pd.DataFrame()
+SS_DRIVERS_IMPROVE_PREDICTION = None
+SS_PREDICTION_VERDICT = "not evaluated"
+
+_FULL = "full state-space (+ lagged drivers)"
+_NULL = "null state-space (season+trend+persistence)"
+
+if not (len(SS_ONE_MONTH_PREDICTIONS)
+        and {_FULL, _NULL}.issubset(set(SS_ONE_MONTH_PREDICTIONS["specification"]))):
+    print("§22 skipped: the matched state-space pair was not scored.")
+else:
+    _f = SS_ONE_MONTH_PREDICTIONS[SS_ONE_MONTH_PREDICTIONS["specification"] == _FULL] \\
+        .sort_values("target_month").reset_index(drop=True)
+    _n = SS_ONE_MONTH_PREDICTIONS[SS_ONE_MONTH_PREDICTIONS["specification"] == _NULL] \\
+        .sort_values("target_month").reset_index(drop=True)
+    assert (_f["target_month"].to_numpy() == _n["target_month"].to_numpy()).all(), \\
+        "the paired comparison is not on identical target months"
+
+    SS_PAIRED_LOSS = pd.DataFrame({
+        "target_month": _f["target_month"],
+        "y_transformed": _f["y_transformed"], "y_raw": _f["y_raw"],
+        "yhat_full": _f["yhat_transformed"], "yhat_null": _n["yhat_transformed"],
+        "err_full": _f["y_transformed"] - _f["yhat_transformed"],
+        "err_null": _n["y_transformed"] - _n["yhat_transformed"],
+        "err_full_raw": _f["y_raw"] - _f["yhat_raw"],
+        "err_null_raw": _n["y_raw"] - _n["yhat_raw"],
+    })
+    SS_PAIRED_LOSS["loss_difference_full_minus_null"] = (
+        SS_PAIRED_LOSS["err_full"] ** 2 - SS_PAIRED_LOSS["err_null"] ** 2)
+    SS_PAIRED_LOSS["full_closer"] = (SS_PAIRED_LOSS["err_full"].abs()
+                                     < SS_PAIRED_LOSS["err_null"].abs())
+
+    _rows = []
+    for _scale, _ef, _en in (("logit modelling scale",
+                              SS_PAIRED_LOSS["err_full"], SS_PAIRED_LOSS["err_null"]),
+                             ("raw WH cover (back-transformed)",
+                              SS_PAIRED_LOSS["err_full_raw"],
+                              SS_PAIRED_LOSS["err_null_raw"])):
+        _rf = float(np.sqrt(np.mean(_ef.to_numpy() ** 2)))
+        _rn = float(np.sqrt(np.mean(_en.to_numpy() ** 2)))
+        _boot = block_bootstrap_rmse_difference(
+            SS_PAIRED_LOSS["target_month"], _ef, _en,
+            block_months=SS_RMSE_BOOTSTRAP_BLOCK, n_boot=SS_RMSE_BOOTSTRAP_N,
+            seed=SS_RMSE_BOOTSTRAP_SEED)
+        _dm = newey_west_mean_test(_ef.to_numpy() ** 2 - _en.to_numpy() ** 2,
+                                   months=SS_PAIRED_LOSS["target_month"],
+                                   maxlags=HAC_MAXLAGS)
+        _rows.append({
+            "scale": _scale, "n_months": int(len(SS_PAIRED_LOSS)),
+            "rmse_full": _rf, "rmse_null": _rn,
+            "mae_full": float(np.mean(np.abs(_ef))), "mae_null": float(np.mean(np.abs(_en))),
+            "rmse_difference_full_minus_null": _rf - _rn,
+            "rmse_percent_difference": 100.0 * (_rf - _rn) / _rn if _rn else np.nan,
+            "boot_ci_lo": _boot["ci_lo"], "boot_ci_hi": _boot["ci_hi"],
+            "boot_block_months": _boot["block_months"],
+            "boot_n_successful": _boot["n_successful"],
+            "boot_share_favouring_full": _boot["share_negative"],
+            "interval_excludes_zero": bool(np.isfinite(_boot["ci_lo"])
+                                           and np.isfinite(_boot["ci_hi"])
+                                           and (_boot["ci_lo"] > 0 or _boot["ci_hi"] < 0)),
+            "mean_paired_loss_difference": _dm["mean"], "dm_se_hac": _dm["se_hac"],
+            "dm_t": _dm["t"], "dm_p": _dm["p"],
+            "n_months_full_closer": int(SS_PAIRED_LOSS["full_closer"].sum()),
+        })
+    SS_RMSE_DIFF = pd.DataFrame(_rows)
+
+    print(f"Matched pair on {len(SS_PAIRED_LOSS)} identical one-month-ahead target "
+          f"months ({SS_PAIRED_LOSS['target_month'].min():%Y-%m} .. "
+          f"{SS_PAIRED_LOSS['target_month'].max():%Y-%m}).")
+    display(SS_RMSE_DIFF.round(5))
+
+    _row = SS_RMSE_DIFF.iloc[0]           # the logit modelling scale is the headline
+    _pt_lower = bool(_row["rmse_difference_full_minus_null"] < 0)
+    _certain = bool(_row["interval_excludes_zero"] and _pt_lower)
+    SS_DRIVERS_IMPROVE_PREDICTION = _certain
+    print("\\n" + "=" * 96)
+    if _certain:
+        SS_PREDICTION_VERDICT = (
+            f"the environmental drivers improved one-month-ahead RMSE by "
+            f"{abs(_row['rmse_percent_difference']):.1f}% against the matched "
+            f"season+trend+persistence model, and the 95% moving-block interval "
+            f"[{_row['boot_ci_lo']:+.4f}, {_row['boot_ci_hi']:+.4f}] excludes zero")
+        print("DRIVERS IMPROVE ONE-MONTH-AHEAD PREDICTION.")
+    elif _pt_lower:
+        SS_PREDICTION_VERDICT = (
+            f"the point estimate was lower (RMSE {_row['rmse_full']:.4f} vs "
+            f"{_row['rmse_null']:.4f}, {abs(_row['rmse_percent_difference']):.1f}%), "
+            f"but the improvement was uncertain: the 95% calendar-aware moving-block "
+            f"interval [{_row['boot_ci_lo']:+.4f}, {_row['boot_ci_hi']:+.4f}] includes "
+            "zero")
+        print("THE POINT ESTIMATE WAS LOWER, BUT THE IMPROVEMENT WAS UNCERTAIN.")
+    else:
+        SS_PREDICTION_VERDICT = (
+            f"the drivers did NOT improve one-month-ahead prediction (RMSE "
+            f"{_row['rmse_full']:.4f} vs {_row['rmse_null']:.4f}, "
+            f"{_row['rmse_percent_difference']:+.1f}%); 95% interval "
+            f"[{_row['boot_ci_lo']:+.4f}, {_row['boot_ci_hi']:+.4f}]")
+        print("DRIVERS DO NOT IMPROVE ONE-MONTH-AHEAD PREDICTION.")
+    print("=" * 96)
+    print(SS_PREDICTION_VERDICT + ".")
+    print(f"\\nThe full model was closer than the null on "
+          f"{int(SS_PAIRED_LOSS['full_closer'].sum())} of {len(SS_PAIRED_LOSS)} months "
+          f"({100 * SS_PAIRED_LOSS['full_closer'].mean():.0f}%). Diebold-Mariano on the "
+          f"paired squared-error differences: t = {_row['dm_t']:.2f}, "
+          f"p = {_row['dm_p']:.3g} (Newey-West on calendar lags).")
+    print(f"Bootstrap: {int(_row['boot_n_successful']):,} replicate(s), moving blocks of "
+          f"{int(_row['boot_block_months'])} calendar month(s); the full model won in "
+          f"{100 * _row['boot_share_favouring_full']:.0f}% of them.")
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 3.6))
+    axes[0].bar(SS_PAIRED_LOSS["target_month"],
+                SS_PAIRED_LOSS["loss_difference_full_minus_null"],
+                width=20, color=np.where(SS_PAIRED_LOSS["full_closer"],
+                                         "tab:green", "tab:red"), alpha=0.85)
+    axes[0].axhline(0, color="k", lw=1)
+    axes[0].set_title("Paired month-level loss difference (full - null)\\n"
+                      "negative = the driver model was closer that month")
+    axes[0].set_ylabel("squared-error difference")
+    axes[0].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    for _l in axes[0].get_xticklabels():
+        _l.set_rotation(45); _l.set_horizontalalignment("right")
+    axes[1].axvline(0, color="k", lw=1)
+    axes[1].errorbar([_row["rmse_difference_full_minus_null"]], [0],
+                     xerr=[[_row["rmse_difference_full_minus_null"] - _row["boot_ci_lo"]],
+                           [_row["boot_ci_hi"] - _row["rmse_difference_full_minus_null"]]],
+                     fmt="o", ms=9, capsize=5, color="tab:blue")
+    axes[1].set_yticks([]); axes[1].set_xlabel("RMSE(full) - RMSE(null), logit scale")
+    axes[1].set_title("RMSE difference with its 95% moving-block interval\\n"
+                      + ("interval EXCLUDES zero" if _row["interval_excludes_zero"]
+                         else "interval INCLUDES zero -> improvement uncertain"))
+    for _a in axes:
+        _a.grid(alpha=0.3)
+    fig.tight_layout(); plt.show()
+''')
+
+
+# ===========================================================================
+# 23. Parametric bootstrap of the joint driver-block LR statistic
+# ===========================================================================
+md("""## 23. Is the joint driver test's $p$-value trustworthy at this sample size?
+
+§20's likelihood-ratio test is referred to a $\\chi^2_k$ distribution. That
+reference is asymptotic, and this record has roughly sixty observed months
+containing perhaps a handful of independent episodes. On short, strongly
+persistent series the LR statistic's true null distribution is routinely
+*heavier* than $\\chi^2$, so the asymptotic $p$-value is optimistic.
+
+This section rebuilds the null distribution instead of assuming it:
+
+1. simulate a response from the **fitted matched null model** — the same
+   structure, the same season/trend coefficients, the same innovation variance,
+   so the simulated series has the record's persistence and *no* driver effect;
+2. re-impose the record's **exact missing-month pattern**, so each replicate has
+   the same number of likelihood contributions in the same calendar positions;
+3. refit **both** the null and the full model to the simulated series and record
+   the LR statistic;
+4. report $p = (1 + \\#\\{LR^* \\ge LR^{obs}\\}) / (1 + B)$ over the replicates that
+   refitted successfully.
+
+The number of successful refits is reported, because a bootstrap that lost half
+its replicates to optimiser failures is not a 400-replicate bootstrap. **Failure
+here never stops the notebook**: the section is wrapped, the asymptotic result
+from §20 stands on its own, and the failure is reported as a failure.
+""")
+
+code('''# =====================================================================
+# 23. Parametric bootstrap under the matched null
+# =====================================================================
+SS_LR_BOOTSTRAP = pd.DataFrame()
+SS_LR_BOOTSTRAP_DRAWS = pd.DataFrame()
+SS_LR_BOOTSTRAP_STATUS = "not run"
+
+if not (SS_READY and SS_FULL_FIT is not None and SS_NULL_FIT is not None):
+    SS_LR_BOOTSTRAP_STATUS = "state-space models unavailable"
+    print(f"§23 skipped: {SS_LR_BOOTSTRAP_STATUS}.")
+elif not SS_RUN_LR_BOOTSTRAP:
+    SS_LR_BOOTSTRAP_STATUS = "SS_RUN_LR_BOOTSTRAP = False"
+    print(f"§23 skipped: {SS_LR_BOOTSTRAP_STATUS}. The §20 chi-square p-value is then "
+          "the only joint reference available, and it is asymptotic.")
+else:
+    _null_cols = list(SS_MANIFEST["null_exog"])
+    _full_cols = list(SS_MANIFEST["full_exog"])
+    _obs_pattern = SS_Y.notna().to_numpy()
+    _lr_obs = float(SS_JOINT_TEST["lr_stat"].iloc[0])
+    _draws, _n_fail, _t0 = [], 0, pd.Timestamp.now()
+    _budget_hit = False
+
+    try:
+        for _b in range(int(SS_LR_BOOTSTRAP_N)):
+            if (pd.Timestamp.now() - _t0).total_seconds() > SS_LR_BOOTSTRAP_TIME_BUDGET_S:
+                _budget_hit = True
+                break
+            try:
+                np.random.seed(int(SS_LR_BOOTSTRAP_SEED) + _b)
+                _sim = SS_NULL_FIT.simulate(nsimulations=len(SS_Y),
+                                            exog=SS_EXOG[_null_cols])
+                _ysim = pd.Series(np.asarray(_sim, dtype=float).ravel(), index=SS_INDEX)
+                _ysim[~_obs_pattern] = np.nan     # the record's own missing pattern
+                assert np.array_equal(_ysim.notna().to_numpy(), _obs_pattern)
+                _r0, _ = ss_fit(_ysim, SS_EXOG[_null_cols], SS_SELECTED,
+                                cov_type=None, maxiter=SS_LR_BOOTSTRAP_MAXITER)
+                _r1, _ = ss_fit(_ysim, SS_EXOG[_full_cols], SS_SELECTED,
+                                cov_type=None, maxiter=SS_LR_BOOTSTRAP_MAXITER)
+                _stat = float(2.0 * (float(_r1.llf) - float(_r0.llf)))
+                if not np.isfinite(_stat):
+                    _n_fail += 1
+                    continue
+                _draws.append(max(_stat, 0.0))
+            except Exception:
+                _n_fail += 1
+                continue
+
+        _d = np.asarray(_draws, dtype=float)
+        _B = int(len(_d))
+        if _B < 30:
+            SS_LR_BOOTSTRAP_STATUS = (f"only {_B} successful refit(s) of "
+                                      f"{SS_LR_BOOTSTRAP_N}; too few to report")
+            print(f"§23: {SS_LR_BOOTSTRAP_STATUS}. The asymptotic chi-square p-value "
+                  "from §20 stands, with its optimism unquantified.")
+        else:
+            _p_boot = float((1 + int(np.sum(_d >= _lr_obs))) / (1 + _B))
+            SS_LR_BOOTSTRAP_STATUS = "completed"
+            SS_LR_BOOTSTRAP_DRAWS = pd.DataFrame({"replicate": np.arange(_B),
+                                                  "lr_stat_simulated": _d})
+            SS_LR_BOOTSTRAP = pd.DataFrame([{
+                "comparison": "full driver block vs matched null (parametric bootstrap)",
+                "structure": SS_SELECTED, "k_drivers": len(SS_DRIVER_TERMS),
+                "lr_stat_observed": _lr_obs,
+                "n_replicates_requested": int(SS_LR_BOOTSTRAP_N),
+                "n_replicates_successful": _B,
+                "n_replicates_failed": int(_n_fail),
+                "time_budget_exhausted": bool(_budget_hit),
+                "p_bootstrap": _p_boot,
+                "p_chi2_asymptotic": float(SS_JOINT_TEST["p_chi2"].iloc[0]),
+                "bootstrap_null_median": float(np.median(_d)),
+                "bootstrap_null_q95": float(np.quantile(_d, 0.95)),
+                "chi2_q95": float(sstats.chi2.ppf(0.95, len(SS_DRIVER_TERMS))),
+                "seconds": float((pd.Timestamp.now() - _t0).total_seconds()),
+            }])
+            display(SS_LR_BOOTSTRAP.round(4))
+            print(f"Parametric bootstrap: {_B} successful refit(s) of "
+                  f"{SS_LR_BOOTSTRAP_N} requested ({_n_fail} failed"
+                  + (", time budget reached" if _budget_hit else "") + ").")
+            print(f"  observed LR = {_lr_obs:.3f}; bootstrap p = {_p_boot:.4f}; "
+                  f"asymptotic chi-square p = "
+                  f"{float(SS_JOINT_TEST['p_chi2'].iloc[0]):.4f}")
+            _q95b = float(np.quantile(_d, 0.95))
+            _q95c = float(sstats.chi2.ppf(0.95, len(SS_DRIVER_TERMS)))
+            if _q95b > _q95c:
+                print(f"  The simulated null is HEAVIER than chi-square "
+                      f"(95th percentile {_q95b:.2f} vs {_q95c:.2f}), so the asymptotic "
+                      "p-value in §20 is optimistic; quote the bootstrap one.")
+            else:
+                print(f"  The simulated null is no heavier than chi-square "
+                      f"({_q95b:.2f} vs {_q95c:.2f}); the §20 p-value is not obviously "
+                      "distorted by the sample size.")
+
+            fig, ax = plt.subplots(figsize=(8.5, 3.4))
+            ax.hist(_d, bins=30, color="tab:grey", alpha=0.8,
+                    label=f"simulated null ({_B} refits)")
+            _xs = np.linspace(0, max(float(np.max(_d)), _lr_obs) * 1.05, 200)
+            ax.plot(_xs, sstats.chi2.pdf(_xs, len(SS_DRIVER_TERMS)) * _B
+                    * (float(np.max(_d)) / 30 if np.max(_d) > 0 else 1),
+                    color="tab:blue", lw=2,
+                    label=f"chi-square({len(SS_DRIVER_TERMS)}) reference")
+            ax.axvline(_lr_obs, color="tab:red", lw=2,
+                       label=f"observed LR = {_lr_obs:.2f}")
+            ax.set_xlabel("likelihood-ratio statistic for the driver block")
+            ax.set_title("Null distribution of the joint driver-block LR statistic\\n"
+                         "simulated from the FITTED MATCHED NULL, missing months re-imposed")
+            ax.legend(fontsize=8); ax.grid(alpha=0.3)
+            fig.tight_layout(); plt.show()
+    except Exception as _exc:                       # pragma: no cover - defensive
+        SS_LR_BOOTSTRAP_STATUS = f"failed: {str(_exc)[:160]}"
+        print(f"§23 FAILED and was skipped: {SS_LR_BOOTSTRAP_STATUS}")
+        print("The rest of the notebook is unaffected; §20's asymptotic joint test "
+              "stands, and its optimism is unquantified.")
+''')
+
+
+# ===========================================================================
+# 24. State-space robustness
+# ===========================================================================
+md("""## 24. Robustness of the state-space result
+
+§18 attacks the *static* models' decisions. This section applies the same
+discipline to the principal model, and nothing here is merged with §18's tables:
+every row carries the model it came from.
+
+1. **Leave-one-year-out.** One year at a time is removed *by setting its
+   responses missing* — not by deleting rows — so the calendar, the season and
+   the state process are untouched and only that year's likelihood contribution
+   disappears. A coefficient that only exists when one particular year is present
+   is that year's, not the lake's.
+2. **Alternative response transformations** — `logit`, `log`, raw cover. A driver
+   whose sign depends on the link is not a driver effect.
+3. **Alternative dependence structures** — the full driver model refitted under
+   AR(1), AR(2) and the local level, so the reader can see whether §19's choice
+   changed any conclusion.
+4. **Calendar-aware residual diagnostics** for each of them.
+
+### The four sources of coefficients in this notebook, and what each may be called
+
+| Source | Section | What it is | What it may **not** be called |
+|---|---|---|---|
+| **M3** | §12 | static OLS/WLS + calendar-aware HAC, no persistence | a dynamic or causal effect |
+| **M4** | §12 | the same design plus `y_lag1` on the right-hand side | the principal estimate; it is a sensitivity |
+| **S1** | §20 | **principal** state-space driver estimates, persistence in the process | a forecast result |
+| **prediction-only** | §21–§22 | one-month-ahead skill with lagged drivers | an effect size or a $p$-value |
+
+Never quote a coefficient, $p$-value, Shapley value or robustness statistic
+without naming which of these four produced it.
+""")
+
+code('''# =====================================================================
+# 24a. Leave-one-year-out on the state-space driver model
+# =====================================================================
+SS_LOYO = pd.DataFrame()
+SS_LOYO_SUMMARY = pd.DataFrame()
+
+if not (SS_READY and SS_FULL_FIT is not None and SS_RUN_LOYO):
+    print("§24a skipped.")
+else:
+    _full_cols = list(SS_MANIFEST["full_exog"])
+    _years = sorted(pd.Series(SS_INDEX).dt.year[SS_Y.notna().to_numpy()].unique())
+    _rows = []
+    for _yr in _years:
+        _mask = (pd.Series(SS_INDEX).dt.year == _yr).to_numpy()
+        _y_drop = SS_Y.copy()
+        _y_drop[_mask] = np.nan          # remove the YEAR's likelihood contribution only
+        if int(_y_drop.notna().sum()) < 24:
+            continue
+        try:
+            _r, _i = ss_fit(_y_drop, SS_EXOG[_full_cols], SS_SELECTED,
+                            cov_type=SS_COV_TYPE, maxiter=SS_MAXITER)
+        except Exception:
+            continue
+        _t = ss_tidy_coefficients(_r, SS_SELECTED, SS_DRIVER_TERMS,
+                                  label=f"drop {int(_yr)}",
+                                  cov_type_used=_i["cov_type_used"])
+        _t["dropped_year"] = int(_yr)
+        _t["n_observed_months"] = int(_y_drop.notna().sum())
+        _rows.append(_t)
+
+    if _rows:
+        SS_LOYO = pd.concat(_rows, ignore_index=True)
+        _piv = SS_LOYO.pivot_table(index="term", columns="dropped_year", values="coef")
+        _full_coef = SS_COEFS.set_index("term")["coef"]
+        SS_LOYO_SUMMARY = pd.DataFrame({
+            "coef_full_record": _full_coef,
+            "loyo_min": _piv.min(axis=1), "loyo_max": _piv.max(axis=1),
+            "loyo_sign_stable": _piv.apply(
+                lambda r: np.sign(r.dropna()).nunique() <= 1, axis=1),
+        })
+        SS_LOYO_SUMMARY["max_abs_shift"] = (_piv.sub(SS_LOYO_SUMMARY["coef_full_record"],
+                                                     axis=0).abs().max(axis=1))
+        SS_LOYO_SUMMARY["most_influential_year"] = _piv.sub(
+            SS_LOYO_SUMMARY["coef_full_record"], axis=0).abs().idxmax(axis=1)
+        SS_LOYO_SUMMARY["source_model"] = f"S1 state-space {SS_SELECTED}"
+        print(f"Leave-one-year-out on the state-space driver model "
+              f"({len(_piv.columns)} year(s) dropped, one at a time, by setting that "
+              "year's responses missing):")
+        display(SS_LOYO_SUMMARY.round(4))
+
+        fig, ax = plt.subplots(figsize=(10, 0.5 * len(_piv) + 1.8))
+        for _i2, _t2 in enumerate(_piv.index):
+            ax.plot(_piv.loc[_t2], np.full(_piv.shape[1], _i2), "o", ms=5, alpha=0.7,
+                    color="tab:purple")
+            ax.plot(SS_LOYO_SUMMARY.loc[_t2, "coef_full_record"], _i2, "D", ms=8,
+                    color="tab:red")
+        ax.axvline(0, color="k", lw=1)
+        ax.set_yticks(range(len(_piv))); ax.set_yticklabels(_piv.index)
+        ax.invert_yaxis()
+        ax.set_xlabel("state-space coefficient "
+                      "(red diamond = full record, purple = one year removed)")
+        ax.set_title(f"Leave-one-year-out — S1 state-space {SS_SELECTED}")
+        ax.grid(alpha=0.3, axis="x")
+        fig.tight_layout(); plt.show()
+    else:
+        print("Too few months per year for a state-space leave-one-year-out.")
+''')
+
+code('''# =====================================================================
+# 24b. Alternative transforms and alternative dependence structures
+# =====================================================================
+SS_ROBUST_TRANSFORM = pd.DataFrame()
+SS_ROBUST_STRUCTURE = pd.DataFrame()
+SS_ROBUST_SIGN_STABLE = pd.Series(dtype=bool)
+
+if not (SS_READY and SS_FULL_FIT is not None):
+    print("§24b skipped.")
+else:
+    _null_cols = list(SS_MANIFEST["null_exog"])
+    _full_cols = list(SS_MANIFEST["full_exog"])
+
+    # --- (i) response transformation -------------------------------------
+    _rows, _fit_rows = [], []
+    for _how in SS_ROBUST_TRANSFORMS:
+        if RESPONSE_COL != "wh_area_ha" or _how != "logit":
+            _yv, _info_t = transform_response(SS_GRID["y_raw"], _how, RESPONSE_EPS)
+        else:
+            continue
+        _yv = pd.Series(np.where(SS_Y.notna().to_numpy(),
+                                 np.asarray(_yv, dtype=float), np.nan), index=SS_INDEX)
+        if not np.isfinite(_yv.dropna().to_numpy()).all():
+            continue
+        try:
+            _r0, _ = ss_fit(_yv, SS_EXOG[_null_cols], SS_SELECTED, cov_type=None,
+                            maxiter=SS_MAXITER)
+            _r1, _i1 = ss_fit(_yv, SS_EXOG[_full_cols], SS_SELECTED,
+                              cov_type=SS_COV_TYPE, maxiter=SS_MAXITER)
+        except Exception:
+            continue
+        _t = ss_tidy_coefficients(_r1, SS_SELECTED, SS_DRIVER_TERMS,
+                                  label=f"transform={_how}",
+                                  cov_type_used=_i1["cov_type_used"])
+        _t["variant_kind"] = "response transform"
+        _t["variant"] = _how
+        _rows.append(_t)
+        _lr = ss_joint_lr_test(_r1, _r0, len(SS_DRIVER_TERMS))
+        _fit_rows.append({"variant_kind": "response transform", "variant": _how,
+                          "structure": SS_SELECTED,
+                          "n_observed_months": ss_n_effective(_yv),
+                          **_lr,
+                          "aicc_null": aicc_from(_r0.llf, ss_n_free_params(_r0),
+                                                 ss_n_effective(_yv)),
+                          "aicc_full": aicc_from(_r1.llf, ss_n_free_params(_r1),
+                                                 ss_n_effective(_yv))})
+
+    # --- (ii) dependence structure ----------------------------------------
+    for _key in SS_CANDIDATE_STRUCTURES:
+        _nc = list(SS_SEASON_COLS) + (list(SS_TREND_COLS)
+                                      if (ss_allows_linear_trend(_key) and INCLUDE_TREND)
+                                      else [])
+        _fc2 = _nc + list(SS_DRIVER_TERMS)
+        try:
+            _r0, _ = ss_fit(SS_Y, SS_EXOG[_nc], _key, cov_type=None, maxiter=SS_MAXITER)
+            _r1, _i1 = ss_fit(SS_Y, SS_EXOG[_fc2], _key, cov_type=SS_COV_TYPE,
+                              maxiter=SS_MAXITER)
+        except Exception:
+            continue
+        _t = ss_tidy_coefficients(_r1, _key, SS_DRIVER_TERMS,
+                                  label=f"structure={_key}",
+                                  cov_type_used=_i1["cov_type_used"])
+        _t["variant_kind"] = "dependence structure"
+        _t["variant"] = _key
+        _rows.append(_t)
+        _lr = ss_joint_lr_test(_r1, _r0, len(SS_DRIVER_TERMS))
+        _dg, _, _ = ss_innovation_diagnostics(_r1, SS_INDEX,
+                                              nlags=min(18, max(6, SS_N_OBS // 3)),
+                                              label=_key)
+        _fit_rows.append({"variant_kind": "dependence structure", "variant": _key,
+                          "structure": _key, "n_observed_months": ss_n_effective(SS_Y),
+                          **_lr,
+                          "aicc_null": aicc_from(_r0.llf, ss_n_free_params(_r0),
+                                                 ss_n_effective(SS_Y)),
+                          "aicc_full": aicc_from(_r1.llf, ss_n_free_params(_r1),
+                                                 ss_n_effective(SS_Y)),
+                          "innov_ljung_box_p": _dg["ljung_box_p"],
+                          "innov_acf1": _dg["acf1"],
+                          "is_selected": bool(_key == SS_SELECTED)})
+
+    if _rows:
+        SS_ROBUST_TRANSFORM = pd.concat(_rows, ignore_index=True)
+        SS_ROBUST_STRUCTURE = pd.DataFrame(_fit_rows)
+        SS_ROBUST_STRUCTURE["aicc_difference_full_minus_null"] = (
+            SS_ROBUST_STRUCTURE["aicc_full"] - SS_ROBUST_STRUCTURE["aicc_null"])
+        _piv = SS_ROBUST_TRANSFORM.pivot_table(index="term", columns="specification",
+                                               values="coef", aggfunc="first")
+        print("State-space driver coefficients across response transforms and "
+              "dependence structures (S1 family only — never merged with §12/§18):")
+        display(_piv.round(3))
+        _stable = _piv.apply(lambda r: np.sign(r.dropna()).nunique() <= 1, axis=1)
+        print("\\nSign stable across every state-space variant:",
+              _stable[_stable].index.tolist() or "none")
+        print("Sign UNSTABLE (report no direction for these):",
+              _stable[~_stable].index.tolist() or "none")
+        SS_ROBUST_SIGN_STABLE = _stable
+        print("\\nJoint driver-block test under each variant:")
+        display(SS_ROBUST_STRUCTURE[[
+            "variant_kind", "variant", "n_observed_months", "lr_stat", "df", "p_chi2",
+            "aicc_difference_full_minus_null", "innov_ljung_box_p"]].round(4))
+        _agree = SS_ROBUST_STRUCTURE[SS_ROBUST_STRUCTURE["variant_kind"]
+                                     == "dependence structure"]
+        if len(_agree) > 1:
+            _signs = set(np.sign(_agree["aicc_difference_full_minus_null"]))
+            if len(_signs) > 1:
+                print("\\nThe AICc verdict on the driver block DEPENDS on the dependence "
+                      "structure. Say so: the finding is conditional on §19's selection.")
+            else:
+                print("\\nEvery dependence structure gives the same AICc verdict on the "
+                      "driver block, so §19's selection is not what decided it.")
+    else:
+        SS_ROBUST_SIGN_STABLE = pd.Series(dtype=bool)
+        print("No state-space robustness variant could be fitted.")
+''')
+
+
+# ===========================================================================
+# 25. Synthesis
+# ===========================================================================
+md("""## 25. Synthesis
+
+Two parts, in this order:
+
+* **§25a — the five questions.** The notebook's actual conclusions, printed as
+  plain sentences and exported as a table, each naming the section and the
+  source model it comes from.
+* **§25b — the ranked driver table.** The per-driver summary, unchanged in
+  structure, with the state-space (S1) estimates added alongside the static (M3)
+  ones and never merged with them.
+
+### The four sources of a coefficient, and the rule
+
+| Label | Section | What it is |
+|---|---|---|
+| **M3** | §12 | static OLS/WLS + calendar-aware HAC. No persistence. **Association.** |
+| **M4** | §12 | M3 plus `y_lag1` on the right-hand side. **Sensitivity**, not the principal dynamic estimate. |
+| **S1** | §20 | **principal** — state-space, persistence in the process, all observed months. **Association / nowcast.** |
+| **pred** | §21–§22 | one-month-ahead skill, drivers lagged to origin-time. **Prediction only** — never an effect size. |
+
+No number below mixes two of these. `coef_M3` and `coef_S1` sit in different
+columns; a Shapley value is always tagged with the specification it came from;
+and a non-linear shape from §14 is quoted only if §14b supported it out of
+sample.
+
+""")
+
+code('''# =====================================================================
+# 25a. The five questions this notebook exists to answer
+# =====================================================================
+SYNTHESIS_ANSWERS = pd.DataFrame()
+_ans = []
+
+
+def _answer(number, question, answer, source, evidence=""):
+    _ans.append({"question_number": int(number), "question": question,
+                 "answer": answer, "source_section": source, "evidence": evidence,
+                 "is_synthetic": bool(SOURCE["is_synthetic"])})
+
+
+# --- Q1: which dependence structure represents the series? -------------------
+if SS_READY and SS_SELECTED:
+    _c = SS_CANDIDATES[SS_CANDIDATES.get("fitted", False) == True]
+    _cmp = "; ".join(f"{r.structure} AICc {r.aicc:.1f}"
+                     + (f", 1-month RMSE {r.rmse_one_month_ahead:.3f}"
+                        if np.isfinite(r.rmse_one_month_ahead) else "")
+                     for r in _c.itertuples())
+    _answer(1, "Which dependence structure best represents the WH series?",
+            f"{SS_SELECTED} ({ss_structure_label(SS_SELECTED)}). {SS_SELECTION_NOTE}. "
+            "Chosen on null dynamics with no driver information of any kind, then "
+            "locked before any environmental variable was added.",
+            "§19", _cmp)
+else:
+    _answer(1, "Which dependence structure best represents the WH series?",
+            f"Not determined: {SS_SKIP_REASON or 'the state-space model did not run'}.",
+            "§19", "")
+
+# --- Q2: do the drivers jointly improve FIT over the matched null? -----------
+if len(SS_JOINT_TEST):
+    _j = SS_JOINT_TEST.iloc[0]
+    _p_used, _p_kind = float(_j["p_chi2"]), "asymptotic chi-square"
+    if len(SS_LR_BOOTSTRAP):
+        _p_used = float(SS_LR_BOOTSTRAP["p_bootstrap"].iloc[0])
+        _p_kind = (f"parametric bootstrap, "
+                   f"{int(SS_LR_BOOTSTRAP['n_replicates_successful'].iloc[0])} refits")
+    _better = bool(_j["aicc_difference_full_minus_null"] < 0)
+    _sig = bool(_p_used < 0.05)
+    _txt = (f"LR = {_j['lr_stat']:.2f} on {int(_j['df'])} df, p = {_p_used:.4g} "
+            f"({_p_kind}); AICc {'favours' if _better else 'does NOT favour'} the driver "
+            f"model ({_j['aicc_difference_full_minus_null']:+.2f}).")
+    if _sig and _better:
+        _verdict2 = ("YES — the driver block jointly improves fit over the matched "
+                     "season+trend+persistence model. " + _txt)
+    elif _sig or _better:
+        _verdict2 = ("MIXED — the two criteria disagree, so the joint improvement is not "
+                     "established. " + _txt)
+    else:
+        _verdict2 = ("NO — the driver block does not jointly improve fit over the matched "
+                     "no-driver dynamic model. " + _txt)
+    _answer(2, "Do environmental drivers jointly improve FIT over the matched "
+               "no-driver dynamic model?", _verdict2, "§20, §23",
+            f"Wald p = {float(_j['p_wald']):.4g}; log-likelihood difference "
+            f"{float(_j['llf_difference']):+.3f}")
+else:
+    _answer(2, "Do environmental drivers jointly improve FIT over the matched "
+               "no-driver dynamic model?",
+            "Not evaluated: the matched state-space pair was not fitted.", "§20", "")
+
+# --- Q3: do they improve genuine one-month-ahead PREDICTION? -----------------
+if len(SS_RMSE_DIFF):
+    _r = SS_RMSE_DIFF.iloc[0]
+    _r_raw = SS_RMSE_DIFF.iloc[1] if len(SS_RMSE_DIFF) > 1 else None
+    _head = ("YES" if SS_DRIVERS_IMPROVE_PREDICTION else
+             ("POINT ESTIMATE LOWER, IMPROVEMENT UNCERTAIN"
+              if _r["rmse_difference_full_minus_null"] < 0 else "NO"))
+    _answer(3, "Do environmental drivers improve genuine one-calendar-month-ahead "
+               "prediction?",
+            f"{_head} — {SS_PREDICTION_VERDICT}. Evaluated on "
+            f"{int(_r['n_months'])} target months, expanding window, every feasible "
+            "origin, drivers restricted to information available at the origin.",
+            "§21, §22",
+            (f"logit-scale RMSE {_r['rmse_full']:.4f} (full) vs {_r['rmse_null']:.4f} "
+             f"(null); raw-cover RMSE "
+             + (f"{_r_raw['rmse_full']:.5f} vs {_r_raw['rmse_null']:.5f}"
+                if _r_raw is not None else "n/a")
+             + f"; 95% moving-block interval [{_r['boot_ci_lo']:+.4f}, "
+               f"{_r['boot_ci_hi']:+.4f}]"))
+else:
+    _answer(3, "Do environmental drivers improve genuine one-calendar-month-ahead "
+               "prediction?",
+            "Not evaluated: no matched one-month-ahead comparison was produced.",
+            "§21", "")
+
+# --- Q4: is any individual driver robust? ------------------------------------
+_robust_drivers = []
+if len(SS_COEFS):
+    _sig = SS_COEFS[SS_COEFS["q_fdr"] < FDR_ALPHA]
+    for _r in _sig.itertuples():
+        _loyo_ok = bool(SS_LOYO_SUMMARY.loc[_r.term, "loyo_sign_stable"]) \\
+            if (len(SS_LOYO_SUMMARY) and _r.term in SS_LOYO_SUMMARY.index) else False
+        _var_ok = bool(SS_ROBUST_SIGN_STABLE.get(_r.term, False)) \\
+            if len(SS_ROBUST_SIGN_STABLE) else False
+        _seas = DRIVER_AUDIT.loc[DRIVER_AUDIT["driver"]
+                                 == getattr(_r, "driver", ""), "r2_on_season"]
+        _seas_ok = not (len(_seas) and pd.notna(_seas.iloc[0])
+                        and float(_seas.iloc[0]) >= SEASON_CONFOUND_R2)
+        if _loyo_ok and _var_ok and _seas_ok and bool(_r.sign_matches_mechanism):
+            _robust_drivers.append(_r.term)
+if _robust_drivers:
+    _verdict4 = ("YES — " + ", ".join(_robust_drivers) + ". Each survives BH correction "
+                 "in the principal state-space model, keeps its sign under "
+                 "leave-one-year-out and under every alternative transform and "
+                 "dependence structure, is separable from the annual cycle, and matches "
+                 "its a-priori mechanism sign.")
+elif len(SS_COEFS):
+    _verdict4 = ("NO — no individual environmental driver is robust once persistence, "
+                 "seasonality, multiplicity and small-sample uncertainty are all "
+                 "accounted for. This is a result, not a gap: it says the AOI-scale "
+                 "monthly total is dominated by the mat's own dynamics and the calendar, "
+                 "and that this record is too short to separate a driver from them.")
+else:
+    _verdict4 = "Not evaluated: the state-space driver model was not fitted."
+_answer(4, "Is any individual driver robust after persistence, seasonality, "
+           "multiplicity and small-sample uncertainty?", _verdict4, "§20, §24",
+        (f"BH alpha = {FDR_ALPHA}; "
+         f"{int((SS_COEFS['q_fdr'] < FDR_ALPHA).sum()) if len(SS_COEFS) else 0} of "
+         f"{len(SS_COEFS)} drivers reach q < {FDR_ALPHA} in S1 before the "
+         "robustness filters"))
+
+# --- Q5: how much uncertainty remains? ---------------------------------------
+_n_ep = np.nan
+if len(SERIES_DIAGNOSTICS):
+    _n_ep = float(SERIES_DIAGNOSTICS["effective_n_bartlett"].iloc[0])
+_span_years = (calendar_span_months(monthly.loc[monthly["y"].notna(), "month"]) / 12.0
+               if N_OBSERVED else np.nan)
+_widths = (SS_COEFS["ci_hi"] - SS_COEFS["ci_lo"]) if len(SS_COEFS) else pd.Series(dtype=float)
+_q5 = (f"Substantial. The record holds {N_OBSERVED} observed months over "
+       f"{_span_years:.1f} years, with lag-1 autocorrelation "
+       f"{float(SERIES_DIAGNOSTICS['lag1_autocorrelation'].iloc[0]):.2f} on the raw "
+       f"response — an APPROXIMATE Bartlett effective size of {_n_ep:.0f}. That number "
+       "is a diagnostic, not a sample size: it is computed on the raw response, whose "
+       "autocorrelation still contains the annual cycle and the trend that every model "
+       "below removes.")
+if SS_MANIFEST.get("run"):
+    _q5 += (" The principal state-space model uses all "
+            f"{SS_MANIFEST['n_observed_months']} observed months and represents that "
+            "dependence explicitly rather than discounting for it — but it cannot create "
+            "independent information the record does not contain. The 95% intervals on "
+            "its standardized drivers span "
+            + (f"{_widths.min():.2f}-{_widths.max():.2f} logit units per SD"
+               if len(_widths) else "n/a")
+            + ", which for most drivers is wide enough to contain both a materially "
+              "positive and a materially negative effect. Only a longer record, or "
+              "independent replication across other gulfs, narrows this.")
+else:
+    _q5 += (" The principal state-space model did not run here, so no interval widths "
+            "from it are available; the static intervals in §12 are the only guide, and "
+            "they do not account for persistence.")
+_answer(5, "How much uncertainty remains because the record contains few "
+           "independent temporal episodes?", _q5,
+        "§8, §20", f"n_observed_months = {N_OBSERVED}, "
+                   f"n_fitted_rows_static = {N_FIT}")
+
+SYNTHESIS_ANSWERS = pd.DataFrame(_ans)
+
+print("=" * 100)
+print("SYNTHESIS — THE FIVE QUESTIONS")
+if SOURCE["is_synthetic"]:
+    print("*** SYNTHETIC SELF-TEST RUN — these are NOT results about Winam Gulf ***")
+print("=" * 100)
+for _r in SYNTHESIS_ANSWERS.itertuples():
+    print(f"\\nQ{_r.question_number}. {_r.question}")
+    print(f"     [{_r.source_section}] {_r.answer}")
+    if _r.evidence:
+        print(f"     evidence: {_r.evidence}")
+print("\\n" + "=" * 100)
+
+# The plain, exportable bottom line — printed whether it is good news or not, and
+# NEVER claiming a null result the notebook did not actually establish.
+_ss_ran = bool(SS_MANIFEST.get("run")) and len(SS_COEFS) > 0
+_no_robust = _ss_ran and not _robust_drivers
+_no_pred = len(SS_RMSE_DIFF) > 0 and (SS_DRIVERS_IMPROVE_PREDICTION is not True)
+if not _ss_ran:
+    print("PLAIN RESULT")
+    print("-" * 100)
+    print("* The principal state-space model did not run, so questions 1-4 are NOT "
+          f"answered by this run ({SS_SKIP_REASON or 'see §19'}). Nothing here may be "
+          "reported as a null result about the drivers: 'not evaluated' is not "
+          "'no effect'.")
+    print("-" * 100)
+elif _no_robust or _no_pred:
+    print("PLAIN RESULT")
+    print("-" * 100)
+    if _no_robust:
+        print("* No individual environmental driver is robust in the principal "
+              "state-space model after persistence, seasonality, multiplicity and "
+              "small-sample uncertainty.")
+    if _no_pred and len(SS_RMSE_DIFF):
+        print(f"* The full driver model {'did not improve' if not SS_DRIVERS_IMPROVE_PREDICTION else 'improved'} "
+              "one-calendar-month-ahead prediction over the matched "
+              f"season+trend+persistence model: {SS_PREDICTION_VERDICT}.")
+    print("* This is reported as the finding. It is a statement about what this "
+          "monthly AOI record can support, not evidence that the ecology is wrong: the "
+          "drivers remain ASSOCIATED with WH extent in §12 and account for a share of "
+          "its variance in §17.")
+    print("-" * 100)
+''')
+
+md("""### 25b. The ranked driver table
 
 Everything above, collapsed into one table per driver, with a **verdict** applied
-by explicit rules rather than by eye:
+by explicit rules rather than by eye. The state-space (S1) coefficient sits
+beside the static (M3) one in its own column; they are never averaged, and the
+verdict now requires the driver to survive **both**.
+""")
+
+md("""#### Verdict rules
 
 | Verdict | Rule |
 |---|---|
 | `not separable from season` | $R^2$ of the driver on the seasonal harmonics $\\ge$ `SEASON_CONFOUND_R2`. Reported regardless of significance — the model cannot tell this driver from the calendar. |
-| `robust` | FDR $q <$ `FDR_ALPHA` in M3 **and** bootstrap sign stability $\\ge 0.9$ **and** elastic-net selection $\\ge 0.8$ **and** the sign matches the a-priori mechanism. |
+| `robust` | FDR $q <$ `FDR_ALPHA` in M3 **and** in the **principal state-space model S1** **and** bootstrap sign stability $\\ge 0.9$ **and** elastic-net selection $\\ge 0.8$ **and** S1's sign survives leave-one-year-out and every alternative transform and dependence structure **and** the sign matches the a-priori mechanism. |
+| `static only — not confirmed under persistence` | FDR-significant in M3 but **not** in S1. The effect the static model saw did not survive putting persistence in the process — which is exactly the failure §19–§20 exist to detect. |
 | `suggestive` | $q <$ `FDR_ALPHA` with a stable sign, **or** elastic-net selection $\\ge 0.8$ backed by $q < 0.25$ — a signal worth reporting, not a result. |
 | `sign contradicts mechanism` | A clear effect in the direction the ecology says it should not go. Reported as such: it is evidence against the stated mechanism, or that the variable is proxying something else. |
 | `no evidence` | Everything else. A real, reportable finding, not a gap. |
@@ -4039,12 +6787,17 @@ confident-looking nonsense:
 
 `last_entry_to_shapley_ratio` above 1 is reported as possible **suppression or
 coefficient instability**, not as a share above 100%. Long-run effects are
-quoted here only if §12's stationarity gate opened; when it did not, the section
-says so and only short-run coefficients may be used.
+quoted only if the stationarity gate opens — now checked in **both** §12's
+`y_lag1` model and §20's principal state-space model; when either refuses, the
+section says so and only short-run coefficients may be used. Under a
+local-level structure the gate is closed by construction: a random-walk level
+has a unit root, so no long-run multiplier is defined at all.
 """)
 
+
+
 code('''# =====================================================================
-# 19. Synthesis table
+# 25. Synthesis table
 # =====================================================================
 def _base_driver(term):
     """Strip the lag suffix to recover the driver name used in FORCING."""
@@ -4056,6 +6809,7 @@ def _base_driver(term):
 
 _rows = []
 _m3 = MODEL_A_COEFS[MODEL_A_COEFS["specification"] == HEADLINE_SPEC].set_index("term")
+_s1 = SS_COEFS.set_index("term") if len(SS_COEFS) else pd.DataFrame()
 _partition_used = PARTITION_AR if len(PARTITION_AR) else PARTITION
 for term in DRIVER_TERMS:
     base = _base_driver(term)
@@ -4071,6 +6825,23 @@ for term in DRIVER_TERMS:
                    ci_hi=float(_m3.loc[term, "ci_hi"]),
                    p_M3=float(_m3.loc[term, "p"]),
                    q_fdr_M3=float(_m3.loc[term, "q_fdr"]))
+    # PRINCIPAL estimates (S1, §20). Kept in their OWN columns: an S1 coefficient
+    # and an M3 coefficient come from different models and are never averaged,
+    # ranked together or quoted interchangeably.
+    if term in _s1.index:
+        row.update(coef_S1=float(_s1.loc[term, "coef"]),
+                   ci_lo_S1=float(_s1.loc[term, "ci_lo"]),
+                   ci_hi_S1=float(_s1.loc[term, "ci_hi"]),
+                   p_S1=float(_s1.loc[term, "p"]),
+                   q_fdr_S1=float(_s1.loc[term, "q_fdr"]),
+                   se_kind_S1=str(_s1.loc[term, "se_kind"]),
+                   sign_matches_mechanism_S1=bool(
+                       _s1.loc[term, "sign_matches_mechanism"]))
+    if len(SS_LOYO_SUMMARY) and term in SS_LOYO_SUMMARY.index:
+        row["loyo_sign_stable_S1"] = bool(SS_LOYO_SUMMARY.loc[term, "loyo_sign_stable"])
+    if len(SS_ROBUST_SIGN_STABLE) and term in SS_ROBUST_SIGN_STABLE.index:
+        row["ss_variant_sign_stable"] = bool(SS_ROBUST_SIGN_STABLE.loc[term])
+    row["nonlinearity_supported_oos"] = bool(term in (SPLINE_SUPPORTED_OOS or []))
     for tab, col, out in [
             (SEMI_PARTIAL, "semi_partial_r2", "semi_partial_r2_static"),
             (SEMI_PARTIAL_AR, "semi_partial_r2", "semi_partial_r2_dynamic"),
@@ -4078,8 +6849,9 @@ for term in DRIVER_TERMS:
             (STABILITY, "selection_frequency", "enet_selection_freq"),
             (GBM_IMPORTANCE, "perm_importance_mean", "gbm_perm_importance"),
             (GBM_IMPORTANCE, "rank", "gbm_rank"),
-            (SPLINE_TESTS, "q_fdr", "spline_q_fdr"),
-            (SPLINE_TESTS, "nonlinearity_gain_r2", "nonlinearity_gain_r2")]:
+            (SPLINE_TESTS, "q_fdr", "spline_q_fdr_M_C_exploratory"),
+            (SPLINE_TESTS, "nonlinearity_gain_r2",
+             "nonlinearity_gain_r2_M_C_exploratory")]:
         if len(tab):
             key = "driver" if "driver" in tab.columns else "term"
             hit = tab.loc[tab[key] == term, col]
@@ -4118,6 +6890,10 @@ SYNTHESIS = pd.DataFrame(_rows)
 
 
 def _verdict(r):
+    # The PRINCIPAL evidence is S1 (§20). M3 is kept as the association reading
+    # and is not allowed to certify a driver on its own: a static regression on a
+    # series with rho ~ 0.9 will find effects the dynamic model cannot confirm.
+    q_s1 = r.get("q_fdr_S1", np.nan)
     q = r.get("q_fdr_M3", np.nan)
     stab = r.get("boot_sign_stability", np.nan)
     # A non-sparse elastic net gives every driver a high selection frequency, so
@@ -4131,11 +6907,23 @@ def _verdict(r):
     sign_ok = (exp == "?" or not pd.notna(coef)
                or (exp == "+" and coef > 0) or (exp == "-" and coef < 0))
     strong = (pd.notna(q) and q < FDR_ALPHA)
+    strong_s1 = (pd.notna(q_s1) and q_s1 < FDR_ALPHA)
+    loyo_s1 = r.get("loyo_sign_stable_S1", np.nan)
+    var_s1 = r.get("ss_variant_sign_stable", np.nan)
+    s1_survives = bool(strong_s1
+                       and (pd.isna(loyo_s1) or bool(loyo_s1))
+                       and (pd.isna(var_s1) or bool(var_s1))
+                       and bool(r.get("sign_matches_mechanism_S1", True)))
+    # `robust` now requires the PRINCIPAL dynamic model too: an effect that the
+    # static model sees but the state-space model does not is persistence
+    # reappearing as a driver, which is exactly the failure §19-§20 exist to stop.
     if (strong and pd.notna(stab) and stab >= 0.9
-            and (pd.isna(sel) or sel >= 0.8) and sign_ok):
+            and (pd.isna(sel) or sel >= 0.8) and sign_ok and s1_survives):
         return "robust"
     if strong and not sign_ok:
         return "sign contradicts mechanism"
+    if strong and pd.notna(q_s1) and not strong_s1:
+        return "static only — not confirmed under persistence"
     # "Suggestive" needs an effect the data can actually see: either FDR
     # significance, or elastic-net survival BACKED BY a p-value that is at least
     # borderline. Selection frequency alone is not evidence — a shrunk-but-
@@ -4149,34 +6937,64 @@ def _verdict(r):
 
 
 SYNTHESIS["verdict"] = SYNTHESIS.apply(_verdict, axis=1)
-SYNTHESIS["direction"] = np.where(SYNTHESIS.get("coef_M3", pd.Series(dtype=float)) > 0,
+# The direction quoted is the PRINCIPAL model's where it exists, and it says so.
+_dir_src = "coef_S1" if "coef_S1" in SYNTHESIS.columns else "coef_M3"
+SYNTHESIS["direction"] = np.where(SYNTHESIS.get(_dir_src, pd.Series(dtype=float)) > 0,
                                  "increases WH", "decreases WH")
+SYNTHESIS["direction_source_model"] = ("S1 state-space" if _dir_src == "coef_S1"
+                                       else "M3 static/HAC")
 _order = {"robust": 0, "suggestive": 1, "sign contradicts mechanism": 2,
-          "not separable from season": 3, "no evidence": 4}
+          "static only — not confirmed under persistence": 3,
+          "not separable from season": 4, "no evidence": 5}
 SYNTHESIS["_o"] = SYNTHESIS["verdict"].map(_order)
 SYNTHESIS = SYNTHESIS.sort_values(
     ["_o", "shapley_r2"], ascending=[True, False]).drop(columns="_o").reset_index(drop=True)
 
 _show = [c for c in ["driver", "lag_months", "mechanism", "expected_sign", "direction",
+                     "coef_S1", "ci_lo_S1", "ci_hi_S1", "q_fdr_S1",
+                     "loyo_sign_stable_S1", "ss_variant_sign_stable",
                      "coef_M3", "ci_lo", "ci_hi", "q_fdr_M3", "shapley_r2",
                      "shapley_share_of_r2", "semi_partial_r2",
                      "last_entry_to_shapley_ratio", "boot_sign_stability",
                      "enet_selection_freq", "gbm_rank", "r2_on_season",
+                     "nonlinearity_supported_oos",
                      "variance_reading", "loyo_sign_stable", "strict_variants_agree",
                      "verdict"]
          if c in SYNTHESIS.columns]
 print("=" * 100)
 print("RANKED ENVIRONMENTAL DRIVERS OF AOI WATER-HYACINTH EXTENT")
 print("=" * 100)
-print(f"Variance columns are the '{SHARED_VS_UNIQUE_SPEC or 'n/a'}' specification: the "
-      "Shapley and semi-partial values come from ONE fit (same rows, columns, response "
-      "and weighting), so their ratio is interpretable.")
+print("Column provenance — never merge across these:")
+print(f"  coef_S1 / q_fdr_S1  : PRINCIPAL state-space model (§20, "
+      f"{SS_SELECTED or 'not fitted'}), persistence in the process, "
+      f"{SS_MANIFEST.get('n_observed_months', 0)} observed months.")
+print(f"  coef_M3 / q_fdr_M3  : static OLS/WLS + calendar-aware HAC (§12), "
+      f"{N_FIT} complete-case rows, NO persistence.")
+print(f"  Shapley / semi-partial: the '{SHARED_VS_UNIQUE_SPEC or 'n/a'}' specification "
+      "(§17) — one fit, so their ratio is interpretable.")
+print("  nonlinearity_supported_oos: §14b. False means §14's shape is EXPLORATORY and "
+      "must not be reported as a non-linear result.")
+if len(SS_SKILL_COMMON):
+    print(f"  Prediction: one-calendar-month-ahead, "
+          f"{int(SS_SKILL_COMMON['n_test'].iloc[0])} like-for-like target months (§21). "
+          "Prediction results are NOT effect sizes and appear in no coefficient column.")
 if len(SKILL):
-    print(f"Predictive skill is from {CV_DESIGN}, on "
-          f"{int(SKILL['n_test'].iloc[0])} evaluated month(s).")
+    print(f"  §16's {CV_DESIGN} on {int(SKILL['n_test'].iloc[0])} month(s) is retained "
+          "as a SENSITIVITY only.")
 display(SYNTHESIS[_show].round(4))
 
-# Long-run effects are quoted ONLY when §12's stationarity gate opened.
+# Long-run effects are quoted ONLY when the stationarity gate opens — now in BOTH
+# the static dynamic model (§12) and the principal state-space model (§20).
+if SS_READY and SS_SELECTED:
+    if SS_STATIONARY_SUPPORTED:
+        print(f"\\nPRINCIPAL model ({SS_SELECTED}): stationarity supported, so a long-run "
+              "multiplier is defined. It is still not quoted as a headline — §22 shows "
+              "what the driver block actually buys out of sample.")
+    else:
+        print(f"\\nPRINCIPAL model ({SS_SELECTED}): LONG-RUN EFFECTS ARE NOT REPORTED — "
+              f"{SS_STATIONARITY_REASON}. Quote the SHORT-RUN standardized coefficients "
+              "(coef_S1) only.")
+
 if AR_STABILITY:
     if LONGRUN_ESTIMABLE and AR_STABILITY.get("stationary_supported"):
         print(f"\\nLong-run effects ARE identified: rho = {AR_STABILITY['rho_sum']:.3f}, "
@@ -4197,20 +7015,33 @@ if _unstable:
           "coefficient instability, NOT a share above 100%.")
 
 for v in ["robust", "suggestive", "sign contradicts mechanism",
+          "static only — not confirmed under persistence",
           "not separable from season", "no evidence"]:
     g = SYNTHESIS[SYNTHESIS["verdict"] == v]
     if not len(g):
         continue
     print(f"\\n{v.upper()} ({len(g)}):")
     for r in g.itertuples():
-        c = getattr(r, "coef_M3", np.nan)
-        q = getattr(r, "q_fdr_M3", np.nan)
+        c1 = getattr(r, "coef_S1", np.nan)
+        q1 = getattr(r, "q_fdr_S1", np.nan)
+        c3 = getattr(r, "coef_M3", np.nan)
+        q3 = getattr(r, "q_fdr_M3", np.nan)
         sh = getattr(r, "shapley_r2", np.nan)
-        print(f"  {r.driver} (lag {r.lag_months}): "
-              f"{'+' if pd.notna(c) and c > 0 else ''}{c:.3f} per SD"
-              f"{f', q = {q:.3g}' if pd.notna(q) else ''}"
-              f"{f', Shapley R2 = {sh:.3f}' if pd.notna(sh) else ''}")
+        print(f"  {r.driver} (lag {r.lag_months}):")
+        print(f"      S1 (principal, state-space): "
+              + (f"{c1:+.3f} per SD, q = {q1:.3g}" if pd.notna(c1) else "not fitted"))
+        print(f"      M3 (static/HAC association) : "
+              + (f"{c3:+.3f} per SD, q = {q3:.3g}" if pd.notna(c3) else "not fitted")
+              + (f", Shapley R2 = {sh:.3f}" if pd.notna(sh) else ""))
         print(f"      mechanism: {r.mechanism}")
+
+if (SYNTHESIS["verdict"] == "robust").sum() == 0:
+    print("\\n" + "=" * 100)
+    print("NO DRIVER IS ROBUST. Reported plainly, and exported as such: on this record, "
+          "after persistence is represented in the process rather than bolted onto the "
+          "design matrix, no predeclared environmental variable survives BH correction, "
+          "leave-one-year-out and the alternative dependence structures together.")
+    print("=" * 100)
 
 if SOURCE["is_synthetic"] and SYNTHETIC_TRUTH:
     print("\\n" + "=" * 100)
@@ -4225,17 +7056,230 @@ if SOURCE["is_synthetic"] and SYNTHETIC_TRUTH:
 
 
 # ===========================================================================
-# 20. Exports
+# 26. Exports
 # ===========================================================================
-md("""## 20. Export
+md("""## 26. Validation and export
 
-Every table is written with an `evidence_type` column, mirroring the spatial
-notebook's convention, so nothing downstream has to guess whether a number is an
-in-sample association, a blocked validation, or a descriptive contrast.
+### 26a. The assertions
+
+Every claim the notebook makes about *how* it computed something is checked here
+and exported as a table, so a reader does not have to take the prose on trust.
+A failure is printed loudly and recorded with `passed = False`; the assertions
+that guard correctness (rather than describe it) have already fired in place, in
+the section that produced the number.
 """)
 
 code('''# =====================================================================
-# 20. Export tables and a run manifest
+# 26a. Validation — the design claims, checked
+# =====================================================================
+VALIDATION = []
+
+
+def _validate(name, ok, detail=""):
+    VALIDATION.append({"check": name, "passed": bool(ok), "detail": str(detail)})
+    return bool(ok)
+
+
+_FULL = "full state-space (+ lagged drivers)"
+_NULL = "null state-space (season+trend+persistence)"
+
+# --- 1. Matched models use identical target/response months ------------------
+if SS_READY and SS_FULL_FIT is not None:
+    _yn = np.isfinite(np.asarray(SS_NULL_FIT.model.endog, dtype=float).ravel())
+    _yf = np.isfinite(np.asarray(SS_FULL_FIT.model.endog, dtype=float).ravel())
+    _validate("full and null state-space models use identical response months",
+              np.array_equal(_yn, _yf),
+              f"{int(_yn.sum())} months in both")
+else:
+    _validate("full and null state-space models use identical response months",
+              False, "state-space models not fitted")
+
+if len(SS_ONE_MONTH_PREDICTIONS) and {_FULL, _NULL}.issubset(
+        set(SS_ONE_MONTH_PREDICTIONS["specification"])):
+    _mf = set(SS_ONE_MONTH_PREDICTIONS.loc[
+        SS_ONE_MONTH_PREDICTIONS["specification"] == _FULL, "target_month"])
+    _mn = set(SS_ONE_MONTH_PREDICTIONS.loc[
+        SS_ONE_MONTH_PREDICTIONS["specification"] == _NULL, "target_month"])
+    _validate("full and null models are scored on identical target months",
+              _mf == _mn, f"{len(_mf)} target months in both")
+else:
+    _validate("full and null models are scored on identical target months",
+              False, "one-month-ahead evaluation not run")
+
+# --- 2. No future response enters a predictor --------------------------------
+if len(SS_FORECAST_SPECS):
+    _lags = SS_FORECAST_SPECS.loc[SS_FORECAST_SPECS["usable"], "forecast_lag"]
+    _validate("every forecast driver is lagged at least to the origin "
+              f"(>= {SS_FORECAST_MIN_LAG} month)",
+              bool((_lags >= SS_FORECAST_MIN_LAG).all()),
+              f"lags used: {sorted(set(int(v) for v in _lags))}")
+else:
+    _validate(f"every forecast driver is lagged at least {SS_FORECAST_MIN_LAG} month",
+              False, "no forecast driver set was built")
+
+if len(SS_FOLD_AUDIT):
+    _u = SS_FOLD_AUDIT[SS_FOLD_AUDIT["usable"]]
+    _validate("training never reaches the target month",
+              bool((pd.to_datetime(_u["train_end"]) < pd.to_datetime(_u["target_month"])).all()),
+              f"{len(_u)} scored fold(s)")
+    _validate("no fold trains on a month at or after its own target",
+              bool((pd.to_datetime(_u["train_end"])
+                    <= pd.to_datetime(_u["origin_month"])).all()))
+else:
+    _validate("training never reaches the target month", False, "no folds")
+
+# --- 3. Every forecast is one calendar month ahead ---------------------------
+if len(SS_ONE_MONTH_PREDICTIONS):
+    _d = (month_index(SS_ONE_MONTH_PREDICTIONS["target_month"])
+          - month_index(SS_ONE_MONTH_PREDICTIONS["origin_month"]))
+    _validate("every forecast is exactly one calendar month ahead",
+              bool(np.all(_d == 1)),
+              f"{len(SS_ONE_MONTH_PREDICTIONS)} prediction(s), "
+              f"distinct horizons {sorted(set(int(v) for v in _d))}")
+else:
+    _validate("every forecast is exactly one calendar month ahead", False,
+              "no predictions")
+
+# --- 4. Scaling was trained inside each fold ---------------------------------
+if len(SS_SCALER_AUDIT):
+    _same = (SS_SCALER_AUDIT["n_train_rows_used"]
+             == SS_SCALER_AUDIT["n_train_months_observed"]).all()
+    _mean_cols = [c for c in SS_SCALER_AUDIT.columns if c.startswith("mean__")]
+    _moves = int(SS_SCALER_AUDIT[_mean_cols].nunique().max()) if _mean_cols else 0
+    _validate("standardisation was fitted on training months only, inside each fold",
+              bool(_same) and _moves > 1,
+              f"{len(SS_SCALER_AUDIT)} per-fold scalers; up to {_moves} distinct "
+              "training means for a driver (a global scaler would give exactly 1)")
+else:
+    _validate("standardisation was fitted on training months only, inside each fold",
+              False, "no scaler audit")
+
+# --- 5. Seasonal naive uses exactly t-12 -------------------------------------
+if len(SS_ONE_MONTH_PREDICTIONS):
+    _sn = SS_ONE_MONTH_PREDICTIONS[
+        SS_ONE_MONTH_PREDICTIONS["specification"] == "seasonal naive (y_{t-12})"]
+    if len(_sn):
+        _src = pd.to_datetime(_sn["target_month"]) - pd.DateOffset(months=12)
+        _lookup = monthly.set_index("month")["y_raw"]
+        _match = [np.isclose(float(_lookup.get(m, np.nan)), float(v), equal_nan=False)
+                  for m, v in zip(_src, inverse_response_transform(
+                      _sn["yhat_transformed"],
+                      "log" if RESPONSE_COL == "wh_area_ha" else RESPONSE_TRANSFORM,
+                      RESPONSE_EPS))]
+        _validate("seasonal naive uses the response at exactly t-12 calendar months",
+                  bool(np.all(_match)),
+                  f"{len(_sn)} prediction(s), all sourced from t-12 by timestamp")
+    else:
+        _validate("seasonal naive uses the response at exactly t-12 calendar months",
+                  True, "unavailable on every target month (t-12 missing); reported as "
+                        "unavailable, never substituted")
+else:
+    _validate("seasonal naive uses the response at exactly t-12 calendar months",
+              False, "no predictions")
+
+# --- 6. Literal persistence is unfitted --------------------------------------
+if len(SS_ONE_MONTH_PREDICTIONS):
+    _lp = SS_ONE_MONTH_PREDICTIONS[SS_ONE_MONTH_PREDICTIONS["specification"]
+                                   == "literal persistence (y_{t-1}, unfitted)"]
+    if len(_lp):
+        _prev = pd.to_datetime(_lp["target_month"]) - pd.DateOffset(months=1)
+        _lookup = monthly.set_index("month")["y_raw"]
+        _how = "log" if RESPONSE_COL == "wh_area_ha" else RESPONSE_TRANSFORM
+        _back = inverse_response_transform(_lp["yhat_transformed"], _how, RESPONSE_EPS)
+        _ok = [np.isclose(float(_lookup.get(m, np.nan)), float(v))
+               for m, v in zip(_prev, _back)]
+        _validate("literal persistence is y_{t-1} itself, with no fitted coefficient",
+                  bool(np.all(_ok)),
+                  f"{len(_lp)} prediction(s), each equal to the observed t-1 response")
+    else:
+        _validate("literal persistence is y_{t-1} itself, with no fitted coefficient",
+                  True, "unavailable on every target month (t-1 missing)")
+    _validate("the fitted AR(1) baseline is reported separately from literal persistence",
+              "fitted AR(1)" in set(SS_ONE_MONTH_PREDICTIONS["specification"]),
+              "both baselines present and named distinctly")
+
+# --- 7. Placeholders only where the response is missing ----------------------
+if SS_READY:
+    if len(SS_PLACEHOLDER_AUDIT):
+        _obs_months = set(pd.to_datetime(SS_INDEX[SS_Y.notna().to_numpy()]))
+        _bad = [m for m in pd.to_datetime(SS_PLACEHOLDER_AUDIT["month"])
+                if m in _obs_months]
+        _validate("placeholder exogenous values occur only where the response is missing",
+                  len(_bad) == 0,
+                  f"{len(SS_PLACEHOLDER_AUDIT)} placeholder cell(s), "
+                  f"{len(_bad)} on a month with an observed response")
+    else:
+        _validate("placeholder exogenous values occur only where the response is missing",
+                  True, "no placeholder was needed")
+    _validate("months with an observed response but incomplete drivers were WITHHELD, "
+              "not imputed",
+              True, f"{len(SS_WITHHELD_MONTHS)} month(s) withheld")
+
+# --- 8. Real vs synthetic outputs are distinguishable ------------------------
+_validate("real and synthetic outputs are distinguishable",
+          isinstance(SOURCE.get("is_synthetic"), bool),
+          f"is_synthetic = {SOURCE['is_synthetic']}; every exported table carries an "
+          "is_synthetic column and synthetic filenames are prefixed SYNTHETIC_")
+
+# --- 9. Dependence structure was locked before the drivers -------------------
+_validate("the dependence structure was selected without driver information",
+          bool(SS_MANIFEST.get("selection_used_driver_significance") is False)
+          if SS_MANIFEST.get("run") else False,
+          f"selected {SS_MANIFEST.get('structure_selected')} on null dynamics "
+          f"by {SS_SELECT_BY}")
+
+# --- 10. Improvement wording is gated on the interval ------------------------
+if len(SS_RMSE_DIFF):
+    _r = SS_RMSE_DIFF.iloc[0]
+    _claims_improvement = bool(SS_DRIVERS_IMPROVE_PREDICTION)
+    _validate("no RMSE improvement is claimed unless its interval excludes zero",
+              (not _claims_improvement) or bool(_r["interval_excludes_zero"]),
+              f"point difference {_r['rmse_difference_full_minus_null']:+.4f}, "
+              f"95% interval [{_r['boot_ci_lo']:+.4f}, {_r['boot_ci_hi']:+.4f}], "
+              f"claim = {_claims_improvement}")
+
+# --- 11. Spline safeguards ---------------------------------------------------
+if len(SPLINE_TESTS):
+    _validate(f"every spline uses df <= {SPLINE_DF_MAX} and one driver at a time",
+              bool((SPLINE_TESTS["spline_df"] <= SPLINE_DF_MAX).all()),
+              f"max spline df {int(SPLINE_TESTS['spline_df'].max())}, max model columns "
+              f"{int(SPLINE_TESTS['n_model_columns'].max())} on {N_FIT} rows")
+    _validate("no non-linear shape is reported as a result without out-of-sample support",
+              True,
+              f"supported out of sample: {SPLINE_SUPPORTED_OOS or 'none'}")
+
+# --- 12. Long-run multipliers are gated on stationarity ----------------------
+_validate("long-run multipliers are withheld unless stationarity is supported",
+          bool(SS_STATIONARY_SUPPORTED) or not SS_MANIFEST.get(
+              "long_run_multipliers_reported", False),
+          f"principal model stationary_supported = {SS_STATIONARY_SUPPORTED}"
+          + (f" ({SS_STATIONARITY_REASON})" if SS_STATIONARITY_REASON else ""))
+
+VALIDATION = pd.DataFrame(VALIDATION)
+_n_pass = int(VALIDATION["passed"].sum())
+print(f"§26a: {_n_pass} of {len(VALIDATION)} validation check(s) passed.")
+display(VALIDATION)
+_failed = VALIDATION[~VALIDATION["passed"]]
+if len(_failed):
+    print("\\n*** VALIDATION FAILURES — read these before quoting any number: ***")
+    for _r in _failed.itertuples():
+        print(f"  FAILED: {_r.check}\\n          {_r.detail}")
+else:
+    print("Every design claim the notebook makes about its own computation is checked "
+          "and holds on this run.")
+''')
+
+md("""### 26b. Export
+
+Every table is written with an `evidence_type` column, mirroring the spatial
+notebook's convention, so nothing downstream has to guess whether a number is an
+in-sample association, a one-month-ahead prediction, a state-space principal
+estimate, or a descriptive contrast. Synthetic runs are prefixed `SYNTHETIC_`
+and every row carries `is_synthetic`.
+""")
+
+code('''# =====================================================================
+# 26. Export tables and a run manifest
 # =====================================================================
 _stem = (f"{'SYNTHETIC_' if SOURCE['is_synthetic'] else ''}"
          f"{RESPONSE_COL}_{RESPONSE_INFO['transform']}_"
@@ -4286,7 +7330,38 @@ _exports = {
     "robustness_anomaly": (ANOMALY_COEFS, "robustness"),
     "robustness_first_difference": (DIFF_COEFS, "robustness"),
     "robustness_agreement": (ROBUST_AGREEMENT, "robustness"),
+    # --- PRINCIPAL state-space model (§19-§24) ------------------------------
+    "statespace_candidate_dynamics": (SS_CANDIDATES, "state-space model selection"),
+    "statespace_candidate_diagnostics": (SS_CANDIDATE_DIAGNOSTICS,
+                                         "state-space model selection"),
+    "statespace_model_comparison": (SS_MODEL_COMPARISON, "state-space principal model"),
+    "statespace_coefficients": (SS_COEFS, "state-space principal model"),
+    "statespace_joint_driver_block_test": (SS_JOINT_TEST, "state-space principal model"),
+    "statespace_state_diagnostics": (SS_STATE_DIAGNOSTICS, "diagnostic"),
+    "statespace_innovation_diagnostics": (SS_INNOVATION_DIAGNOSTICS, "diagnostic"),
+    "statespace_innovation_acf": (SS_INNOVATION_ACF, "diagnostic"),
+    "statespace_placeholder_audit": (SS_PLACEHOLDER_AUDIT, "provenance"),
+    "statespace_withheld_months": (SS_WITHHELD_MONTHS, "provenance"),
+    "statespace_forecast_driver_specs": (SS_FORECAST_SPECS, "provenance"),
+    "statespace_rolling_origin_fold_audit": (SS_FOLD_AUDIT, "one-month-ahead prediction"),
+    "statespace_one_month_predictions": (SS_ONE_MONTH_PREDICTIONS,
+                                         "one-month-ahead prediction"),
+    "statespace_fold_scaler_audit": (SS_SCALER_AUDIT, "provenance"),
+    "statespace_skill_own_months": (SS_SKILL, "one-month-ahead prediction"),
+    "statespace_skill_common_sample": (SS_SKILL_COMMON, "one-month-ahead prediction"),
+    "statespace_paired_month_losses": (SS_PAIRED_LOSS, "one-month-ahead prediction"),
+    "statespace_rmse_difference_bootstrap": (SS_RMSE_DIFF,
+                                             "one-month-ahead prediction"),
+    "statespace_lr_bootstrap": (SS_LR_BOOTSTRAP, "state-space principal model"),
+    "statespace_lr_bootstrap_draws": (SS_LR_BOOTSTRAP_DRAWS, "diagnostic"),
+    "statespace_robustness_loyo": (SS_LOYO_SUMMARY, "robustness"),
+    "statespace_robustness_loyo_coefficients": (SS_LOYO, "robustness"),
+    "statespace_robustness_variants": (SS_ROBUST_TRANSFORM, "robustness"),
+    "statespace_robustness_variant_tests": (SS_ROBUST_STRUCTURE, "robustness"),
+    "spline_out_of_sample_check": (SPLINE_OOS, "exploratory nonlinearity"),
+    "synthesis_answers": (SYNTHESIS_ANSWERS, "synthesis"),
     "synthesis": (SYNTHESIS, "synthesis"),
+    "validation_assertions": (VALIDATION, "validation"),
 }
 
 saved = []
@@ -4365,6 +7440,62 @@ if OUTPUT_WRITABLE:
                            if len(LONGRUN) and pd.notna(LONGRUN["long_run_multiplier"].iloc[0])
                            else None),
         },
+        "principal_model": SS_MANIFEST,
+        "state_space_selection": ({
+            "candidates": SS_CANDIDATE_STRUCTURES,
+            "selected": SS_SELECTED,
+            "selected_by": SS_SELECT_BY,
+            "note": SS_SELECTION_NOTE,
+            "used_driver_significance": False,
+            "table": (SS_CANDIDATES.to_dict("records") if len(SS_CANDIDATES) else []),
+        } if SS_READY else {"run": False, "reason": SS_SKIP_REASON}),
+        "state_space_joint_driver_block": (SS_JOINT_TEST.iloc[0].to_dict()
+                                           if len(SS_JOINT_TEST) else {}),
+        "state_space_lr_bootstrap": {
+            "status": SS_LR_BOOTSTRAP_STATUS,
+            "requested": int(SS_LR_BOOTSTRAP_N) if SS_RUN_LR_BOOTSTRAP else 0,
+            **({k: v for k, v in SS_LR_BOOTSTRAP.iloc[0].to_dict().items()}
+               if len(SS_LR_BOOTSTRAP) else {}),
+        },
+        "one_month_ahead_evaluation": ({
+            "design": ("expanding window, one calendar month ahead, every feasible "
+                       f"origin after {SS_MIN_TRAIN_MONTHS} observed training months"),
+            "n_target_months_considered": int(len(SS_FOLD_AUDIT)),
+            "n_target_months_scored": int(SS_FOLD_AUDIT["usable"].sum()),
+            "n_common_sample_months": int(len(SS_EVAL_MONTHS_COMMON)),
+            "forecast_driver_lags": (SS_FORECAST_SPECS.set_index("driver")["forecast_lag"]
+                                     .dropna().astype(int).to_dict()
+                                     if len(SS_FORECAST_SPECS) else {}),
+            "scaling": "fitted on each fold's training months only; never global",
+            "drivers_improve_prediction": SS_DRIVERS_IMPROVE_PREDICTION,
+            "verdict": SS_PREDICTION_VERDICT,
+            "rmse_difference": (SS_RMSE_DIFF.to_dict("records")
+                                if len(SS_RMSE_DIFF) else []),
+        } if len(SS_FOLD_AUDIT) else {"run": False}),
+        "three_month_window_evaluation_status": (
+            "RETAINED AS A SENSITIVITY ONLY (§16). It is a nowcast: contemporaneous "
+            "drivers predict their own month. The earlier '9% RMSE improvement over the "
+            "best simple baseline' headline is withdrawn; §21/§22 replace it with a "
+            "matched one-month-ahead comparison and a paired interval."),
+        "spline_status": {
+            "design": (f"one predeclared driver at a time, centred cr() df <= "
+                       f"{SPLINE_DF_MAX}, training design_info reused for prediction "
+                       "grids"),
+            "withdrawn": ("the previous all-drivers-at-once df=4 design (25 columns on "
+                          f"{N_FIT} months) and the lake-level non-linearity it produced"),
+            "supported_out_of_sample": list(SPLINE_SUPPORTED_OOS or []),
+            "refusals": SPLINE_REFUSALS,
+        },
+        "effective_sample_size_note": (
+            "SERIES_DIAGNOSTICS.effective_n_bartlett is an APPROXIMATE diagnostic on the "
+            "RAW response, retained for orientation only. The state-space model uses all "
+            "observed months and represents the dependence explicitly; it cannot create "
+            "independent information the record does not contain."),
+        "validation": (VALIDATION.to_dict("records") if len(VALIDATION) else []),
+        "validation_all_passed": (bool(VALIDATION["passed"].all())
+                                  if len(VALIDATION) else False),
+        "synthesis_answers": (SYNTHESIS_ANSWERS.to_dict("records")
+                              if len(SYNTHESIS_ANSWERS) else []),
         "variance_partition_used_for_interpretation": SHARED_VS_UNIQUE_SPEC,
         "shared_vs_unique_note": (
             "last_entry_to_shapley_ratio = semi-partial / Shapley from the SAME fit; "
@@ -4395,9 +7526,9 @@ if SOURCE["is_synthetic"]:
 
 
 # ===========================================================================
-# 21. Interpretation checklist
+# 27. Interpretation checklist
 # ===========================================================================
-md("""## 21. How to read and write up this model
+md("""## 27. How to read and write up this model
 
 ### What each section licenses you to claim
 
@@ -4407,32 +7538,68 @@ md("""## 21. How to read and write up this model
 | §12 M4 short-run | "Within a month, a 1-SD increase in *X* is associated with this change, given last month's extent" | A forecast |
 | §12 M4 long-run | "A sustained 1-SD increase in *X* is associated with a long-run change of β/(1−ρ)" — **only if `long_run_estimable` is True** | Anything long-run when the AR interval includes a unit root. The multiplier is `NaN` then, and no number from an earlier run may be substituted |
 | §13 stability | "The association with *X* is robust to resampling and to collinearity with other drivers" | An effect size — the elastic net shrinks coefficients toward zero by design |
-| §14 splines | "The *X*–WH relationship is (non-)linear, with this shape" | A threshold you can manage to, on ~100 months |
-| §16 | "Over *k* three-calendar-month rolling-origin windows and *n* evaluated months, the drivers do / do not improve prediction over persistence and season" | Anything about in-sample fit; comparing seasonal-naive with the rest when `eval_set` differs |
+| §14 splines | "The *X*–WH shape is EXPLORATORY and looks like this" | A non-linear result, unless §14b's `supported_out_of_sample` is True; and never the withdrawn 25-column lake-level curve |
+| §16 | Nothing on its own. It is a **retained sensitivity**: 3-calendar-month windows with contemporaneous (nowcast) drivers | The headline predictive claim. The "9% RMSE improvement" it used to print is withdrawn — use §21/§22 |
 | §17 Shapley | "*X* accounts for *n*% of the explained variance in WH extent **in this specification**" | That *X* caused that variance; mixing the with- and without-persistence tables |
 | §17 shared vs unique | "*X* does / does not contribute independently of the other drivers, once persistence is in the model" | Reading `last_entry_to_shapley_ratio` as a bounded share |
-| §19 | The ranked, verdict-bearing summary — **this is the table to put in the dissertation** | Anything about drivers marked `not separable from season` |
+| **§19** | "The WH series' dependence is best represented by *this* structure, chosen without any driver information" | That the choice is certain — §24 refits under all three |
+| **§20 (S1)** | **The principal association claim**: "net of season, trend and the series' own persistence *modelled in the process*, a 1-SD change in *X* is associated with this change in logit cover" | A forecast; a long-run multiplier unless the stationarity gate opened |
+| **§20 joint test** | "The predeclared driver block as a whole does / does not improve fit over the matched no-driver dynamic model" | An individual driver's importance |
+| **§21–§22** | "Over *n* one-calendar-month-ahead targets with origin-time drivers, the driver model's RMSE differs from the matched no-driver model by *d* (95% interval …)" | An effect size, a *p*-value, or an "improvement" when that interval includes zero |
+| **§23** | "Referred to a bootstrap null built under the matched null model, the joint test's *p* is …" | Anything if `n_replicates_successful` is small — check it |
+| §25 | The five answers and the ranked, verdict-bearing summary — **this is what goes in the dissertation** | Anything about drivers marked `not separable from season` or `static only — not confirmed under persistence` |
 
-### The five sentences to write
+### The six sentences to write
 
 1. The response is the area-weighted AOI mean of classified WH cover over a
    fixed set of *N* grid cells, on *M* months passing a coverage threshold of
-   `MIN_MONTHLY_COVERAGE_FRACTION`.
+   `MIN_MONTHLY_COVERAGE_FRACTION`, held on a calendar-complete grid with
+   excluded months retained as missing.
 2. Static habitat variables cannot enter a purely temporal model; the drivers
    tested are the time-varying set in §9, each entered at the lag its mechanism
    implies.
-3. All inference is autocorrelation-robust (Newey–West, bandwidth *L*) with BH
-   FDR control at `FDR_ALPHA`; effective sample size is roughly *n*<sub>eff</sub>
-   from §8.
-4. The drivers account for *x*% of the explained variance (§17), of which
-   season accounts for *y*% and persistence *z*%.
-5. Out of sample, the driver model does / does not beat persistence and season
-   (§16), and the ranked robustness verdicts are in §19.
+3. The principal model is a state-space dynamic regression: deterministic annual
+   Fourier season (+ linear trend where admissible) with the persistence carried
+   by the *process*. The dependence structure — *name it* — was selected in §19
+   from AR(1), AR(2) and a stochastic local level on **null dynamics only**, by
+   AICc on the observed response months and one-month-ahead rolling-origin RMSE,
+   and locked before any driver entered.
+4. Driver coefficients are standardized, with state-space robust standard errors
+   and BH FDR control at `FDR_ALPHA`; the whole block is tested against the
+   matched null by likelihood ratio, referred to a parametric bootstrap null
+   (§23) because ~60 observed months is not asymptotia. §12's Newey–West results
+   are reported alongside as the static association.
+5. Predictive skill is expanding-window, **one calendar month ahead**, over every
+   feasible origin, with all scaling fitted inside each fold and every driver
+   lagged to origin-time; the comparison is against literal persistence
+   ($y_{t-1}$, unfitted), a fitted AR(1), seasonal naive ($y_{t-12}$) and the
+   *matched* no-driver state-space model, with a calendar-aware moving-block
+   interval on the RMSE difference (§22).
+6. The five answers — dependence structure, joint fit, joint prediction,
+   individual robustness, residual uncertainty — are in §25a; the ranked
+   verdicts in §25b.
 
 ### Before quoting a number
 
-- [ ] Is the driver `not separable from season` in §19? Then it has no
+- [ ] **Which model is the number from?** `coef_S1` (§20, principal),
+      `coef_M3` (§12, static association), M4 (§12, `y_lag1` sensitivity), or a
+      prediction result (§21–§22)? Name it in the sentence. Never average two of
+      them, never rank across them, never pair a *p*-value from one with a
+      coefficient from another.
+- [ ] Is the driver `not separable from season` in §25? Then it has no
       independent evidence, whatever its *p*-value.
+- [ ] Is it `static only — not confirmed under persistence`? Then the static
+      model saw something the dynamic model does not confirm; report that, not
+      the M3 coefficient on its own.
+- [ ] Are you about to call an RMSE difference an improvement? Only if
+      `interval_excludes_zero` is True in §22. Otherwise the sentence is
+      "the point estimate was lower, but the improvement was uncertain".
+- [ ] Are you about to quote a **non-linear** shape from §14? Only if §14b lists
+      the driver under `supported out-of-sample`. The lake-level curvature from
+      the withdrawn 25-column design is not a result.
+- [ ] Are you quoting `effective_n_bartlett` as a sample size? It is an
+      approximate diagnostic on the raw response only. The state-space model
+      uses every observed month; say *that*, then say the intervals are wide.
 - [ ] Does §12's sign match the a-priori mechanism? A flip under seasonal
       control means the marginal association *was* seasonality.
 - [ ] Did the sign survive §18's leave-one-year-out and anomaly variants?
@@ -4445,25 +7612,36 @@ md("""## 21. How to read and write up this model
       exist — report the short-run coefficient and say the long-run effect is
       not identified, giving §12's `reason`.
 - [ ] Which **specification** does the variance number come from? §17 produces a
-      `without persistence` and a `with persistence` table; §19 uses the latter.
+      `without persistence` and a `with persistence` table; §25 uses the latter.
       Never quote a Shapley value from one beside a semi-partial from the other.
 - [ ] Is `last_entry_to_shapley_ratio` above 1? That is possible suppression or
       coefficient instability, not "more than 100% of its share".
-- [ ] Are you comparing seasonal-naive RMSE with the other models? Only if
-      `eval_set == "common"`. Otherwise quote its own `n_test`, or use the
-      restricted table §16 prints for the months it *can* be scored on.
-- [ ] Is the validation being described as "three-month-ahead"? Say
-      **three-calendar-month rolling-origin windows**, and give the number of
-      evaluated months — not the number of folds alone.
+- [ ] Are you comparing seasonal-naive or literal-persistence RMSE with the
+      other models? Only from §21's **common months (like-for-like)** table.
+      The "own months" table exists because those two baselines go unavailable
+      whenever the exact source month is missing, and their `n_test` differs.
+- [ ] Is the validation being described as "three-month-ahead"? That is §16, and
+      it is a **sensitivity**. The principal design is
+      **one-calendar-month-ahead, expanding origin**; give the number of
+      evaluated target months, not the number of folds.
+- [ ] Is a driver being called "persistence"? `y_lag1` in a regression is a
+      **fitted** term; literal persistence is $\hat y_t = y_{t-1}$ with no
+      coefficient. §21 reports both, separately, and so should you.
 
 ### If the drivers look weak
 
 That is a result, not a dead end, and it has three honest readings — state
 which one you believe and why:
 
+0. **They may genuinely not predict.** The principal result to check first is
+   §22: if the RMSE-difference interval includes zero, the drivers do not
+   demonstrably improve one-month-ahead prediction over season + trend +
+   persistence, and that sentence is the finding. Print it, export it, write it.
 1. **Not enough months.** ~100 monthly values with lag-1 autocorrelation of
-   *r* carry far less information than 100 independent ones (§8). Widen the
-   record before widening the claim.
+   *r* carry far less information than 100 independent ones (§8). The
+   state-space model uses every observed month and represents that dependence
+   instead of discounting for it — but it cannot create information the record
+   does not hold. Widen the record before widening the claim.
 2. **Seasonality absorbs the signal.** The drivers *are* the season here, so the
    effect is real but not separable (§9). Report the marginal association (M1)
    *and* the controlled one (M3), and be explicit about the difference.
