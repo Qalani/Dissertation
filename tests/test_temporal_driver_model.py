@@ -886,7 +886,7 @@ def test_notebook_excludes_endogenous_optical_proxies_from_driver_claims():
     assert "TEMPORAL_PROXY_TERMS" in cfg
     for name in ("chl_mci_s3", "turb_ndti_s2"):
         assert name in cfg
-    synth = _cell("19. Synthesis table")
+    synth = _cell("25. Synthesis table")
     # Proxies must never appear in the ranked driver table's term list.
     assert "PROXY_TERMS" not in synth
 
@@ -900,8 +900,11 @@ def test_notebook_uses_calendar_rolling_origin_not_random_cv():
 
 def test_notebook_scores_skill_against_persistence_and_seasonal_baselines():
     src = _cell("16. Rolling-origin out-of-sample skill")
-    for baseline in ("mean baseline", "persistence (y_lag1)", "seasonal-naive"):
+    for baseline in ("mean baseline", "y_lag1", "seasonal-naive"):
         assert baseline in src
+    # §16's y_lag1 specification is a FITTED regression and must not be sold as
+    # literal persistence; the unfitted y_{t-1} rule is §21's baseline.
+    assert "NOT literal persistence" in src
 
 
 def test_notebook_reports_the_cv_design_in_calendar_months():
@@ -941,7 +944,7 @@ def test_notebook_builds_shared_vs_unique_within_one_specification():
 
 
 def test_notebook_exports_carry_evidence_type_and_is_synthetic():
-    src = _cell("20. Export tables and a run manifest")
+    src = _cell("26. Export tables and a run manifest")
     assert 'out["evidence_type"] = evidence' in src
     assert 'out["is_synthetic"] = SOURCE["is_synthetic"]' in src
     for name in ("semi_partial_r2_with_ar", "shared_vs_unique_variance_with_ar",
@@ -977,8 +980,8 @@ def test_corrected_cells_carry_no_stale_outputs():
         "# 18a. Response-definition",
         "# 18b. Leave-one-year-out",
         "# 18c. Deseasonalised anomalies",
-        "# 19. Synthesis table",
-        "# 20. Export tables and a run manifest",
+        "# 25. Synthesis table",
+        "# 26. Export tables and a run manifest",
     ]
     cells = json.loads(NOTEBOOK.read_text())["cells"]
     for c in cells:
@@ -991,7 +994,7 @@ def test_corrected_cells_carry_no_stale_outputs():
 
 
 def test_synthesis_verdicts_cover_the_documented_categories():
-    src = _cell("19. Synthesis table")
+    src = _cell("25. Synthesis table")
     for verdict in ("robust", "suggestive", "sign contradicts mechanism",
                     "not separable from season", "no evidence"):
         assert f'"{verdict}"' in src
@@ -999,7 +1002,7 @@ def test_synthesis_verdicts_cover_the_documented_categories():
 
 def test_verdicts_ignore_selection_frequency_when_the_net_is_not_sparse():
     """A near-ridge fit selects everything; that must not read as robustness."""
-    src = _cell("19. Synthesis table")
+    src = _cell("25. Synthesis table")
     assert "ENET_SPARSITY_OK" in src
     enet = _cell("13. Elastic net")
     assert "ENET_SPARSITY_OK" in enet
@@ -1011,3 +1014,338 @@ def test_notebook_regenerates_from_its_builder():
     nb = json.loads(NOTEBOOK.read_text())
     assert nb["nbformat"] == 4
     assert len(nb["cells"]) > 30
+
+
+# ---------------------------------------------------------------------------
+# §5c / §19-§24: the state-space dynamic-regression model
+#
+# The static models put persistence on the right-hand side as `y_lag1`, which
+# deletes every month whose predecessor is missing and assumes the disturbance
+# is exactly AR(1). The principal model puts the dependence in the process
+# instead. What is pinned here is the discipline around it, because that is what
+# makes the driver estimates readable at all:
+#
+#   * the dependence structure is chosen from NULL dynamics, with no driver in
+#     any candidate, and locked before the drivers enter;
+#   * AICc is computed on the number of OBSERVED response months, not grid rows;
+#   * the exogenous placeholder can only ever land on a month that makes no
+#     likelihood contribution, and a month with an observed response but an
+#     incomplete driver row is WITHHELD rather than imputed;
+#   * every forecast is one calendar month ahead, trains strictly earlier, fits
+#     its scaling inside the fold and uses only origin-time driver information;
+#   * literal persistence is y_{t-1} with no fitted coefficient, and is reported
+#     separately from a fitted AR(1);
+#   * an RMSE difference is only called an improvement when its interval
+#     excludes zero.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def ss(ns):
+    """§5c state-space helpers, executed on top of the §4/§5 namespace."""
+    import warnings
+
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    from statsmodels.tsa.statespace.structural import UnobservedComponents
+
+    namespace = dict(ns)
+    namespace.update(warnings=warnings, SARIMAX=SARIMAX,
+                     UnobservedComponents=UnobservedComponents)
+    exec(compile(_cell("5c. State-space dynamic-regression helpers"), "<ss>", "exec"),
+         namespace)
+    return namespace
+
+
+def _ss_series(n=90, seed=3, gaps=(11, 12, 30, 47)):
+    """A gapped monthly series with an AR(1) error and one real driver."""
+    rng = np.random.default_rng(seed)
+    months = pd.date_range("2017-01-01", periods=n, freq="MS")
+    ang = 2 * np.pi * months.month.to_numpy(dtype=float) / 12.0
+    x = rng.normal(size=n)
+    u = np.zeros(n)
+    for t in range(1, n):
+        u[t] = 0.6 * u[t - 1] + rng.normal(0, 0.4)
+    y = 0.5 + 0.7 * np.sin(ang) + 0.5 * x + u
+    s = pd.Series(y, index=months)
+    s.iloc[list(gaps)] = np.nan
+    return s, pd.Series(x, index=months), months
+
+
+def test_aicc_uses_observed_months_not_grid_rows(ss):
+    """A record that is a quarter missing must not get a quarter-sized penalty."""
+    llf, k = -50.0, 8
+    tight = ss["aicc_from"](llf, k, 60)
+    loose = ss["aicc_from"](llf, k, 120)
+    assert tight > loose, "AICc must penalise harder on fewer observed months"
+    # The small-sample correction is the whole point of AICc over AIC.
+    assert tight == pytest.approx(-2 * llf + 2 * k + 2 * k * (k + 1) / (60 - k - 1))
+    # Refuse rather than return a negative-denominator nonsense value.
+    assert ss["aicc_from"](llf, 60, 60) == np.inf
+
+
+def test_only_models_without_a_stochastic_level_take_a_linear_trend(ss):
+    """A random-walk level and a linear trend claim the same variation."""
+    assert ss["ss_allows_linear_trend"]("sarimax_ar1")
+    assert ss["ss_allows_linear_trend"]("sarimax_ar2")
+    assert not ss["ss_allows_linear_trend"]("local_level")
+
+
+def test_local_level_is_refused_a_long_run_multiplier(ss):
+    """A unit-root latent state has no long-run multiplier to quote."""
+    s, x, months = _ss_series()
+    X = ss["fourier_terms"](months, 2)
+    X.index = s.index
+    res, _ = ss["ss_fit"](s, X, "local_level", cov_type=None, maxiter=120)
+    diag = ss["ss_state_diagnostics"](res, "local_level")
+    assert diag["stationary_supported"] is False
+    assert "unit root" in diag["reason"]
+
+
+def test_ar_structures_report_roots_and_gate_on_the_interval(ss):
+    s, x, months = _ss_series()
+    X = ss["fourier_terms"](months, 2)
+    X.index = s.index
+    res, info = ss["ss_fit"](s, X, "sarimax_ar1", cov_type=None, maxiter=200)
+    diag = ss["ss_state_diagnostics"](res, "sarimax_ar1")
+    assert diag["roots_outside_unit_circle"] is True
+    assert diag["rho_ci_lo"] < diag["rho_sum"] < diag["rho_ci_hi"]
+    assert diag["stationary_supported"] == (diag["roots_outside_unit_circle"]
+                                            and diag["ci_within_unit_circle"])
+
+
+def test_standardized_innovations_exist_only_on_observed_months(ss):
+    """The filter makes no update on a missing month, so it has no innovation."""
+    gaps = (11, 12, 30, 47)
+    s, x, months = _ss_series(gaps=gaps)
+    X = ss["fourier_terms"](months, 2)
+    X.index = s.index
+    res, _ = ss["ss_fit"](s, X, "sarimax_ar1", cov_type=None, maxiter=200)
+    inn = ss["ss_standardized_innovations"](res, months=months)
+    assert inn["std_innovation"].isna().to_numpy()[list(gaps)].all()
+    assert inn["std_innovation"].notna().sum() >= len(s.dropna()) - 2
+
+
+def test_calendar_ljung_box_drops_lags_with_no_calendar_pairs(ss):
+    """A lag built from zero genuinely h-months-apart pairs is not evidence."""
+    rng = np.random.default_rng(0)
+    months = pd.date_range("2020-01-01", periods=8, freq="MS")
+    x = pd.Series(rng.normal(size=8))
+    out = ss["calendar_ljung_box"](x, months=months, nlags=12)
+    assert out["df"] == len(out["lags_used"])
+    assert all(l >= 8 for l in out["lags_dropped"] if l not in out["lags_used"])
+    assert 0.0 <= out["lb_pvalue"] <= 1.0
+
+
+def test_rmse_difference_bootstrap_is_paired_and_calendar_blocked(ss):
+    """Both models are resampled on the SAME months, in contiguous blocks."""
+    months = pd.date_range("2018-01-01", periods=60, freq="MS")
+    rng = np.random.default_rng(1)
+    a = rng.normal(0, 1.0, 60)
+    out = ss["block_bootstrap_rmse_difference"](months, a, a, n_boot=200, seed=0)
+    # Identical error series: the difference is exactly zero in every replicate.
+    assert out["ci_lo"] == pytest.approx(0.0, abs=1e-12)
+    assert out["ci_hi"] == pytest.approx(0.0, abs=1e-12)
+    assert out["n_successful"] > 100
+    b = a * 2.0
+    worse = ss["block_bootstrap_rmse_difference"](months, b, a, n_boot=200, seed=0)
+    assert worse["ci_lo"] > 0, "a uniformly worse model must not straddle zero"
+
+
+def test_inverse_response_transform_round_trips(ss):
+    v = pd.Series([0.02, 0.15, 0.4])
+    for how in ("logit", "log", "identity"):
+        t, _ = ss["transform_response"](v, how, 1e-4)
+        back = ss["inverse_response_transform"](t, how, 1e-4)
+        assert back.to_numpy() == pytest.approx(v.to_numpy(), rel=1e-6)
+
+
+def test_fourier_terms_depend_only_on_the_calendar_month(ss):
+    """A fold must be able to build the season for a month it has never seen."""
+    a = ss["fourier_terms"](pd.date_range("2019-01-01", periods=12, freq="MS"), 2)
+    b = ss["fourier_terms"](pd.date_range("2024-01-01", periods=12, freq="MS"), 2)
+    assert a.to_numpy() == pytest.approx(b.to_numpy())
+
+
+def test_state_space_selection_uses_null_dynamics_only():
+    """The dependence structure must not be chosen with driver p-values."""
+    src = _cell("19b. Fit the candidate dependence structures WITHOUT any driver")
+    assert "ss_null_exog" in src
+    # The exogenous block of every candidate is season (+ trend); no driver term
+    # is ever put in front of the selection.
+    body = src.split("def ss_null_exog")[1].split("def ss_rolling_one_step_null")[0]
+    assert "SS_DRIVER_TERMS" not in body
+    assert "SS_SEASON_COLS" in body and "SS_TREND_COLS" in body
+    assert "aicc" in src and "rmse_one_month_ahead" in src
+    assert "LOCKED dependence structure" in src
+    for cand in ("sarimax_ar1", "sarimax_ar2", "local_level"):
+        cfg = _cell("3a. Where the data comes from")
+        assert cand in cfg
+
+
+def test_matched_null_and_full_models_are_asserted_identical():
+    src = _cell("20. The locked structure, with and without the environmental drivers")
+    assert "do not use identical response months" in src
+    assert "is not a strict extension of the null model" in src
+    assert "differs from the null by something other than the drivers" in src
+    assert "ss_joint_lr_test" in src and "ss_joint_wald_test" in src
+
+
+def test_exogenous_placeholder_is_confined_to_missing_response_months():
+    src = _cell("19a. The state-space modelling frame")
+    assert "placeholder would enter the likelihood" in src
+    assert "a placeholder was written on a month with an observed response" in src
+    assert "SS_WITHHELD_MONTHS" in src
+    # The withheld months are recorded, not silently imputed.
+    assert "withheld from the likelihood" in src
+
+
+def test_one_month_ahead_design_never_reaches_forward():
+    src = _cell("21b. Expanding-window, one-calendar-month-ahead rolling origin")
+    assert "target is not exactly one calendar month after the origin" in src
+    assert "training reaches the target month" in src
+    assert "SS_MIN_TRAIN_MONTHS" in src
+    # Scaling is fitted inside the fold, from the training months only.
+    assert "_tr[_scale_cols].mean()" in src
+    assert "_tr[_scale_cols].std(ddof=1)" in src
+    # The globally z-scored §11 columns must not be reused for the forecast.
+    assert "SS_FC_TERMS" in src and "DRIVER_TERMS" not in src
+
+
+def test_forecast_drivers_are_lagged_to_origin_time():
+    src = _cell("21a. Build the FORECAST driver set")
+    assert "SS_FORECAST_MIN_LAG" in src
+    assert "would use information from the target month or later" in src
+    assert "SS_FORECAST_EXOG_OVERRIDE" in src
+    # The a-priori (lag-0) specification survives for the association inference.
+    assert "a-priori (lag-0) specification is retained unchanged" in src
+
+
+def test_literal_persistence_is_not_a_fitted_regression():
+    src = _cell("21b. Expanding-window, one-calendar-month-ahead rolling origin")
+    assert "literal persistence (y_{t-1}, unfitted)" in src
+    assert "fitted AR(1)" in src
+    assert "NO fitted coefficient" in src
+    val = _cell("26a. Validation")
+    assert "literal persistence is y_{t-1} itself, with no fitted coefficient" in val
+    assert "reported separately from literal persistence" in val
+
+
+def test_seasonal_naive_is_exactly_twelve_calendar_months():
+    src = _cell("21b. Expanding-window, one-calendar-month-ahead rolling origin")
+    assert "seasonal naive (y_{t-12})" in src
+    assert "not exactly 12 calendar months earlier" in src
+    code = [ln for ln in src.split("\n") if not ln.strip().startswith("#")]
+    assert not any("shift(12)" in ln for ln in code)
+
+
+def test_rmse_improvement_wording_is_gated_on_the_interval():
+    src = _cell("22. Paired loss differences and a calendar-aware bootstrap interval")
+    assert "the point estimate was lower" in src
+    assert "but the improvement was uncertain" in src
+    assert "interval_excludes_zero" in src
+    assert "block_bootstrap_rmse_difference" in src
+    # Both scales are reported.
+    assert "logit modelling scale" in src
+    assert "raw WH cover (back-transformed)" in src
+
+
+def test_lr_bootstrap_cannot_stop_the_notebook():
+    src = _cell("23. Parametric bootstrap under the matched null")
+    assert "SS_RUN_LR_BOOTSTRAP" in src
+    assert "n_replicates_successful" in src
+    assert "except Exception" in src
+    assert "the rest of the notebook is unaffected" in src.lower()
+    cfg = _cell("3a. Where the data comes from")
+    assert "SS_LR_BOOTSTRAP_N = 399" in cfg          # inside the 300-500 range
+
+
+def test_spline_section_fits_one_driver_at_a_time_within_a_df_ceiling():
+    """25 columns on 64 months is an interpolation, not a nonlinear result."""
+    cfg = _cell("3a. Where the data comes from")
+    assert "SPLINE_DF_MAX = 3" in cfg
+    assert "SPLINE_ONE_DRIVER_AT_A_TIME = True" in cfg
+    src = _cell("14. Natural-spline GLM")
+    assert "SPLINE_ONE_DRIVER_AT_A_TIME" in src
+    assert "design_info" in src and "build_design_matrices" in src
+    assert "SPLINE_MIN_ROWS_PER_COLUMN" in src
+    # Centred, so the smooth carries no intercept.
+    assert "centred: no intercept inside the smooth" in src
+    oos = _cell("14b. Out-of-sample check on the non-linear shapes")
+    assert "supported_out_of_sample" in oos
+    assert "exploratory" in oos
+    # A point estimate does not promote a curve: the same calendar-aware
+    # moving-block interval §22 uses has to exclude zero.
+    assert "block_bootstrap_rmse_difference" in oos
+    assert '_b["ci_hi"] < 0' in oos
+
+
+def test_three_month_window_skill_is_demoted_and_the_nine_percent_claim_withdrawn():
+    src = _cell("16. Rolling-origin out-of-sample skill")
+    assert "SENSITIVITY" in src
+    assert "NOT a headline result" in src
+    assert "IMPROVE out-of-sample RMSE by" not in src
+    export = _cell("26. Export tables and a run manifest")
+    assert "withdrawn" in export
+
+
+def test_synthesis_answers_the_five_questions_and_names_its_sources():
+    src = _cell("25a. The five questions")
+    assert "SYNTHESIS_ANSWERS" in src
+    for q in ("Which dependence structure", "jointly improve FIT",
+              "one-calendar-month-ahead prediction", "Is any individual driver robust",
+              "How much uncertainty remains"):
+        assert q in src
+    assert "PLAIN RESULT" in src
+    table = _cell("25. Synthesis table")
+    assert "coef_S1" in table and "coef_M3" in table
+    assert "static only — not confirmed under persistence" in table
+
+
+def test_effective_sample_size_is_labelled_approximate():
+    src = _cell("8. Response series diagnostics")
+    assert "APPROXIMATE effective sample size" in src
+    assert "cannot" in src and "independent information" in src
+
+
+def test_state_space_exports_and_validation_are_present():
+    src = _cell("26. Export tables and a run manifest")
+    for name in ("statespace_candidate_dynamics", "statespace_coefficients",
+                 "statespace_joint_driver_block_test",
+                 "statespace_rolling_origin_fold_audit",
+                 "statespace_one_month_predictions",
+                 "statespace_skill_common_sample",
+                 "statespace_rmse_difference_bootstrap",
+                 "statespace_lr_bootstrap",
+                 "statespace_innovation_diagnostics",
+                 "statespace_robustness_loyo",
+                 "synthesis_answers", "validation_assertions"):
+        assert f'"{name}"' in src, f"{name} is not exported"
+    val = _cell("26a. Validation")
+    for check in ("identical response months", "identical target months",
+                  "exactly one calendar month ahead",
+                  "standardisation was fitted on training months only",
+                  "exactly t-12 calendar months",
+                  "placeholder exogenous values occur only where the response is missing",
+                  "real and synthetic outputs are distinguishable"):
+        assert check in val, f"missing validation check: {check}"
+
+
+def test_state_space_robustness_covers_the_required_sweeps():
+    loyo = _cell("24a. Leave-one-year-out on the state-space driver model")
+    assert "setting its responses missing" in loyo or "responses missing" in loyo
+    var = _cell("24b. Alternative transforms and alternative dependence structures")
+    assert "SS_ROBUST_TRANSFORMS" in var
+    assert "SS_CANDIDATE_STRUCTURES" in var
+    assert "never merged with §12/§18" in var
+
+
+def test_synthetic_self_test_series_has_calendar_gaps(ns):
+    """A gapless self-test never exercises the missing-month machinery."""
+    monthly, truth = ns["make_synthetic_monthly"](108, seed=42, missing_fraction=0.2)
+    assert truth["n_months_forced_missing"] > 10
+    below = monthly["coverage_fraction"] < 0.9
+    assert int(below.sum()) == truth["n_months_forced_missing"]
+    # A month whose partner exactly 12 calendar months later survives the filter,
+    # so seasonal-naive genuinely goes unavailable somewhere.
+    gapped = set(monthly.loc[below, "month"])
+    kept = set(monthly.loc[~below, "month"])
+    assert any((m + pd.DateOffset(months=12)) in kept for m in gapped)
