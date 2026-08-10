@@ -123,6 +123,7 @@ from the regional design.
 | 21 | Exports and run manifest |
 | 22 | Synthesis; implementation summary |
 | 23 | Validation assertion table |
+| 24–25 | How to read the model; implementation summary |
 
 ## Two run modes
 
@@ -469,7 +470,32 @@ RANDOM_SLOPE_CANDIDATES = ["rain_chirps_30d_mm", "wave_exposure_idx"]
 RANDOM_SLOPE_MAX_TERMS = 2
 # Below this many usable regions the model drops random slopes entirely and keeps
 # partially pooled intercepts + common slopes (+ at most one interaction).
-RANDOM_SLOPE_MIN_REGIONS = 6
+# Ten, not six: a between-region slope VARIANCE estimated from a handful of
+# groups is prior-dominated, and reporting it as a measurement is exactly the
+# failure this notebook exists to avoid.
+RANDOM_SLOPE_MIN_REGIONS = 10
+# Parameterisation of the regional slope deviations b_{r,k}.
+#   "centred"    - b ~ Normal(0, sigma_b). The right choice when the data INFORM
+#                  the regional slopes, which is the only case in which a random
+#                  slope is kept at all: §10c admits a term only when it has
+#                  genuine within-month regional variation. Default.
+#   "noncentred" - b = sigma_b * z. The right choice when the data barely inform
+#                  them - but then the term does not belong in the model.
+# The wrong choice biases nothing; it produces a funnel, max-tree-depth
+# trajectories and a fit that takes an hour to fail. §15's ladder switches
+# parameterisation before it gives up on the random slopes altogether.
+RANDOM_SLOPE_PARAMETERISATION = "centred"
+# Parameterisation of the partially pooled regional intercepts alpha_r and the
+# shared-state loadings lambda_r. Same logic as the random slopes, and it matters
+# more, because these exist in EVERY model this notebook fits:
+#   "centred"    - alpha ~ Normal(mu_alpha, sigma_alpha). Right when each region
+#                  contributes tens of observed months, which is exactly the
+#                  regime §9b's MIN_REGION_MONTHS enforces. Default.
+#   "noncentred" - alpha = mu_alpha + sigma_alpha * z. Right for sparse groups.
+# Choosing wrongly costs mixing, not correctness: the non-centred form funnels
+# when the group effects are strongly informed, and R-hat on alpha_r is the first
+# thing that fails. §15's ladder switches it before touching the model itself.
+HIERARCHY_PARAMETERISATION = "centred"
 
 # =====================================================================
 # 3f. Model and sampling
@@ -522,7 +548,7 @@ FAST_MODE = True
 # state-space model is a property of the geometry, not of the draw count, and a
 # development run full of spurious divergences would send §15's simplification
 # ladder chasing a sampler problem rather than a model problem.
-SAMPLING_FAST = dict(draws=500, tune=1000, chains=4, cores=4,
+SAMPLING_FAST = dict(draws=300, tune=700, chains=4, cores=4,
                      target_accept=0.95, random_seed=20260810)
 # THE FINAL, DOCUMENTED CONFIGURATION. Every reported number must come from a run
 # with FAST_MODE = False.
@@ -530,7 +556,7 @@ SAMPLING_FINAL = dict(draws=2000, tune=2000, chains=4, cores=4,
                       target_accept=0.95, random_seed=20260810)
 # Cheaper settings for the many refits in §17-§19. Still four chains, because a
 # refit with unusable diagnostics is not a cheaper answer, it is no answer.
-SAMPLING_REFIT_FAST = dict(draws=250, tune=750, chains=4, cores=4,
+SAMPLING_REFIT_FAST = dict(draws=200, tune=500, chains=4, cores=4,
                            target_accept=0.93, random_seed=20260810)
 SAMPLING_REFIT_FINAL = dict(draws=750, tune=1500, chains=4, cores=4,
                             target_accept=0.95, random_seed=20260810)
@@ -546,7 +572,7 @@ DIAG_MAX_DIVERGENCES = 0
 # =====================================================================
 # Expanding-window, ONE-calendar-month-ahead prediction.
 VAL_MIN_TRAIN_MONTHS = 36        # observed calendar months before the first origin
-VAL_MAX_ORIGINS_FAST = 6         # FAST_MODE cap; None (final) = every feasible origin
+VAL_MAX_ORIGINS_FAST = 3         # FAST_MODE cap; None (final) = every feasible origin
 VAL_MAX_ORIGINS_FINAL = None
 # Drivers must be knowable at the origin. Anything with an a-priori lag of 0 is
 # moved to lag 1 for the FORECAST evaluation (the a-priori specification is kept
@@ -558,7 +584,7 @@ VAL_BOOTSTRAP_N = 2000
 VAL_BOOTSTRAP_SEED = 11
 
 RUN_LORO = True                  # leave-one-region-out transfer (§18)
-LORO_MAX_REGIONS_FAST = 3        # FAST_MODE cap on how many regions are withheld
+LORO_MAX_REGIONS_FAST = 2        # FAST_MODE cap on how many regions are withheld
 LORO_MAX_REGIONS_FINAL = None
 
 # =====================================================================
@@ -576,7 +602,7 @@ REGIONALISATION_VARIANTS = {
     "openness_q65":   {"_openness_quantile": 0.65},
     "min_cells_80":   {"_min_region_cells": 80},
 }
-SENSITIVITY_VARIANTS_FAST = ["river_3km", "littoral_3km", "openness_q65"]
+SENSITIVITY_VARIANTS_FAST = ["river_3km", "openness_q65"]
 
 RANDOM_STATE = 20260810
 
@@ -2316,10 +2342,10 @@ def plot_regions(assignments, regions, thresholds, covariates, cell_size_m,
         if len(_grp):
             for rid, sub in _grp.groupby("region_id"):
                 ax.plot(sub["x_km"].mean(), sub["y_km"].mean(), marker="v",
-                        ms=11, color="#1f78b4", mec="white", mew=1.2, zorder=6)
+                        ms=12, mfc="white", mec="#08306b", mew=2.0, zorder=6)
         elif len(near):
             ax.plot(near["x_km"].iloc[0], near["y_km"].iloc[0], marker="v",
-                    ms=11, color="#1f78b4", mec="white", mew=1.2, zorder=6)
+                    ms=12, mfc="white", mec="#08306b", mew=2.0, zorder=6)
 
     for r in regions.itertuples():
         # Anchor the label on a cell that really belongs to the region: a
@@ -2346,8 +2372,9 @@ def plot_regions(assignments, regions, thresholds, covariates, cell_size_m,
     if riv_col and t_riv is not None:
         handles.append(Line2D([0], [0], color="#1f78b4", lw=1.8, ls="--",
                               label=f"major-river distance = {t_riv:,.0f} m"))
-        handles.append(Line2D([0], [0], color="#1f78b4", marker="v", lw=0,
-                              ms=10, label="major river / river mouth"))
+        handles.append(Line2D([0], [0], marker="v", lw=0, ms=11, mfc="white",
+                              mec="#08306b", mew=2.0,
+                              label="major river / river mouth"))
     ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5),
               fontsize=8, frameon=False)
     ax.set_aspect("equal")
@@ -3391,12 +3418,19 @@ def make_model_data(X_model, Y, obs_mask, season, tt, region_ids, driver_terms,
 
 def build_regional_model(data, drivers=True, common_state="ar1",
                          regional_ar="common", include_trend=True,
-                         use_random_slopes=True, priors=None):
+                         use_random_slopes=True, priors=None,
+                         random_slope_parameterisation=None,
+                         hierarchy_parameterisation=None):
     """The hierarchical dynamic model. One builder, every structure §13-§19 needs."""
     if not HAVE_PYMC:
         raise RuntimeError("PyMC is not available.")
     P = dict(PRIORS)
     P.update(priors or {})
+    random_slope_parameterisation = (random_slope_parameterisation
+                                     or RANDOM_SLOPE_PARAMETERISATION)
+    hierarchy_parameterisation = (hierarchy_parameterisation
+                                  or HIERARCHY_PARAMETERISATION)
+    centred = hierarchy_parameterisation == "centred"
     R_, T_, K_ = data["R"], data["T"], data["K"]
     obs_r, obs_t = data["obs_r"], data["obs_t"]
     rs_idx = list(data["rs_idx"]) if (drivers and use_random_slopes) else []
@@ -3411,10 +3445,13 @@ def build_regional_model(data, drivers=True, common_state="ar1",
         # --- partially pooled regional intercepts (non-centred) --------------
         mu_alpha = pm.Normal("mu_alpha", 0.0, P["mu_alpha_sd"])
         sigma_alpha = pm.HalfNormal("sigma_alpha", P["sigma_alpha"])
-        alpha = pm.Deterministic(
-            "alpha", mu_alpha + sigma_alpha * pm.Normal("alpha_z", 0, 1,
-                                                        dims="region"),
-            dims="region")
+        if centred:
+            alpha = pm.Normal("alpha", mu_alpha, sigma_alpha, dims="region")
+        else:
+            alpha = pm.Deterministic(
+                "alpha", mu_alpha + sigma_alpha * pm.Normal("alpha_z", 0, 1,
+                                                            dims="region"),
+                dims="region")
 
         # --- deterministic season and optional common trend ------------------
         gamma = pm.Normal("gamma_season", 0.0, P["season_sd"], dims="season")
@@ -3431,10 +3468,14 @@ def build_regional_model(data, drivers=True, common_state="ar1",
             eta = eta + pt.dot(X_obs, beta)
             if rs_idx:
                 sigma_b = pm.HalfNormal("sigma_b", P["sigma_b"], dims="rs_driver")
-                b = pm.Deterministic(
-                    "b", sigma_b[None, :] * pm.Normal("b_z", 0, 1,
-                                                      dims=("region", "rs_driver")),
-                    dims=("region", "rs_driver"))
+                if random_slope_parameterisation == "centred":
+                    b = pm.Normal("b", 0.0, sigma_b[None, :],
+                                  dims=("region", "rs_driver"))
+                else:
+                    b = pm.Deterministic(
+                        "b", sigma_b[None, :] * pm.Normal(
+                            "b_z", 0, 1, dims=("region", "rs_driver")),
+                        dims=("region", "rs_driver"))
                 eta = eta + pt.sum(b[obs_r, :] * X_obs[:, rs_idx], axis=1)
 
         # --- shared latent state ---------------------------------------------
@@ -3457,9 +3498,13 @@ def build_regional_model(data, drivers=True, common_state="ar1",
 
         if g is not None:
             sigma_lambda = pm.HalfNormal("sigma_lambda", P["sigma_lambda"])
-            lam = pm.Deterministic(
-                "lam", 1.0 + sigma_lambda * pm.Normal("lam_z", 0, 1, dims="region"),
-                dims="region")
+            if centred:
+                lam = pm.Normal("lam", 1.0, sigma_lambda, dims="region")
+            else:
+                lam = pm.Deterministic(
+                    "lam", 1.0 + sigma_lambda * pm.Normal("lam_z", 0, 1,
+                                                          dims="region"),
+                    dims="region")
             eta = eta + lam[obs_r] * g[obs_t]
 
         # --- region-specific temporal dependence + observation noise ----------
@@ -3826,6 +3871,8 @@ FIT_CONFIG = {
     "regional_ar": REGIONAL_AR_MODE,
     "include_trend": INCLUDE_TREND,
     "use_random_slopes": bool(MODEL_DATA["rs_idx"]),
+    "random_slope_parameterisation": RANDOM_SLOPE_PARAMETERISATION,
+    "hierarchy_parameterisation": HIERARCHY_PARAMETERISATION,
     "drivers_used": list(DRIVER_TERMS),
     "target_accept": SAMPLING["target_accept"],
     "simplification_step": 0,
@@ -3854,14 +3901,18 @@ def fit_matched_pair(config, sampling=None, priors=None, data=None,
     m_null = build_regional_model(
         null_data, drivers=False, common_state=config["common_state"],
         regional_ar=config["regional_ar"], include_trend=config["include_trend"],
-        use_random_slopes=False, priors=priors)
+        use_random_slopes=False, priors=priors,
+        hierarchy_parameterisation=config.get("hierarchy_parameterisation"))
     id_null, inf_null = fit_model(m_null, samp,
                                   label=f"regional_dynamic_null{label_suffix}",
                                   prior_predictive=False)
     m_full = build_regional_model(
         d_full, drivers=True, common_state=config["common_state"],
         regional_ar=config["regional_ar"], include_trend=config["include_trend"],
-        use_random_slopes=config["use_random_slopes"], priors=priors)
+        use_random_slopes=config["use_random_slopes"], priors=priors,
+        random_slope_parameterisation=config.get(
+            "random_slope_parameterisation"),
+        hierarchy_parameterisation=config.get("hierarchy_parameterisation"))
     id_full, inf_full = fit_model(m_full, samp,
                                   label=f"regional_dynamic_full{label_suffix}",
                                   prior_predictive=True)
@@ -3943,6 +3994,31 @@ def _ladder_steps(config, data):
     """The ordered simplifications, each returning (name, new_config) or None."""
     steps = []
 
+    def switch_hierarchy_parameterisation(c):
+        cur = c.get("hierarchy_parameterisation", "centred")
+        if c.get("_tried_hierarchy_parameterisation"):
+            return None
+        alt = "noncentred" if cur == "centred" else "centred"
+        n = dict(c)
+        n["hierarchy_parameterisation"] = alt
+        n["_tried_hierarchy_parameterisation"] = True
+        return (f"switch the regional intercept / loading parameterisation from "
+                f"{cur} to {alt} (poor mixing in alpha_r is a geometry problem "
+                "before it is a model problem)", n)
+
+    def switch_random_slope_parameterisation(c):
+        if not c.get("use_random_slopes"):
+            return None
+        cur = c.get("random_slope_parameterisation", "centred")
+        alt = "noncentred" if cur == "centred" else "centred"
+        if c.get("_tried_rs_parameterisation"):
+            return None
+        n = dict(c)
+        n["random_slope_parameterisation"] = alt
+        n["_tried_rs_parameterisation"] = True
+        return (f"switch the random-slope parameterisation from {cur} to {alt} "
+                "(a funnel is a geometry problem before it is a model problem)", n)
+
     def drop_random_slopes(c):
         if not c.get("use_random_slopes"):
             return None
@@ -3979,8 +4055,9 @@ def _ladder_steps(config, data):
         n["target_accept"] = min(0.99, round(c.get("target_accept", 0.9) + 0.05, 3))
         return (f"raise target_accept to {n['target_accept']}", n)
 
-    for f in (drop_random_slopes, simplify_regional_ar, reduce_drivers,
-              raise_target_accept):
+    for f in (switch_hierarchy_parameterisation,
+              switch_random_slope_parameterisation, drop_random_slopes,
+              simplify_regional_ar, reduce_drivers, raise_target_accept):
         steps.append(f)
     return steps
 
@@ -3998,6 +4075,9 @@ if HAVE_PYMC and PAIR is not None:
             "common_state": _cfg["common_state"],
             "regional_ar": _cfg["regional_ar"],
             "random_slopes": bool(_cfg["use_random_slopes"]),
+            "random_slope_parameterisation": _cfg.get(
+                "random_slope_parameterisation"),
+            "hierarchy_parameterisation": _cfg.get("hierarchy_parameterisation"),
             "n_drivers": len(_cfg["drivers_used"]),
             "target_accept": _cfg.get("target_accept"),
             "divergences_full": _pair["info_full"]["divergences"],
@@ -4070,7 +4150,11 @@ if HAVE_PYMC and FIT_FULL is not None:
         _dfull, drivers=True, common_state=FINAL_CONFIG["common_state"],
         regional_ar=FINAL_CONFIG["regional_ar"],
         include_trend=FINAL_CONFIG["include_trend"],
-        use_random_slopes=FINAL_CONFIG["use_random_slopes"])
+        use_random_slopes=FINAL_CONFIG["use_random_slopes"],
+        random_slope_parameterisation=FINAL_CONFIG.get(
+            "random_slope_parameterisation"),
+        hierarchy_parameterisation=FINAL_CONFIG.get(
+            "hierarchy_parameterisation"))
     with _mfull:
         _pp = pm.sample_posterior_predictive(
             FIT_FULL, progressbar=False,
@@ -4480,7 +4564,11 @@ if HAVE_PYMC and FIT_FULL is not None and RUN_LORO and N_REGIONS >= 3:
                 d_full, drivers=True, common_state=FINAL_CONFIG["common_state"],
                 regional_ar=FINAL_CONFIG["regional_ar"],
                 include_trend=FINAL_CONFIG["include_trend"],
-                use_random_slopes=FINAL_CONFIG["use_random_slopes"])
+                use_random_slopes=FINAL_CONFIG["use_random_slopes"],
+                random_slope_parameterisation=FINAL_CONFIG.get(
+                    "random_slope_parameterisation"),
+                hierarchy_parameterisation=FINAL_CONFIG.get(
+                    "hierarchy_parameterisation"))
             idl, infl = fit_model(m, SAMPLING_REFIT, label=f"loro_{rid}")
         except Exception as exc:
             print(f"  LORO {rid}: fit failed ({exc})")
@@ -4885,17 +4973,25 @@ if HAVE_PYMC and FIT_FULL is not None and len(FC_TERMS):
             "training reaches the target month"
 
         try:
-            m_n = build_regional_model(d_null, drivers=False,
-                                       common_state=FINAL_CONFIG["common_state"],
-                                       regional_ar=FINAL_CONFIG["regional_ar"],
-                                       include_trend=FINAL_CONFIG["include_trend"],
-                                       use_random_slopes=False)
+            m_n = build_regional_model(
+                d_null, drivers=False,
+                common_state=FINAL_CONFIG["common_state"],
+                regional_ar=FINAL_CONFIG["regional_ar"],
+                include_trend=FINAL_CONFIG["include_trend"],
+                use_random_slopes=False,
+                hierarchy_parameterisation=FINAL_CONFIG.get(
+                    "hierarchy_parameterisation"))
             id_n, inf_n = fit_model(m_n, SAMPLING_REFIT, label=f"val_null_{_fold}")
-            m_f = build_regional_model(d_full, drivers=True,
-                                       common_state=FINAL_CONFIG["common_state"],
-                                       regional_ar=FINAL_CONFIG["regional_ar"],
-                                       include_trend=FINAL_CONFIG["include_trend"],
-                                       use_random_slopes=FINAL_CONFIG["use_random_slopes"])
+            m_f = build_regional_model(
+                d_full, drivers=True,
+                common_state=FINAL_CONFIG["common_state"],
+                regional_ar=FINAL_CONFIG["regional_ar"],
+                include_trend=FINAL_CONFIG["include_trend"],
+                use_random_slopes=FINAL_CONFIG["use_random_slopes"],
+                random_slope_parameterisation=FINAL_CONFIG.get(
+                    "random_slope_parameterisation"),
+                hierarchy_parameterisation=FINAL_CONFIG.get(
+                    "hierarchy_parameterisation"))
             id_f, inf_f = fit_model(m_f, SAMPLING_REFIT, label=f"val_full_{_fold}")
         except Exception as exc:
             _fold_rows.append({"fold": _fold, "origin_month": MONTH_GRID[o],
@@ -5101,6 +5197,14 @@ if len(VAL_PREDICTIONS):
                 "resampling_unit": "calendar month (regions within a month are "
                                    "NOT independent replicates)"})
         VAL_RMSE_DIFF = pd.DataFrame(_rows)
+        if not len(VAL_RMSE_DIFF):
+            print("No RMSE-difference interval could be formed: fewer than three "
+                  "target CALENDAR MONTHS were available, and the resampling unit "
+                  "is the month, not the region-month. Widening it to "
+                  "region-months would manufacture precision out of regions that "
+                  "share a month, a satellite pass and the shared state — so the "
+                  "interval is withheld instead. Raise VAL_MAX_ORIGINS (or set "
+                  "FAST_MODE = False) for a usable interval.")
         display(VAL_RMSE_DIFF)
         register("temporal_validation_rmse_differences", VAL_RMSE_DIFF, "validation")
         for r in VAL_RMSE_DIFF.itertuples():
@@ -5113,7 +5217,8 @@ if len(VAL_PREDICTIONS):
                       f"{r.rmse_difference_a_minus_b:+.4f} "
                       f"[{r.ci95_lo:+.4f}, {r.ci95_hi:+.4f}] — the interval "
                       "includes zero, so this is NOT an improvement.")
-        if VAL_RMSE_DIFF["n_target_months_resampled"].min() < 8:
+        if (len(VAL_RMSE_DIFF)
+                and VAL_RMSE_DIFF["n_target_months_resampled"].min() < 8):
             print("\nWith this few target months the bootstrap interval is itself "
                   "coarse. Treat it as a guard against over-claiming, not as a "
                   "precise interval.")
@@ -5370,7 +5475,9 @@ if HAVE_PYMC and FIT_FULL is not None and SENSITIVITY_VARIANTS:
                 common_state=FINAL_CONFIG["common_state"],
                 regional_ar=FINAL_CONFIG["regional_ar"],
                 include_trend=FINAL_CONFIG["include_trend"],
-                use_random_slopes=False)
+                use_random_slopes=False,
+                hierarchy_parameterisation=FINAL_CONFIG.get(
+                    "hierarchy_parameterisation"))
             _id, _inf = fit_model(_m, SAMPLING_REFIT, label=f"sens_{_vname}")
         except Exception as exc:
             print(f"    fit failed: {exc}")

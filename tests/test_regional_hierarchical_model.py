@@ -589,6 +589,8 @@ def model_ns(ns):
     space = dict(ns)
     space.update({"pm": pm, "pt": pt, "HAVE_PYMC": True, "time": __import__("time"),
                   "FAST_MODE": True,
+                  "RANDOM_SLOPE_PARAMETERISATION": "centred",
+                  "HIERARCHY_PARAMETERISATION": "centred",
                   "SAMPLING": dict(draws=10, tune=10, chains=2, cores=1,
                                    target_accept=0.9, random_seed=0),
                   "PRIORS": {"mu_alpha_sd": 1.5, "sigma_alpha": 1.0,
@@ -682,6 +684,58 @@ def test_stationary_ar_parameters_are_bounded_in_the_unit_interval(model_ns):
     for arr in draws:
         arr = np.asarray(arr)
         assert (arr > 0).all() and (arr < 1).all()
+
+
+@pytest.mark.parametrize("parameterisation", ["centred", "noncentred"])
+def test_both_random_slope_parameterisations_build(model_ns, parameterisation):
+    """The ladder switches between them, so both must be constructible."""
+    rng = np.random.default_rng(4)
+    R, T = 4, 18
+    data = model_ns["make_model_data"](
+        rng.normal(size=(R, T, 2)), rng.normal(size=(R, T)),
+        np.ones((R, T), bool),
+        np.c_[np.sin(np.arange(T)), np.cos(np.arange(T))], np.arange(T) / T,
+        [f"R{i:02d}" for i in range(R)], ["d0", "d1"],
+        random_slope_terms=["d0"])
+    m = model_ns["build_regional_model"](
+        data, drivers=True, common_state="ar1", regional_ar="common",
+        use_random_slopes=True,
+        random_slope_parameterisation=parameterisation)
+    names = {v.name for v in m.free_RVs + m.deterministics}
+    assert "b" in names and "sigma_b" in names
+    assert ("b_z" in names) == (parameterisation == "noncentred")
+    assert np.isfinite(float(m.compile_logp()(m.initial_point())))
+
+
+@pytest.mark.parametrize("parameterisation", ["centred", "noncentred"])
+def test_both_hierarchy_parameterisations_build(model_ns, parameterisation):
+    """alpha_r and lambda_r have two parameterisations; the ladder switches them."""
+    data = _toy_model_data(model_ns)
+    m = model_ns["build_regional_model"](
+        data, drivers=True, common_state="ar1", regional_ar="common",
+        hierarchy_parameterisation=parameterisation)
+    names = {v.name for v in m.free_RVs + m.deterministics}
+    assert "alpha" in names and "lam" in names
+    assert ("alpha_z" in names) == (parameterisation == "noncentred")
+    assert ("lam_z" in names) == (parameterisation == "noncentred")
+    assert np.isfinite(float(m.compile_logp()(m.initial_point())))
+
+
+def test_the_two_hierarchy_parameterisations_are_the_same_model(model_ns):
+    """Switching parameterisation is a geometry change, not a model change."""
+    import pymc as pm
+    data = _toy_model_data(model_ns, R=3, T=10, K=1, seed=7)
+    draws = {}
+    for how in ("centred", "noncentred"):
+        m = model_ns["build_regional_model"](
+            data, drivers=True, common_state="none", regional_ar="none",
+            include_trend=False, hierarchy_parameterisation=how)
+        with m:
+            pr = pm.sample_prior_predictive(draws=4000, random_seed=3)
+        draws[how] = pr.prior["alpha"].to_numpy().ravel()
+    a, b = draws["centred"], draws["noncentred"]
+    assert abs(a.mean() - b.mean()) < 0.15
+    assert abs(a.std() - b.std()) / max(b.std(), 1e-9) < 0.15
 
 
 def test_random_slopes_are_only_built_when_asked_for(model_ns):
