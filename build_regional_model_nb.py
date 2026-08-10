@@ -488,18 +488,20 @@ RANDOM_SLOPE_PARAMETERISATION = "centred"
 # Parameterisation of the partially pooled regional intercepts alpha_r and the
 # shared-state loadings lambda_r. It matters more than the random slopes, because
 # these exist in EVERY model this notebook fits:
-#   "noncentred" - alpha = mu_alpha + sigma_alpha * z. Default. The intuition
-#                  that "tens of months per region means the group effects are
-#                  well informed, so centre them" turns out to be wrong here:
-#                  alpha_r is entangled with the level of the shared state g_t
-#                  and with mu_alpha, so it is not sharply informed on its own.
-#                  On the synthetic recovery panel the non-centred form mixed
-#                  markedly better, and the ladder's first rung reached it.
-#   "centred"    - alpha ~ Normal(mu_alpha, sigma_alpha). Better when the
-#                  regional effects really are sharply determined.
-# Choosing wrongly costs mixing, not correctness. §15's ladder switches this
-# BEFORE it simplifies the model, because a funnel is a geometry problem.
-HIERARCHY_PARAMETERISATION = "noncentred"
+#   "centred"    - alpha ~ Normal(mu_alpha, sigma_alpha). The DEFAULT. On the
+#                  synthetic recovery panel it began with zero divergences and
+#                  the ladder reached a passing configuration in two rungs.
+#                  Starting non-centred instead produced 114 divergences on the
+#                  first fit, changed which shared state §13 selected, and the
+#                  ladder did not recover from it at those settings.
+#   "noncentred" - alpha = mu_alpha + sigma_alpha * z. The conventional default
+#                  for hierarchical models, and better when sigma_alpha is small
+#                  relative to what the data can resolve. Reached by the ladder.
+# Neither is universally right, and the difference interacts with which shared
+# state §13 selects, which is exactly why §15's ladder switches this BEFORE it
+# simplifies the model: a funnel is a geometry problem, not evidence against a
+# term. Choosing wrongly costs mixing, never correctness.
+HIERARCHY_PARAMETERISATION = "centred"
 
 # =====================================================================
 # 3f. Model and sampling
@@ -6426,7 +6428,11 @@ wave exposure were labelled `spatiotemporal` and verdicted `supported`; wind
 speed and lake level were labelled `temporal_only`, exactly as they were built.
 The diagnostic gate failed at first and passed at ladder step 2, after
 switching the intercept parameterisation and dropping the region-specific AR —
-both recorded. §17 refused to call the drivers a predictive improvement on
+both recorded. Starting from the *non-centred* parameterisation instead, §13
+selected a different shared state (AR(1) rather than the local level) and the
+ladder did **not** reach a passing configuration at these sampling settings —
+which is why the centred form is the default and why the rung that switches it
+sits ahead of every structural simplification. §17 refused to call the drivers a predictive improvement on
 three target months, which is the correct answer at that sample size. That is
 the whole machine working, on data whose truth is known.
 
