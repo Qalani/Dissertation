@@ -486,16 +486,20 @@ RANDOM_SLOPE_MIN_REGIONS = 10
 # parameterisation before it gives up on the random slopes altogether.
 RANDOM_SLOPE_PARAMETERISATION = "centred"
 # Parameterisation of the partially pooled regional intercepts alpha_r and the
-# shared-state loadings lambda_r. Same logic as the random slopes, and it matters
-# more, because these exist in EVERY model this notebook fits:
-#   "centred"    - alpha ~ Normal(mu_alpha, sigma_alpha). Right when each region
-#                  contributes tens of observed months, which is exactly the
-#                  regime §9b's MIN_REGION_MONTHS enforces. Default.
-#   "noncentred" - alpha = mu_alpha + sigma_alpha * z. Right for sparse groups.
-# Choosing wrongly costs mixing, not correctness: the non-centred form funnels
-# when the group effects are strongly informed, and R-hat on alpha_r is the first
-# thing that fails. §15's ladder switches it before touching the model itself.
-HIERARCHY_PARAMETERISATION = "centred"
+# shared-state loadings lambda_r. It matters more than the random slopes, because
+# these exist in EVERY model this notebook fits:
+#   "noncentred" - alpha = mu_alpha + sigma_alpha * z. Default. The intuition
+#                  that "tens of months per region means the group effects are
+#                  well informed, so centre them" turns out to be wrong here:
+#                  alpha_r is entangled with the level of the shared state g_t
+#                  and with mu_alpha, so it is not sharply informed on its own.
+#                  On the synthetic recovery panel the non-centred form mixed
+#                  markedly better, and the ladder's first rung reached it.
+#   "centred"    - alpha ~ Normal(mu_alpha, sigma_alpha). Better when the
+#                  regional effects really are sharply determined.
+# Choosing wrongly costs mixing, not correctness. §15's ladder switches this
+# BEFORE it simplifies the model, because a funnel is a geometry problem.
+HIERARCHY_PARAMETERISATION = "noncentred"
 
 # =====================================================================
 # 3f. Model and sampling
@@ -5488,9 +5492,10 @@ if HAVE_PYMC and FIT_FULL is not None and SENSITIVITY_VARIANTS:
             s.update({"variant": _vname, "n_regions": len(_ds["keep"]),
                       "headline_mean": _head.get(term, np.nan),
                       "divergences": _inf["divergences"]})
-            s["same_sign_as_headline"] = bool(
-                np.isfinite(s["headline_mean"])
-                and np.sign(s["posterior_mean"]) == np.sign(s["headline_mean"]))
+            s["in_headline_model"] = bool(np.isfinite(s["headline_mean"]))
+            s["same_sign_as_headline"] = (
+                bool(np.sign(s["posterior_mean"]) == np.sign(s["headline_mean"]))
+                if s["in_headline_model"] else None)
             _brows.append(s)
         print(f"    {len(_ds['keep'])} regions, "
               f"{int(_ds['data']['obs_mask'].sum())} region-months, "
@@ -5503,8 +5508,18 @@ if HAVE_PYMC and FIT_FULL is not None and SENSITIVITY_VARIANTS:
                                    "posterior_mean", "headline_mean",
                                    f"hdi{int(HDI_PROB * 100)}_lo",
                                    f"hdi{int(HDI_PROB * 100)}_hi",
+                                   "in_headline_model",
                                    "same_sign_as_headline"]])
-        _stab = (SENSITIVITY_BETAS.groupby("term")
+        # A term the §15 ladder removed from the headline model has nothing to be
+        # compared WITH. It is listed separately rather than counted as a sign
+        # change against a coefficient that was never estimated.
+        _no_headline = sorted(SENSITIVITY_BETAS.loc[
+            ~SENSITIVITY_BETAS["in_headline_model"], "term"].unique())
+        if _no_headline:
+            print(f"Not in the headline model (the §15 ladder removed them), so "
+                  f"no sign comparison is possible: {_no_headline}")
+        _cmp_rows = SENSITIVITY_BETAS[SENSITIVITY_BETAS["in_headline_model"]]
+        _stab = (_cmp_rows.groupby("term")
                  .agg(n_variants=("variant", "nunique"),
                       n_same_sign=("same_sign_as_headline", "sum"),
                       min_mean=("posterior_mean", "min"),
@@ -5513,13 +5528,28 @@ if HAVE_PYMC and FIT_FULL is not None and SENSITIVITY_VARIANTS:
         _stab["sign_stable_across_variants"] = (
             _stab["n_same_sign"] == _stab["n_variants"])
         _stab["magnitude_range"] = _stab["max_mean"] - _stab["min_mean"]
+        # A sign flip between two coefficients that are both practically zero is
+        # noise, not fragility. Only a flip involving a coefficient OUTSIDE the
+        # ROPE says the conclusion depends on where the boundaries were drawn.
+        _stab["largest_abs_variant_mean"] = np.maximum(
+            _stab["max_mean"].abs(), _stab["min_mean"].abs())
+        _stab["material_sign_change"] = (
+            (~_stab["sign_stable_across_variants"])
+            & (_stab["headline_mean"].abs() > ROPE_HALFWIDTH)
+            & (_stab["largest_abs_variant_mean"] > ROPE_HALFWIDTH))
         display(_stab)
         register("regionalisation_sensitivity_summary", _stab, "robustness")
         for r in _stab.itertuples():
-            if not r.sign_stable_across_variants:
+            if r.material_sign_change:
                 print(f"*** {r.term}: the sign CHANGES between regionalisation "
-                      "variants. The conclusion for this driver depends on where "
-                      "the regional boundaries were drawn. ***")
+                      "variants, and the coefficient is outside the ROPE in at "
+                      "least one of them. The conclusion for this driver depends "
+                      "on where the regional boundaries were drawn. ***")
+            elif not r.sign_stable_across_variants:
+                print(f"{r.term}: the sign differs between variants, but every "
+                      f"estimate lies inside the ROPE (|beta| < {ROPE_HALFWIDTH}). "
+                      "That is a sign flip around zero, not an unstable "
+                      "conclusion.")
     register("regionalisation_sensitivity_regions", SENSITIVITY_REGIONS,
              "robustness")
     register("regionalisation_sensitivity_betas", SENSITIVITY_BETAS, "robustness")
@@ -5553,13 +5583,13 @@ if HAVE_PYMC and len(GLOBAL_DRIVERS):
     ypos = np.arange(len(d))
     colours = {"supported": "#1b7837", "suggestive": "#7fbf7b",
                "heterogeneous": "#d95f02", "temporal_only": "#7570b3",
-               "no evidence": "#999999", "not reportable": "#cccccc"}
-    fig, ax = plt.subplots(figsize=(9.5, 0.62 * len(d) + 2.2))
-    ax.axvspan(-ROPE_HALFWIDTH, ROPE_HALFWIDTH, color="0.88", zorder=0,
+               "no evidence": "#9e9e9e", "not reportable": "#5c5c5c"}
+    fig, ax = plt.subplots(figsize=(9.5, 0.75 * len(d) + 2.2))
+    ax.axvspan(-ROPE_HALFWIDTH, ROPE_HALFWIDTH, color="0.93", zorder=0,
                label=f"ROPE (|beta| < {ROPE_HALFWIDTH})")
     ax.axvline(0, color="0.3", lw=1, zorder=1)
     for i, r in enumerate(d.itertuples()):
-        c = colours.get(r.verdict, "#999999")
+        c = colours.get(r.verdict, "#9e9e9e")
         ax.plot([lo[i], hi[i]], [i, i], color=c, lw=2.6, solid_capstyle="round",
                 zorder=2)
         ax.plot(m[i], i, "o", color=c, ms=7, mec="white", mew=1.1, zorder=3)
@@ -5677,7 +5707,11 @@ if HAVE_PYMC and FIT_FULL is not None and "g" in FIT_FULL.posterior:
     g = FIT_FULL.posterior["g"]
     gm = g.mean(dim=("chain", "draw")).to_numpy()
     gh = az.hdi(FIT_FULL, var_names=["g"], hdi_prob=HDI_PROB)["g"].to_numpy()
-    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    _have_u = "u" in FIT_FULL.posterior
+    fig, axes = plt.subplots(2 if _have_u else 1, 1,
+                             figsize=(12, 7 if _have_u else 4.2), sharex=True,
+                             squeeze=False)
+    axes = axes[:, 0]
     ax = axes[0]
     ax.fill_between(MONTH_GRID, gh[:, 0], gh[:, 1], color="#4C72B0", alpha=0.25,
                     label=f"{int(HDI_PROB * 100)}% HDI")
@@ -5687,13 +5721,13 @@ if HAVE_PYMC and FIT_FULL is not None and "g" in FIT_FULL.posterior:
     ax.plot(_obs_months, np.full(len(_obs_months), gh.min()), "|",
             color="0.35", ms=6, label="months with an observed region")
     ax.set_ylabel("shared state $g_t$")
-    ax.set_title("Shared latent temporal state — gulf-wide persistence and "
+    ax.set_title("Shared latent temporal state — gulf-wide persistence and\n"
                  "unmeasured common shocks "
-                 f"({MODEL_KINDS[FINAL_CONFIG['common_state']]})", fontsize=11)
+                 f"({FINAL_CONFIG['common_state']})", fontsize=11)
     ax.legend(fontsize=8, frameon=False, ncol=3)
     ax.grid(alpha=0.2, lw=0.4)
-    ax = axes[1]
-    if "u" in FIT_FULL.posterior:
+    if _have_u:
+        ax = axes[1]
         um = FIT_FULL.posterior["u"].mean(dim=("chain", "draw")).to_numpy()
         cols = {"river_influenced_bay": "#1f78b4", "sheltered_littoral": "#33a02c",
                 "exposed_littoral": "#ff7f00", "open_gulf": "#6a3d9a"}
@@ -5705,14 +5739,13 @@ if HAVE_PYMC and FIT_FULL is not None and "g" in FIT_FULL.posterior:
         ax.legend(fontsize=6, ncol=3, frameon=False)
         ax.set_ylabel("regional state $u_{r,t}$")
         ax.set_title("Region-specific temporal dependence", fontsize=11)
+        ax.grid(alpha=0.2, lw=0.4)
     else:
-        ax.text(0.5, 0.5, "no region-specific AR in the final model\n(dropped by "
-                          "the §15 simplification ladder)", ha="center",
-                va="center", transform=ax.transAxes, fontsize=10)
-        ax.axis("off")
-    ax.grid(alpha=0.2, lw=0.4)
-    axes[1].xaxis.set_major_locator(mdates.YearLocator())
-    axes[1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        axes[0].set_xlabel("no region-specific AR in the final model — "
+                           "$u_{r,t}$ was dropped by the §15 simplification "
+                           "ladder", fontsize=9)
+    axes[-1].xaxis.set_major_locator(mdates.YearLocator())
+    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     fig.tight_layout()
     save_fig(fig, "06_latent_states")
     plt.show()
@@ -6027,20 +6060,28 @@ _answer(
     "§16a REGIONAL_DRIVERS, §20b")
 
 if len(SENSITIVITY_BETAS):
-    _st = (SENSITIVITY_BETAS.groupby("term")["same_sign_as_headline"]
-           .agg(["sum", "count"]))
-    _unstable = _st[_st["sum"] < _st["count"]].index.tolist()
+    _sens_sum = EXPORTS.get("regionalisation_sensitivity_summary", (None,))[0]
+    _material, _cosmetic = [], []
+    if _sens_sum is not None and len(_sens_sum):
+        _material = _sens_sum.loc[_sens_sum["material_sign_change"],
+                                  "term"].tolist()
+        _cosmetic = _sens_sum.loc[(~_sens_sum["sign_stable_across_variants"])
+                                  & (~_sens_sum["material_sign_change"]),
+                                  "term"].tolist()
     _answer(
         "6. Does the conclusion survive reasonable alternative regional "
         "definitions?",
         (f"{len(SENSITIVITY_VARIANTS)} predeclared response-blind variant(s) were "
          f"re-run end to end. "
-         + (f"Sign UNSTABLE for: {_unstable}. Those conclusions depend on where "
-            "the regional boundaries were drawn and must be reported as such."
-            if _unstable else
-            "Every driver kept its sign across every variant, and the magnitudes "
-            "stayed within the range in the sensitivity table.")),
-        "§19 SENSITIVITY_BETAS")
+         + (f"MATERIALLY unstable: {_material} — the sign changes AND the "
+            "coefficient is outside the ROPE in at least one variant, so the "
+            "conclusion for those drivers depends on where the boundaries were "
+            "drawn. " if _material else
+            "No driver changed sign in a way that matters: every sign change "
+            "involved coefficients that are practically zero. ")
+         + (f"Sign flips around zero (inside the ROPE, not a finding either way): "
+            f"{_cosmetic}." if _cosmetic else "")),
+        "§19 regionalisation_sensitivity_summary")
 else:
     _answer("6. Does the conclusion survive reasonable alternative regional "
             "definitions?",
@@ -6373,6 +6414,21 @@ seasonal naïve as unfitted baselines; calendar months as the bootstrap
 resampling unit; leave-one-region-out transfer that never touches the withheld
 region's response; a simplification ladder that refits **both** models; and an
 assertion table that re-checks all of it on every run.
+
+**What the synthetic recovery test showed.** Run on the synthetic cell-month
+panel (8 regions, 84 months, 544 region-month observations), the pipeline
+recovered every known value inside its 95% HDI: antecedent rainfall
+$+0.45 \to +0.43$ [0.41, 0.46], wave exposure $-0.30 \to -0.33$
+[$-0.57$, $-0.12$], air temperature $+0.10 \to +0.11$ [$-0.03$, 0.25], and the
+two drivers with **no** effect by construction — wind speed and lake level —
+came back at $+0.08$ and $+0.02$ with intervals spanning zero. Rainfall and
+wave exposure were labelled `spatiotemporal` and verdicted `supported`; wind
+speed and lake level were labelled `temporal_only`, exactly as they were built.
+The diagnostic gate failed at first and passed at ladder step 2, after
+switching the intercept parameterisation and dropping the region-specific AR —
+both recorded. §17 refused to call the drivers a predictive improvement on
+three target months, which is the correct answer at that sample size. That is
+the whole machine working, on data whose truth is known.
 
 **Unresolved limitations.**
 
