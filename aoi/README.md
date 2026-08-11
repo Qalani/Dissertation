@@ -145,3 +145,22 @@ eighth of the gulf, and the covariate spans 0 to ~33 km.
   gulf can be the nearest river to a gulf cell; `length_km` is measured *before*
   that clip, over a wider Lake Victoria basin window, so a long river truncated
   at the window edge is not mistaken for a short one.
+
+### How the notebook gets it
+
+`winam_wh_regional_hierarchical_driver_model.ipynb` fetches this file **from
+GitHub over `raw.githubusercontent.com`**, so a fresh Colab runtime needs nothing
+staged on Drive and every run reads the same versioned file. The notebook tries,
+in order:
+
+1. local paths (`MyDrive/WH_regional_hierarchical_model/`, `MyDrive/`, `aoi/`) —
+   so a deliberately modified layer still wins;
+2. `RIVER_VECTOR_PATH` on each ref in `RIVER_VECTOR_REFS`, built from
+   `RIVER_VECTOR_REPO`.
+
+Whatever is read is validated as a river layer before use — a `404: Not Found`
+body or an unrelated FeatureCollection is skipped rather than accepted as a layer
+with no qualifying rivers. The source URL **and the SHA-256 of the bytes actually
+read** are printed and written into the run manifest, so a result can be tied
+back to the exact network that produced it. To freeze the layer for a final run,
+put a commit SHA in `RIVER_VECTOR_REFS` instead of a branch name.

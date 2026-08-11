@@ -771,7 +771,8 @@ def _rivers_fc():
 def test_major_rivers_apply_both_declared_thresholds(ns, tmp_path):
     p = tmp_path / "rivers.geojson"
     p.write_text(json.dumps(_rivers_fc()))
-    geom, table, src = ns["load_major_rivers"]([str(p)], 20.0, 10.0, "EPSG:32736")
+    geom, table, src, sha = ns["load_major_rivers"](
+        [str(p)], 20.0, 10.0, "EPSG:32736")
     assert src == str(p)
     sel = table[table["selected"]]
     assert sel["name"].tolist() == ["Major"]
@@ -783,9 +784,67 @@ def test_major_rivers_apply_both_declared_thresholds(ns, tmp_path):
 
 @pytest.mark.skipif(not _HAVE_SHAPELY, reason="shapely>=2 / pyproj not installed")
 def test_missing_river_layer_is_reported_not_invented(ns, tmp_path):
-    geom, table, src = ns["load_major_rivers"](
-        [str(tmp_path / "absent.geojson")], 20.0, 10.0, "EPSG:32736")
-    assert geom is None and src is None and table.empty
+    geom, table, src, sha = ns["load_major_rivers"](
+        [str(tmp_path / "absent.geojson")], 20.0, 10.0, "EPSG:32736",
+        verbose=False)
+    assert geom is None and src is None and sha is None and table.empty
+
+
+@pytest.mark.skipif(not _HAVE_SHAPELY, reason="shapely>=2 / pyproj not installed")
+def test_a_non_river_payload_is_refused_not_read_as_an_empty_layer(ns, tmp_path):
+    """A 404 body or some other GeoJSON must not pass for a layer with no rivers.
+
+    The notebook fetches this layer over the network. If a "404: Not Found"
+    body, an HTML error page or an unrelated FeatureCollection were accepted,
+    the run would continue with zero selected rivers — indistinguishable from a
+    legitimate empty selection, and silently back on the weak covariate.
+    """
+    bad_html = tmp_path / "err.geojson"
+    bad_html.write_text("404: Not Found")
+    other_fc = tmp_path / "other.geojson"
+    other_fc.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "properties": {"foo": 1},
+                      "geometry": {"type": "Point", "coordinates": [34.5, -0.3]}}]}))
+    empty_fc = tmp_path / "empty.geojson"
+    empty_fc.write_text(json.dumps({"type": "FeatureCollection", "features": []}))
+
+    good = tmp_path / "good.geojson"
+    good.write_text(json.dumps(_rivers_fc()))
+
+    # each bad payload is skipped, and the good one further down the list wins
+    geom, table, src, sha = ns["load_major_rivers"](
+        [str(bad_html), str(other_fc), str(empty_fc), str(good)],
+        20.0, 10.0, "EPSG:32736")
+    assert src == str(good)
+    assert table.loc[table["selected"], "name"].tolist() == ["Major"]
+
+    # with no good candidate at all, nothing is invented
+    geom, table, src, sha = ns["load_major_rivers"](
+        [str(bad_html), str(other_fc), str(empty_fc)], 20.0, 10.0, "EPSG:32736",
+        verbose=False)
+    assert geom is None and src is None and sha is None and table.empty
+
+
+@pytest.mark.skipif(not _HAVE_SHAPELY, reason="shapely>=2 / pyproj not installed")
+def test_the_layer_digest_identifies_the_bytes_actually_read(ns, tmp_path):
+    """The run manifest ties a result to a river network by hash."""
+    import hashlib
+    p = tmp_path / "rivers.geojson"
+    payload = json.dumps(_rivers_fc())
+    p.write_text(payload)
+    _, _, _, sha = ns["load_major_rivers"]([str(p)], 20.0, 10.0, "EPSG:32736")
+    assert sha == hashlib.sha256(payload.encode()).hexdigest()
+
+
+def test_the_river_layer_is_fetched_from_github_by_default():
+    """The notebook must not require the layer to be staged by hand."""
+    cfg = _cell("# 3c. Regionalisation")
+    assert "RIVER_VECTOR_REPO" in cfg and "raw.githubusercontent.com" in cfg
+    # every declared ref must be reachable as a candidate URL
+    assert "RIVER_VECTOR_REFS" in cfg
+    src = _cell("# 7a-ii. Distance to the nearest MAJOR river")
+    assert "RIVER_LAYER_SHA256" in src, "the layer's digest must be recorded"
 
 
 @pytest.mark.skipif(not _HAVE_SHAPELY, reason="shapely>=2 / pyproj not installed")
@@ -793,7 +852,8 @@ def test_the_shipped_river_layer_selects_winam_s_known_inflows(ns):
     """The layer in aoi/ must actually contain the gulf's real rivers."""
     layer = REPO / "aoi" / "winam_major_rivers.geojson"
     assert layer.exists(), "aoi/winam_major_rivers.geojson is missing"
-    geom, table, _ = ns["load_major_rivers"]([str(layer)], 20.0, 10.0, "EPSG:32736")
+    geom, table, _s, sha = ns["load_major_rivers"](
+        [str(layer)], 20.0, 10.0, "EPSG:32736")
     chosen = set(table.loc[table["selected"], "name"])
     for river in ["Nzoia", "Yala", "Nyando", "Miriu (Sondu)"]:
         assert river in chosen, f"{river} missing from {sorted(chosen)}"
@@ -813,7 +873,8 @@ def test_the_mapped_network_separates_cells_the_hydrosheds_column_cannot(ns):
     layer = REPO / "aoi" / "winam_major_rivers.geojson"
     mask_path = REPO / "aoi" / "winam_gulf_water_mask_occ05.geojson"
     assert layer.exists() and mask_path.exists()
-    geom, _, _ = ns["load_major_rivers"]([str(layer)], 20.0, 10.0, "EPSG:32736")
+    geom, _t, _s, _h = ns["load_major_rivers"](
+        [str(layer)], 20.0, 10.0, "EPSG:32736")
 
     import pyproj
     import shapely.geometry

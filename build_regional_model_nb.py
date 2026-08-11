@@ -423,14 +423,29 @@ THRESHOLD_FALLBACK_QUANTILES = {
 # long enough to have a real catchment AND close enough to discharge into the
 # analysed water body — a long river that never approaches the gulf is not a
 # source of river influence on it.
+#
+# WHERE THE LAYER COMES FROM. The default is GitHub: the layer is versioned in
+# this repository beside the notebook that reads it, so a Colab runtime needs
+# nothing staged on Drive by hand and every run of this notebook — on any
+# machine, by anyone — reads the same file. Local paths are tried FIRST so a
+# deliberately modified layer still wins; §7a-ii prints which source was used
+# and the SHA-256 of the bytes it actually read, and both go into the run
+# manifest, so "which river network produced this number" is answerable after
+# the fact.
+RIVER_VECTOR_REPO = "Qalani/Dissertation"
+RIVER_VECTOR_PATH = "aoi/winam_major_rivers.geojson"
+# Tried in order. `main` is the long-term home; the feature branch is listed
+# after it so the notebook also works before that branch is merged. Pin a commit
+# SHA here instead of a branch name to freeze the layer for a final run.
+RIVER_VECTOR_REFS = ["main", "claude/river-network-covariate-n3dd10"]
 RIVER_VECTOR_CANDIDATES = [
+    # explicit local overrides win, if a copy has been staged deliberately
     "/content/drive/MyDrive/WH_regional_hierarchical_model/winam_major_rivers.geojson",
     "/content/drive/MyDrive/winam_major_rivers.geojson",
     "aoi/winam_major_rivers.geojson",
     "../aoi/winam_major_rivers.geojson",
-    "https://raw.githubusercontent.com/Qalani/Dissertation/main/aoi/"
-    "winam_major_rivers.geojson",
-]
+] + [f"https://raw.githubusercontent.com/{RIVER_VECTOR_REPO}/{_ref}/"
+     f"{RIVER_VECTOR_PATH}" for _ref in RIVER_VECTOR_REFS]
 RIVER_MAJOR_MIN_LENGTH_KM = 20.0      # a major river has a real catchment
 RIVER_MAJOR_MAX_GULF_DIST_KM = 10.0   # ...and it must actually reach the gulf
 # When the layer cannot be found the notebook falls back to the panel's
@@ -2220,32 +2235,63 @@ print(f"\nEligible water area: {CELL_STATIC['eligible_area_ha'].sum():,.0f} ha o
 # all three inputs are.
 
 
-def load_major_rivers(candidates, min_length_km, max_gulf_dist_km, crs):
-    """The major-river geometry in `crs`, plus the selection table and source.
+def load_major_rivers(candidates, min_length_km, max_gulf_dist_km, crs,
+                      timeout=30, verbose=True):
+    """The major-river geometry in `crs`, the selection table, source and digest.
 
     Every named watercourse in the layer is scored against the two DECLARED
     thresholds; the table records which qualified and which did not, so the
     selection can be defended river by river rather than as a black box.
+
+    Candidates may be local paths or URLs, and are tried in order. Whatever is
+    read is validated as a river layer BEFORE it is used — a 404 body, an HTML
+    error page or some other GeoJSON would otherwise be accepted as a layer with
+    no qualifying rivers, which looks exactly like a legitimate empty result.
+    The SHA-256 of the bytes actually read is returned so a run can be tied to
+    the exact layer that produced it.
     """
+    import hashlib
     import urllib.request
 
-    raw, used = None, None
+    def _valid(obj):
+        if not isinstance(obj, dict) or obj.get("type") != "FeatureCollection":
+            return False
+        feats = obj.get("features")
+        if not isinstance(feats, list) or not feats:
+            return False
+        props = feats[0].get("properties", {}) if isinstance(feats[0], dict) else {}
+        return {"name", "length_km", "dist_to_gulf_km"} <= set(props)
+
+    raw, used, digest, attempts = None, None, None, []
     for cand in candidates:
+        cand = str(cand)
         try:
-            if str(cand).startswith(("http://", "https://")):
-                with urllib.request.urlopen(str(cand), timeout=30) as fh:
-                    raw = json.loads(fh.read().decode("utf-8"))
+            if cand.startswith(("http://", "https://")):
+                with urllib.request.urlopen(cand, timeout=timeout) as fh:
+                    payload = fh.read()
             else:
                 p = Path(cand)
                 if not p.exists():
+                    attempts.append((cand, "not present"))
                     continue
-                raw = json.loads(p.read_text())
-            used = str(cand)
+                payload = p.read_bytes()
+            obj = json.loads(payload.decode("utf-8"))
+            if not _valid(obj):
+                attempts.append((cand, "not a river layer (missing name / "
+                                       "length_km / dist_to_gulf_km)"))
+                continue
+            raw, used = obj, cand
+            digest = hashlib.sha256(payload).hexdigest()
+            attempts.append((cand, "USED"))
             break
-        except Exception:
+        except Exception as exc:
+            attempts.append((cand, f"{type(exc).__name__}: {exc}"))
             continue
+    if verbose and raw is None:
+        for cand, why in attempts:
+            print(f"    tried {cand}\n      -> {why}")
     if raw is None:
-        return None, pd.DataFrame(), None
+        return None, pd.DataFrame(), None, None
 
     rows = []
     for feat in raw.get("features", []):
@@ -2270,21 +2316,22 @@ def load_major_rivers(candidates, min_length_km, max_gulf_dist_km, crs):
 
     keep = [f for f, r in zip(raw.get("features", []), rows) if r["selected"]]
     if not keep:
-        return None, table, used
+        return None, table, used, digest
 
     to_crs = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform
     geom = shapely.ops.unary_union(
         [shapely.ops.transform(to_crs, shapely.geometry.shape(f["geometry"]))
          for f in keep])
-    return geom, table, used
+    return geom, table, used, digest
 
 
 RIVER_SELECTION = pd.DataFrame()
-RIVER_LAYER_SOURCE = None
+RIVER_LAYER_SOURCE = RIVER_LAYER_SHA256 = None
 _river_geom = None
 if HAVE_SHAPELY:
     try:
-        _river_geom, RIVER_SELECTION, RIVER_LAYER_SOURCE = load_major_rivers(
+        (_river_geom, RIVER_SELECTION, RIVER_LAYER_SOURCE,
+         RIVER_LAYER_SHA256) = load_major_rivers(
             RIVER_VECTOR_CANDIDATES, RIVER_MAJOR_MIN_LENGTH_KM,
             RIVER_MAJOR_MAX_GULF_DIST_KM, PANEL_CRS)
     except Exception as _exc:
@@ -2296,6 +2343,7 @@ if _river_geom is not None:
     CELL_STATIC["dist_majriver_local_m"] = shapely.distance(_pts, _river_geom)
     _sel = RIVER_SELECTION[RIVER_SELECTION["selected"]]
     print(f"Major-river layer: {RIVER_LAYER_SOURCE}")
+    print(f"  sha256 {RIVER_LAYER_SHA256}")
     print(f"  {len(_sel)} of {len(RIVER_SELECTION)} named watercourses qualify "
           f"(mapped course >= {RIVER_MAJOR_MIN_LENGTH_KM:g} km AND within "
           f"{RIVER_MAJOR_MAX_GULF_DIST_KM:g} km of the analysed water body):")
@@ -2317,10 +2365,12 @@ if _river_geom is not None:
               f"{_old.max() / max(_old.min(), 1e-9):,.0f}; the mapped-network "
               f"column spans a factor of {_new.max() / max(_new.min(), 1e-9):,.0f}. "
               "A covariate that cannot separate cells cannot define regions.")
+    RIVER_SELECTION.attrs["source"] = RIVER_LAYER_SOURCE
+    RIVER_SELECTION.attrs["sha256"] = RIVER_LAYER_SHA256
     register("major_river_selection", RIVER_SELECTION, "provenance")
 else:
     _why = ("shapely/pyproj unavailable" if not HAVE_SHAPELY
-            else f"no layer found in {RIVER_VECTOR_CANDIDATES}"
+            else "no readable layer among the candidates above"
             if RIVER_LAYER_SOURCE is None else
             f"no watercourse in {RIVER_LAYER_SOURCE} met "
             f"length >= {RIVER_MAJOR_MIN_LENGTH_KM:g} km and gulf distance <= "
@@ -2330,8 +2380,12 @@ else:
             "column that put 100% of this AOI inside a 5 km river cut and "
             "collapsed the regionalisation to one region. §7c will catch that "
             "and substitute a quantile, but the covariate itself is still the "
-            "weak one. Put winam_major_rivers.geojson somewhere in "
-            "RIVER_VECTOR_CANDIDATES to use the mapped network. ***")
+            "weak one.\n"
+            "*** The layer is versioned in the repository at "
+            f"{RIVER_VECTOR_REPO}/{RIVER_VECTOR_PATH} and is normally fetched "
+            "from GitHub with no setup. If the fetch failed, check the runtime "
+            "has outbound HTTPS, or download that file and put it at one of the "
+            "local paths in RIVER_VECTOR_CANDIDATES. ***")
     if REQUIRE_LOCAL_RIVER_VECTOR:
         raise RuntimeError(_msg)
     print(_msg)
@@ -6418,6 +6472,25 @@ if OUTPUT_WRITABLE:
             "thresholds": {k: (float(v) if v is not None else None)
                            for k, v in THRESHOLDS.items()},
             "threshold_provenance": THRESHOLD_PROVENANCE.to_dict("records"),
+            # Which river network produced dist_majriver_local_m, and the exact
+            # bytes of it, so this run can be reproduced or audited later.
+            "river_layer": {
+                "source": RIVER_LAYER_SOURCE,
+                "sha256": RIVER_LAYER_SHA256,
+                "repo": RIVER_VECTOR_REPO,
+                "path": RIVER_VECTOR_PATH,
+                "refs_tried": list(RIVER_VECTOR_REFS),
+                "min_length_km": float(RIVER_MAJOR_MIN_LENGTH_KM),
+                "max_gulf_dist_km": float(RIVER_MAJOR_MAX_GULF_DIST_KM),
+                "n_selected": (int(RIVER_SELECTION["selected"].sum())
+                               if len(RIVER_SELECTION) else 0),
+                "selected": (RIVER_SELECTION.loc[RIVER_SELECTION["selected"],
+                                                 "name"].tolist()
+                             if len(RIVER_SELECTION) else []),
+                "used_for_river_distance": bool(
+                    REGION_COVARIATES.get("river_dist_m")
+                    == "dist_majriver_local_m"),
+            },
             "contiguity": REGION_CONTIGUITY,
             "min_region_cells": MIN_REGION_CELLS,
             "min_region_eligible_area_ha": MIN_REGION_ELIGIBLE_AREA_HA,
