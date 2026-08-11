@@ -4,7 +4,7 @@ The AOI temporal notebook (`winam_wh_temporal_driver_model.ipynb`) asks "how muc
 hyacinth is there this month"; the spatial-panel notebooks ask "where is it". This
 notebook asks the question in between: divide Winam Gulf into a handful of FIXED,
 ecologically meaningful regions, build ONE water-hyacinth time series per region,
-and fit a hierarchical dynamic driver model to the resulting region x month panel.
+and fit a dynamic panel regression to the resulting region x month panel.
 
 It reuses the loading, provenance, calendar-handling and area-weighted aggregation
 logic of the existing notebooks. It does NOT replace them, and it does not treat
@@ -47,7 +47,7 @@ md('<a href="https://colab.research.google.com/github/Qalani/Dissertation/blob/m
    '<img src="https://colab.research.google.com/assets/colab-badge.svg" '
    'alt="Open In Colab"/></a>')
 
-md(r"""# Winam Gulf water hyacinth — **regional hierarchical dynamic** driver model
+md(r"""# Winam Gulf water hyacinth — **regional dynamic panel** driver model
 
 **Question this notebook answers.** Does splitting Winam Gulf into a small number
 of fixed, ecologically meaningful regions reveal environmental driver information
@@ -111,11 +111,11 @@ from the regional design.
 | 9 | **Region-month panel** — the inferential dataset |
 | 10 | **Does the regional design add information?** Driver variance decomposition |
 | 11 | Model dataset, standardisation, missing-data audit |
-| 12 | The PyMC hierarchical dynamic model (one builder, several structures) |
+| 12 | The estimator — panel regression with AR(p) errors, month-clustered SEs |
 | 13 | Step 1 — persistence structure selected on the **no-driver** model |
-| 14 | Step 2 — matched `regional_dynamic_null` vs `regional_dynamic_full` |
-| 15 | Diagnostics, the simplification ladder, prior sensitivity |
-| 16 | Posterior inference — ROPE, sign probabilities, conservative verdicts |
+| 14 | Step 2 — matched null vs full: AICc and a month-clustered F-test |
+| 15 | Diagnostics — residual autocorrelation, stationarity, collinearity, influence |
+| 16 | Driver associations — clustered CIs, ROPE, conservative verdicts |
 | 17 | Temporal validation — expanding-window, one calendar month ahead |
 | 18 | Regional transfer — leave-one-region-out |
 | 19 | Regionalisation sensitivity |
@@ -125,17 +125,21 @@ from the regional design.
 | 23 | Validation assertion table |
 | 24–25 | How to read the model; implementation summary |
 
-## Two run modes
+## How long it takes
 
-`FAST_MODE = True` (the default in the repo) runs short chains, few validation
-origins and a reduced sensitivity grid, so the notebook can be executed
-end-to-end for development. **`FAST_MODE = False` is the configuration any
-reported number must come from**; §3f states it explicitly and every exported
-table records which mode produced it.
+**The whole notebook runs in well under a minute.** Every model is a least-squares
+fit: the estimator has no shortcuts to take and no sampler to converge, so
+`FAST_MODE` does **not** weaken any fit. It changes one thing only — how many of
+the predeclared §19 regionalisation variants are re-run — and every exported
+table still records which mode produced it. **`FAST_MODE = False` is the
+configuration any reported number must come from.**
+
+Because a validation fold costs milliseconds rather than hours, §17 uses **every
+feasible origin** rather than a handful, and §18 withholds **every** region.
 
 `USE_SYNTHETIC_DEMO = True` builds a synthetic *cell-month panel* — geography,
 static covariates, gulf-wide and regionally-varying drivers, a known common
-AR(1) state, known regional intercepts and known driver slopes — and runs the
+temporal signal, known regional intercepts and known driver slopes — and runs the
 entire pipeline, regionalisation included, with no Google Drive. It is a
 recovery test, never a result: every exported table carries `is_synthetic`.
 """)
@@ -146,15 +150,18 @@ recovery test, never a result: every exported table carries `is_synthetic`.
 # ===========================================================================
 md("""## 1. Install packages
 
-Colab has numpy / pandas / scipy / statsmodels / matplotlib already. **PyMC and
-ArviZ are required** for §12–§19 (`pip install pymc arviz`); on Colab this takes
-a couple of minutes. `geopandas` is optional and only affects the GeoPackage
-export and the shoreline overlay on the map — the region map itself is drawn
-from the grid cells with matplotlib and needs nothing extra.
+**Nothing needs installing.** Colab already has numpy / pandas / scipy /
+statsmodels / matplotlib, and every model in this notebook is a least-squares
+fit in statsmodels. The whole of §12–§19 runs in seconds.
+
+`geopandas` is optional and only affects the GeoPackage export and the shoreline
+overlay on the map — the region map itself is drawn from the grid cells with
+matplotlib and needs nothing extra. `shapely` and `pyproj` (both bundled with
+geopandas, and both already present on Colab) are used in §7a-ii for the river
+network.
 """)
 
-code("""# Colab: run once per runtime. PyMC pulls in pytensor and a C toolchain.
-# !pip -q install pymc arviz
+code("""# Colab: nothing to install. Uncomment only if a runtime is missing them.
 # !pip -q install geopandas          # optional: GeoPackage export + shoreline overlay
 """)
 
@@ -213,19 +220,6 @@ except Exception:  # pragma: no cover - non-IPython
 
 print(f"Colab: {IN_COLAB} | Drive mounted: {DRIVE_MOUNTED}")
 print(f"numpy {np.__version__} | pandas {pd.__version__} | statsmodels {sm.__version__}")
-
-# --- PyMC / ArviZ: REQUIRED for the hierarchical model (§12-§19) -------------
-try:
-    import pymc as pm
-    import pytensor.tensor as pt
-    import arviz as az
-    HAVE_PYMC = True
-    print(f"pymc {pm.__version__} | arviz {az.__version__}")
-except Exception as exc:
-    HAVE_PYMC = False
-    pm = pt = az = None
-    print("PyMC/ArviZ unavailable -> §12-§19 will be SKIPPED (not silently "
-          f"replaced by something weaker): {exc}")
 
 # --- geopandas: OPTIONAL, for the GeoPackage export and shoreline overlay ----
 try:
@@ -500,9 +494,9 @@ REGION_COUNT_TARGET = (6, 12)
 
 # ...and a HARD floor, which is not a preference. ONE REGION IS NOT A REGIONAL
 # DESIGN. With R = 1 the between-region variances have no groups to be estimated
-# from, the shared latent state g_t becomes one free value per observation (a
-# saturated model whose p_loo exceeds its own n), and §10's between-region
-# variance shares are 0 by ARITHMETIC rather than by measurement — which then
+# from, every month-cluster holds a single observation so the clustered
+# covariance has nothing to pool over, and §10's between-region variance shares
+# are 0 by ARITHMETIC rather than by measurement — which then
 # reads as "no driver varies regionally" when nothing was actually tested.
 # §8a stops the run rather than emitting tables that look like results.
 REGION_COUNT_HARD_MIN = 2
@@ -589,134 +583,82 @@ REGIONAL_DEGENERATE_COLS = {
 
 # PREDECLARED random-slope candidates, in preference order. Only terms that §10
 # labels `spatiotemporal` are eligible, and at most RANDOM_SLOPE_MAX_TERMS are
-# used, because a random-slope variance estimated from <= 12 regions is weakly
-# identified. Declared here so the choice cannot be made after seeing a posterior.
+# used. Declared here so the choice cannot be made after seeing a result.
 RANDOM_SLOPE_CANDIDATES = ["rain_chirps_30d_mm", "wave_exposure_idx"]
 RANDOM_SLOPE_MAX_TERMS = 2
-# Below this many usable regions the model drops random slopes entirely and keeps
-# partially pooled intercepts + common slopes (+ at most one interaction).
-# Ten, not six: a between-region slope VARIANCE estimated from a handful of
-# groups is prior-dominated, and reporting it as a measurement is exactly the
-# failure this notebook exists to avoid.
+# Below this many usable regions the model drops random slopes entirely and
+# keeps region intercepts + common slopes. Ten, not six: a between-region slope
+# pattern described by a handful of groups is not a measurement of regional
+# heterogeneity, and reporting it as one is exactly the failure this notebook
+# exists to avoid.
 RANDOM_SLOPE_MIN_REGIONS = 10
-# Parameterisation of the regional slope deviations b_{r,k}.
-#   "centred"    - b ~ Normal(0, sigma_b). The right choice when the data INFORM
-#                  the regional slopes, which is the only case in which a random
-#                  slope is kept at all: §10c admits a term only when it has
-#                  genuine within-month regional variation. Default.
-#   "noncentred" - b = sigma_b * z. The right choice when the data barely inform
-#                  them - but then the term does not belong in the model.
-# The wrong choice biases nothing; it produces a funnel, max-tree-depth
-# trajectories and a fit that takes an hour to fail. §15's ladder switches
-# parameterisation before it gives up on the random slopes altogether.
-RANDOM_SLOPE_PARAMETERISATION = "centred"
-# Parameterisation of the partially pooled regional intercepts alpha_r and the
-# shared-state loadings lambda_r. It matters more than the random slopes, because
-# these exist in EVERY model this notebook fits:
-#   "centred"    - alpha ~ Normal(mu_alpha, sigma_alpha). The DEFAULT. On the
-#                  synthetic recovery panel it began with zero divergences and
-#                  the ladder reached a passing configuration in two rungs.
-#                  Starting non-centred instead produced 114 divergences on the
-#                  first fit, changed which shared state §13 selected, and the
-#                  ladder did not recover from it at those settings.
-#   "noncentred" - alpha = mu_alpha + sigma_alpha * z. The conventional default
-#                  for hierarchical models, and better when sigma_alpha is small
-#                  relative to what the data can resolve. Reached by the ladder.
-# Neither is universally right, and the difference interacts with which shared
-# state §13 selects, which is exactly why §15's ladder switches this BEFORE it
-# simplifies the model: a funnel is a geometry problem, not evidence against a
-# term. Choosing wrongly costs mixing, never correctness.
-HIERARCHY_PARAMETERISATION = "centred"
 
 # =====================================================================
-# 3f. Model and sampling
+# 3f. Model and estimator
 # =====================================================================
 SEASON_HARMONICS = 2       # deterministic annual Fourier pairs (2 -> 4 columns)
 INCLUDE_TREND = True       # common long-term linear trend on the scaled month index
 
-# Candidate structures for the SHARED latent state g_t. The AOI temporal model's
-# AR interval included a unit root, so the local-level (random-walk) alternative
-# is fitted as a genuine candidate, not a footnote. Selection happens on the
-# NO-DRIVER model (§13), before any driver posterior is looked at.
-COMMON_STATE_CANDIDATES = ["ar1", "randomwalk", "none"]
-# Region-specific temporal dependence u_{r,t}: one common rho (default) or one per
-# region. §15's simplification ladder falls back from "per_region" to "common".
-REGIONAL_AR_MODE = "common"           # "common" | "per_region" | "none"
-
-# Weakly informative, regularising priors on the STANDARDISED scale. Every driver
-# is z-scored, and the response is logit cover, so a slope of 0.5 is already a
-# large effect (a 1 SD driver move shifting the odds by ~65%).
-PRIORS = {
-    "mu_alpha_sd": 1.5,
-    "sigma_alpha": 1.0,      # HalfNormal scale, between-region intercept SD
-    "beta_sd": 0.5,          # gulf-wide driver slopes
-    "sigma_b": 0.25,         # HalfNormal scale, between-region slope SD
-    "season_sd": 0.5,
-    "trend_sd": 0.25,
-    "sigma_g": 0.5,          # HalfNormal scale, shared-state innovation SD
-    "sigma_lambda": 0.3,     # HalfNormal scale, regional loading spread around 1
-    "sigma_u": 0.4,          # HalfNormal scale, regional AR innovation SD
-    "sigma_eps": 0.5,        # HalfNormal scale, observation noise
-    "rho_a": 2.0,            # Beta(a, b) on every stationary AR parameter,
-    "rho_b": 2.0,            # constrained to the unit interval (0, 1)
-}
-# Prior-sensitivity variants (§15e): the same model refit with tighter and looser
-# regularisation. Conclusions that move between these are reported as fragile.
-PRIOR_VARIANTS = {
-    "tight": {"beta_sd": 0.25, "sigma_b": 0.15, "sigma_alpha": 0.5},
-    "loose": {"beta_sd": 1.0, "sigma_b": 0.5, "sigma_alpha": 2.0},
-}
-
 # Region of practical equivalence on the STANDARDISED LOGIT scale. A |slope|
 # below this is practically zero: a 1 SD driver change moving the log-odds of
 # cover by less than 0.05 is not an ecologically interesting association at this
-# sample size. Configured explicitly, never inferred from the posterior.
+# sample size. Configured explicitly, never inferred from a fit.
 ROPE_HALFWIDTH = 0.05
-HDI_PROB = 0.95
+HDI_PROB = 0.95                       # confidence level for every interval
 
 FAST_MODE = True
-# target_accept is 0.95 even in FAST mode: the funnel in a hierarchical
-# state-space model is a property of the geometry, not of the draw count, and a
-# development run full of spurious divergences would send §15's simplification
-# ladder chasing a sampler problem rather than a model problem.
-SAMPLING_FAST = dict(draws=300, tune=700, chains=4, cores=4,
-                     target_accept=0.95, random_seed=20260810)
-# THE FINAL, DOCUMENTED CONFIGURATION. Every reported number must come from a run
-# with FAST_MODE = False.
-SAMPLING_FINAL = dict(draws=2000, tune=2000, chains=4, cores=4,
-                      target_accept=0.95, random_seed=20260810)
-# Cheaper settings for the many refits in §17-§19. Still four chains, because a
-# refit with unusable diagnostics is not a cheaper answer, it is no answer.
-SAMPLING_REFIT_FAST = dict(draws=200, tune=500, chains=4, cores=4,
-                           target_accept=0.93, random_seed=20260810)
-SAMPLING_REFIT_FINAL = dict(draws=750, tune=1500, chains=4, cores=4,
-                            target_accept=0.95, random_seed=20260810)
+# FAST_MODE no longer changes the ESTIMATOR — every fit is least squares and
+# takes milliseconds, so there is nothing to shorten. It changes only how many
+# predeclared SENSITIVITY VARIANTS §19 runs, and it is still recorded on every
+# export, because a run that skipped most of its robustness checks is not the
+# run a number should be quoted from.
+
+# Regression with AR(p) errors on the region-month panel (§12), fitted by
+# iterated Cochrane-Orcutt and reported with MONTH-CLUSTERED standard errors.
+#
+# The AR order is CHOSEN in §13 by AICc, on the no-driver model, from
+# 0..AR_MAX_LAGS. AR_MAX_LAGS also fixes the estimation sample: only rows whose
+# calendar lags 1..AR_MAX_LAGS are observed months can be quasi-differenced, and
+# holding that sample fixed is what makes the candidates' AICc values, and the
+# null/full pair, comparable.
+AR_MAX_LAGS = 2
+AR_MAX_ITER = 25                      # Cochrane-Orcutt iterations
+# Standard errors cluster on CALENDAR MONTH: every region observed in the same
+# month counts as ONE independent unit. For a driver with one gulf-wide value per
+# month this makes the effective sample size the number of months, which is
+# exactly the claim §10 makes and the reason this notebook exists.
+CLUSTER_ON = "month"
+# Below this many clusters the clustered covariance is itself unreliable.
+MIN_MONTH_CLUSTERS = 20
 
 # Diagnostic thresholds required before a coefficient may be reported (§15).
-DIAG_MAX_RHAT = 1.01
-DIAG_MIN_ESS_BULK = 400
-DIAG_MIN_ESS_TAIL = 400
-DIAG_MAX_DIVERGENCES = 0
+RESID_ACF_MAX_LAG = 12
+LJUNG_BOX_LAGS = 3                    # calendar lags tested for leftover persistence
+LJUNG_BOX_ALPHA = 0.05
+MAX_DRIVER_VIF = 10.0                 # collinearity among the driver columns
+INFLUENCE_MAX_SHIFT = 0.10            # leave-one-calendar-month-out coefficient shift
 
 # =====================================================================
 # 3g. Validation
 # =====================================================================
 # Expanding-window, ONE-calendar-month-ahead prediction.
 VAL_MIN_TRAIN_MONTHS = 36        # observed calendar months before the first origin
-VAL_MAX_ORIGINS_FAST = 3         # FAST_MODE cap; None (final) = every feasible origin
-VAL_MAX_ORIGINS_FINAL = None
+# EVERY feasible origin is used. A cap existed only because each fold meant two
+# MCMC refits; a fold is now milliseconds, so there is no cap to justify and no
+# question of one landing in a single season.
+VAL_MAX_ORIGINS = None
+VAL_MIN_TRAIN_ROWS = 40          # training region-months a fold must have
 # Drivers must be knowable at the origin. Anything with an a-priori lag of 0 is
 # moved to lag 1 for the FORECAST evaluation (the a-priori specification is kept
 # unchanged for the §14/§16 association inference - different questions).
 VAL_FORECAST_MIN_LAG = 1
 # Calendar MONTHS are the resampling unit for uncertainty on performance
 # differences. Regions within a month are not independent replicates.
-VAL_BOOTSTRAP_N = 2000
-VAL_BOOTSTRAP_SEED = 11
+VAL_BOOTSTRAP_DRAWS = 2000
+VAL_MIN_BOOTSTRAP_MONTHS = 8     # below this no interval is formed, it is withheld
 
 RUN_LORO = True                  # leave-one-region-out transfer (§18)
-LORO_MAX_REGIONS_FAST = 2        # FAST_MODE cap on how many regions are withheld
-LORO_MAX_REGIONS_FINAL = None
+LORO_MAX_REGIONS = None          # every region; each refit is milliseconds
 
 # =====================================================================
 # 3h. Regionalisation sensitivity (§19)
@@ -751,16 +693,13 @@ except Exception as exc:
     OUTPUT_WRITABLE = False
     print(f"OUTPUT_DIR not writable ({exc}); §21 will skip the exports.")
 
-SAMPLING = dict(SAMPLING_FAST if FAST_MODE else SAMPLING_FINAL)
-SAMPLING_REFIT = dict(SAMPLING_REFIT_FAST if FAST_MODE else SAMPLING_REFIT_FINAL)
-VAL_MAX_ORIGINS = VAL_MAX_ORIGINS_FAST if FAST_MODE else VAL_MAX_ORIGINS_FINAL
-LORO_MAX_REGIONS = LORO_MAX_REGIONS_FAST if FAST_MODE else LORO_MAX_REGIONS_FINAL
 SENSITIVITY_VARIANTS = (SENSITIVITY_VARIANTS_FAST if FAST_MODE
                         else list(REGIONALISATION_VARIANTS))
 
 print("Configuration loaded.")
 print(f"  mode              : {'FAST (development)' if FAST_MODE else 'FINAL (reportable)'}")
-print(f"  sampling          : {SAMPLING}")
+print(f"  estimator         : regression with AR(p<={AR_MAX_LAGS}) errors, "
+      f"{CLUSTER_ON}-clustered SEs, {int(HDI_PROB * 100)}% intervals")
 print(f"  mechanisms        : {len(REGIONAL_FORCING_TERMS)}")
 print(f"  ROPE (std. logit) : +/- {ROPE_HALFWIDTH}")
 print(f"  region thresholds : {REGION_THRESHOLDS}")
@@ -2757,11 +2696,12 @@ if len(REGIONS) < REGION_COUNT_HARD_MIN:
         f"  '{_dom['region_type']}' holds {_dom['cell_share']:.1%} of eligible "
         f"cells and {_dom['area_share']:.1%} of eligible area.\n"
         "  A single region is not a regional design. With R = 1:\n"
-        "    - the between-region variances (sigma_alpha, sigma_b, sigma_lambda) "
-        "have no groups to be estimated from and are pure prior;\n"
-        "    - the shared latent state g_t becomes one free value per "
-        "observation, so the model is saturated and its p_loo exceeds its own "
-        "n, which invalidates every LOO comparison;\n"
+        "    - there is no between-region variation at all, so the regional "
+        "design cannot answer the question it exists to ask;\n"
+        "    - there is no cross-region variation for the month-clustered "
+        "covariance to measure, so every cluster holds exactly one "
+        "observation and the standard errors lose the very correction they "
+        "exist to make;\n"
         "    - §10's between-region variance shares are 0 by ARITHMETIC, not by "
         "measurement, and would read as 'no driver varies regionally' when "
         "nothing was tested.\n"
@@ -2785,12 +2725,12 @@ _lo, _hi = REGION_COUNT_TARGET
 if len(REGIONS) < _lo:
     print(f"\n*** {len(REGIONS)} regions is below the {_lo}-{_hi} target band. "
           "Consequence for hierarchical estimation: the between-region variances "
-          "(sigma_alpha, sigma_b, sigma_lambda) are estimated from very few "
-          "groups, so they are weakly identified and their priors will do much of "
-          "the work. §12 therefore drops random slopes below "
+          "are described by very few groups, so the spread of the region "
+          "intercepts is a statement about those few regions and nothing wider. "
+          "§12 therefore drops random slopes below "
           f"RANDOM_SLOPE_MIN_REGIONS={RANDOM_SLOPE_MIN_REGIONS} regions, and §16 "
-          "reports partial pooling as a shrinkage statement rather than a "
-          "variance estimate. ***")
+          "reports the spread of the region intercepts descriptively rather "
+          "than as a variance component. ***")
 elif len(REGIONS) > _hi:
     print(f"\nNote: {len(REGIONS)} regions exceeds the {_lo}-{_hi} target band. "
           "More regions means shorter, noisier individual series; the minimum-size "
@@ -3274,19 +3214,17 @@ print(f"\n{N_REGIONS} usable region(s) enter the model.")
 if N_REGIONS < REGION_COUNT_TARGET[0]:
     print(f"*** Fewer than {REGION_COUNT_TARGET[0]} usable regions. The "
           "hierarchical variances are then estimated from very few groups: "
-          "partial pooling still regularises the regional intercepts, but "
-          "sigma_alpha / sigma_b / sigma_lambda are prior-dominated and must not "
-          "be read as measurements of between-region heterogeneity. §12 "
-          "simplifies the random-effects structure accordingly and §22 says so "
-          "in the synthesis. ***")
+          "the region intercepts are still estimated, but their spread "
+          "describes THESE regions and is not an estimate of between-region "
+          "heterogeneity in any wider population. §12 estimates them as fixed "
+          "effects and §16b reports them descriptively. ***")
 if N_REGIONS < 4:
-    print(f"*** With {N_REGIONS} region(s) there are at most {N_REGIONS} "
-          "observations per calendar month, while the shared latent state g_t "
-          "has ONE free value per month. The state is therefore weakly "
-          "identified against the observations it is meant to summarise, the "
-          "sampler will show it as divergences and low ESS in §15, and PSIS-LOO "
-          "will report p_loo close to (or above) the likelihood row count. §16b "
-          "checks for exactly that and says so. ***")
+    print(f"*** With {N_REGIONS} region(s) each calendar-month cluster holds at "
+          f"most {N_REGIONS} observation(s). Clustering on month is what makes "
+          "the effective sample size the number of months rather than the "
+          "number of region-months, but with this few regions per month there "
+          "is very little cross-region dependence for it to absorb, and §15b "
+          "checks the cluster count directly. ***")
 ''')
 
 code(r'''# =====================================================================
@@ -3743,7 +3681,7 @@ register("random_slope_decision", RANDOM_SLOPE_DECISION, "provenance")
 if RANDOM_SLOPE_TERMS:
     print(f"Random slopes on: {RANDOM_SLOPE_TERMS}")
 else:
-    print("Random slopes: NONE — partially pooled regional intercepts and common "
+    print("Random slopes: NONE — region intercepts and common "
           "driver slopes only. An elaborate random-effects structure is not kept "
           "merely because it runs.")
 ''')
@@ -3915,339 +3853,85 @@ register("placeholder_audit", PLACEHOLDER_AUDIT, "provenance")
 # ===========================================================================
 # 12. The model
 # ===========================================================================
-md(r"""## 12. The hierarchical dynamic model
+md(r"""## 12. The panel dynamic regression
 
-$$y_{r,t}= \alpha_r + s_t + \tau t
-+ \sum_k\big(\beta_k+b_{r,k}\big)x_{r,t,k}
-+ \lambda_r g_t + u_{r,t} + \epsilon_{r,t}$$
+One equation, fitted by least squares in a fraction of a second. For region $r$
+in calendar month $t$:
 
-| Term | What it is | Prior (standardised scale) |
-|---|---|---|
-| $\alpha_r$ | partially pooled regional intercept | $\mu_\alpha+\sigma_\alpha z_r$, non-centred |
-| $s_t$ | deterministic annual Fourier terms | $\mathcal N(0,\texttt{season\_sd})$ |
-| $\tau t$ | optional common long-term trend | $\mathcal N(0,\texttt{trend\_sd})$ |
-| $\beta_k$ | gulf-wide mean association | $\mathcal N(0,\texttt{beta\_sd})$ |
-| $b_{r,k}$ | regularised regional deviation | $\sigma_{b,k}z_{r,k}$, non-centred |
-| $g_t$ | shared latent state — gulf-wide persistence and unmeasured common shocks | AR(1) **or** local level |
-| $\lambda_r$ | regional loading on that shared state | $1+\sigma_\lambda z_r$ |
-| $u_{r,t}$ | region-specific temporal dependence | AR(1) |
-| $\epsilon_{r,t}$ | observation noise | see below |
+$$y_{r,t} \;=\; \alpha_r \;+\; \mathbf{s}_t'\boldsymbol\gamma \;+\; \tau\,t
+\;+\; \mathbf{x}_{r,t}'\boldsymbol\beta \;+\; e_{r,t},
+\qquad
+e_{r,t} \;=\; \sum_{j=1}^{p}\rho_j\,e_{r,t-j} \;+\; v_{r,t}$$
 
-$$g_t=\rho_g g_{t-1}+\eta_t, \qquad u_{r,t}=\rho_r u_{r,t-1}+\zeta_{r,t}$$
+with $y_{r,t} = \operatorname{logit}$ of regional WH cover, $\alpha_r$ a
+**region intercept**, $\mathbf{s}_t$ the deterministic annual Fourier terms,
+$\tau$ an optional linear trend, and $\mathbf{x}_{r,t}$ the predeclared drivers
+at their a-priori lags.
 
-**Three modelling choices worth defending.**
+### Why this, and what it costs
 
-*Stationary AR parameters are constrained to $(0,1)$* with a $\mathrm{Beta}(2,2)$
-prior. Negative month-to-month persistence in a floating macrophyte is not a
-hypothesis anyone holds, and leaving the interval open to $-1$ buys nothing but a
-bimodal posterior. Stationarity is **not** forced on the common process: the
-random-walk alternative is a separate candidate, selected in §13, precisely
-because the AOI temporal model's AR interval reached a unit root.
+This is the same estimand as a hierarchical dynamic model — a level equation
+with persistent errors — estimated by maximum likelihood instead of MCMC. It
+mirrors the AOI temporal notebook, which fits `SARIMAX(order=(p,0,0))` with
+exogenous regressors: *regression with AR(p) errors*, selected on **AICc**. Using
+one statistical idiom across both analyses is deliberate.
 
-*$\lambda_r$ is centred on 1, not on 0.* A latent state and its loadings are only
-identified up to scale and sign; anchoring the average loading at one fixes both,
-and $\sigma_\lambda$ then measures how differently regions respond to the shared
-state.
+Two things are genuinely lost relative to a hierarchical model, and neither is
+hidden:
 
-*The regional AR innovation and the observation noise are parameterised as a
-total and a split.* $\sigma_u=\sigma\sqrt{\phi}$ and
-$\sigma_\epsilon=\sigma\sqrt{1-\phi}$ with $\phi\sim\mathrm{Beta}(2,2)$. Their
-**sum** is what the data identify well; the split between a weakly autocorrelated
-regional process and white observation noise is intrinsically hard, and putting
-the hard part in a bounded fraction turns a funnel into a well-behaved posterior
-instead of hiding it. §15 reports the split's diagnostics separately, and the
-simplification ladder drops $u_{r,t}$ when it is not separable.
+| Lost | Consequence here |
+|---|---|
+| partial pooling of $\alpha_r$ | region intercepts are **fixed effects**, estimated independently. With ~80 months per region they are precisely estimated anyway, so shrinkage would move them very little — but $\sigma_\alpha$ is no longer a parameter and §16 reports the spread of the $\hat\alpha_r$ descriptively, not as a variance component. |
+| region-varying slopes | not estimated. §10c already refused them whenever fewer than `RANDOM_SLOPE_MIN_REGIONS` regions exist or no driver is `spatiotemporal`, so on this record nothing is given up. |
 
-The **local-level alternative** replaces $g_t$'s AR recursion with a Gaussian
-random walk whose path is centred, so its level stays identified against the
-pooled intercept.
+### The two sources of dependence, and what handles each
+
+A region-month panel is dependent in two directions at once, and an interval
+that ignores either is too narrow:
+
+1. **Across months, within a region** — persistence. Handled *in the mean model*
+   by the AR($p$) error structure, with $p$ chosen in §13 on the **no-driver**
+   model, so the choice cannot be tuned to a driver result. §15 checks with a
+   calendar Ljung-Box that it worked.
+2. **Across regions, within a month** — every region sees the same weather, the
+   same lake, the same satellite pass. Handled *in the standard errors* by
+   **clustering on calendar month**: regions sharing a month count as ONE
+   independent unit.
+
+That second choice is the whole of §10's argument made operational. For a driver
+with one gulf-wide value per month, month-clustering makes the effective sample
+size the number of **months**; the region-months add no independent information
+and the standard errors say so.
+
+### Estimation
+
+Iterated Cochrane-Orcutt: fit by OLS, estimate $\rho$ from calendar-consecutive
+residual pairs, quasi-difference $y$ and every column of $X$, refit, repeat to
+convergence. Quasi-differencing needs lags $1\ldots p$ to be **observed calendar
+months**, so the estimation sample is the rows for which they are — fixed once at
+`AR_MAX_LAGS` so every candidate $p$, and the null and full models alike, are
+fitted on **identical rows**.
 """)
 
 code(r'''# =====================================================================
-# 12. Model builder
+# 12. The estimator — regression with AR(p) errors on the region-month panel
 # =====================================================================
-MODEL_KINDS = {
-    "ar1": "shared latent state g_t ~ AR(1), stationary, rho in (0, 1)",
-    "randomwalk": "shared latent state g_t ~ Gaussian random walk (local level), "
-                  "path centred so its level is identified against the intercept",
-    "none": "no shared latent state",
-}
 
 
 def make_model_data(X_model, Y, obs_mask, season, tt, region_ids, driver_terms,
                     random_slope_terms=()):
-    """Package the arrays the model builder needs, with the observation index."""
+    """Package the arrays the estimator needs, with the observation index."""
     obs_r, obs_t = np.nonzero(obs_mask)
-    rs_idx = [driver_terms.index(t) for t in random_slope_terms
-              if t in driver_terms]
     return {
         "R": int(Y.shape[0]), "T": int(Y.shape[1]), "K": int(X_model.shape[2]),
         "X": X_model, "Y": Y, "obs_mask": obs_mask,
         "obs_r": obs_r, "obs_t": obs_t,
         "y_obs": Y[obs_r, obs_t],
-        "X_obs": X_model[obs_r, obs_t, :] if X_model.shape[2] else
-                 np.zeros((len(obs_r), 0)),
+        "X_obs": (X_model[obs_r, obs_t, :] if X_model.shape[2]
+                  else np.zeros((len(obs_r), 0))),
         "season": season, "tt": np.asarray(tt, dtype=float),
         "region_ids": list(region_ids), "driver_terms": list(driver_terms),
-        "rs_idx": rs_idx,
-        "rs_terms": [driver_terms[i] for i in rs_idx],
     }
-
-
-def build_regional_model(data, drivers=True, common_state="ar1",
-                         regional_ar="common", include_trend=True,
-                         use_random_slopes=True, priors=None,
-                         random_slope_parameterisation=None,
-                         hierarchy_parameterisation=None):
-    """The hierarchical dynamic model. One builder, every structure §13-§19 needs."""
-    if not HAVE_PYMC:
-        raise RuntimeError("PyMC is not available.")
-    P = dict(PRIORS)
-    P.update(priors or {})
-    random_slope_parameterisation = (random_slope_parameterisation
-                                     or RANDOM_SLOPE_PARAMETERISATION)
-    hierarchy_parameterisation = (hierarchy_parameterisation
-                                  or HIERARCHY_PARAMETERISATION)
-    centred = hierarchy_parameterisation == "centred"
-    R_, T_, K_ = data["R"], data["T"], data["K"]
-    obs_r, obs_t = data["obs_r"], data["obs_t"]
-    rs_idx = list(data["rs_idx"]) if (drivers and use_random_slopes) else []
-    coords = {"region": data["region_ids"], "time": np.arange(T_),
-              "season": [f"s{i}" for i in range(data["season"].shape[1])]}
-    if drivers and K_:
-        coords["driver"] = data["driver_terms"]
-    if rs_idx:
-        coords["rs_driver"] = [data["driver_terms"][i] for i in rs_idx]
-
-    with pm.Model(coords=coords) as model:
-        # --- partially pooled regional intercepts (non-centred) --------------
-        mu_alpha = pm.Normal("mu_alpha", 0.0, P["mu_alpha_sd"])
-        sigma_alpha = pm.HalfNormal("sigma_alpha", P["sigma_alpha"])
-        if centred:
-            alpha = pm.Normal("alpha", mu_alpha, sigma_alpha, dims="region")
-        else:
-            alpha = pm.Deterministic(
-                "alpha", mu_alpha + sigma_alpha * pm.Normal("alpha_z", 0, 1,
-                                                            dims="region"),
-                dims="region")
-
-        # --- deterministic season and optional common trend ------------------
-        gamma = pm.Normal("gamma_season", 0.0, P["season_sd"], dims="season")
-        eta = alpha[obs_r] + pt.dot(pt.as_tensor_variable(data["season"])[obs_t],
-                                    gamma)
-        if include_trend:
-            tau = pm.Normal("tau_trend", 0.0, P["trend_sd"])
-            eta = eta + tau * pt.as_tensor_variable(data["tt"])[obs_t]
-
-        # --- drivers ----------------------------------------------------------
-        if drivers and K_:
-            X_obs = pt.as_tensor_variable(data["X_obs"])
-            beta = pm.Normal("beta", 0.0, P["beta_sd"], dims="driver")
-            eta = eta + pt.dot(X_obs, beta)
-            if rs_idx:
-                sigma_b = pm.HalfNormal("sigma_b", P["sigma_b"], dims="rs_driver")
-                if random_slope_parameterisation == "centred":
-                    b = pm.Normal("b", 0.0, sigma_b[None, :],
-                                  dims=("region", "rs_driver"))
-                else:
-                    b = pm.Deterministic(
-                        "b", sigma_b[None, :] * pm.Normal(
-                            "b_z", 0, 1, dims=("region", "rs_driver")),
-                        dims=("region", "rs_driver"))
-                eta = eta + pt.sum(b[obs_r, :] * X_obs[:, rs_idx], axis=1)
-
-        # --- shared latent state ---------------------------------------------
-        if common_state == "ar1":
-            rho_g = pm.Beta("rho_g", P["rho_a"], P["rho_b"])
-            sigma_g = pm.HalfNormal("sigma_g", P["sigma_g"])
-            g = pm.AR("g", rho=pt.stack([rho_g]), sigma=sigma_g,
-                      init_dist=pm.Normal.dist(0.0, sigma_g / pt.sqrt(1 - rho_g ** 2)),
-                      constant=False, ar_order=1, dims="time")
-        elif common_state == "randomwalk":
-            sigma_g = pm.HalfNormal("sigma_g", P["sigma_g"])
-            g_raw = pm.GaussianRandomWalk(
-                "g_raw", sigma=sigma_g, init_dist=pm.Normal.dist(0.0, 1.0),
-                steps=T_ - 1, dims="time")
-            g = pm.Deterministic("g", g_raw - pt.mean(g_raw), dims="time")
-        elif common_state == "none":
-            g = None
-        else:
-            raise ValueError(f"unknown common_state {common_state!r}")
-
-        if g is not None:
-            sigma_lambda = pm.HalfNormal("sigma_lambda", P["sigma_lambda"])
-            if centred:
-                lam = pm.Normal("lam", 1.0, sigma_lambda, dims="region")
-            else:
-                lam = pm.Deterministic(
-                    "lam", 1.0 + sigma_lambda * pm.Normal("lam_z", 0, 1,
-                                                          dims="region"),
-                    dims="region")
-            eta = eta + lam[obs_r] * g[obs_t]
-
-        # --- region-specific temporal dependence + observation noise ----------
-        if regional_ar in ("common", "per_region"):
-            sigma_resid = pm.HalfNormal("sigma_resid_total",
-                                        float(np.hypot(P["sigma_u"], P["sigma_eps"])))
-            frac_u = pm.Beta("frac_u", 2.0, 2.0)
-            sigma_u = pm.Deterministic("sigma_u", sigma_resid * pt.sqrt(frac_u))
-            sigma_eps = pm.Deterministic("sigma_eps",
-                                         sigma_resid * pt.sqrt(1.0 - frac_u))
-            if regional_ar == "common":
-                rho_u = pm.Beta("rho_u", P["rho_a"], P["rho_b"])
-                init_sd = sigma_u / pt.sqrt(1 - rho_u ** 2)
-                u = pm.AR("u", rho=pt.stack([rho_u]), sigma=sigma_u,
-                          init_dist=pm.Normal.dist(0.0, init_sd),
-                          constant=False, ar_order=1,
-                          dims=("region", "time"), shape=(R_, T_))
-            else:
-                rho_u = pm.Beta("rho_u", P["rho_a"], P["rho_b"], dims="region")
-                init_sd = (sigma_u / pt.sqrt(1 - rho_u ** 2))[:, None]
-                u = pm.AR("u", rho=rho_u[:, None], sigma=sigma_u,
-                          init_dist=pm.Normal.dist(0.0, init_sd, shape=(R_, 1)),
-                          constant=False, ar_order=1,
-                          dims=("region", "time"), shape=(R_, T_))
-            eta = eta + u[obs_r, obs_t]
-        elif regional_ar == "none":
-            sigma_eps = pm.HalfNormal("sigma_eps", P["sigma_eps"])
-        else:
-            raise ValueError(f"unknown regional_ar {regional_ar!r}")
-
-        pm.Deterministic("eta_obs", eta)
-        pm.Normal("y", mu=eta, sigma=sigma_eps, observed=data["y_obs"])
-    return model
-
-
-def fit_model(model, sampling=None, label="", prior_predictive=False):
-    """Sample, returning (idata, info). Never silently degrades the chain count."""
-    cfg = dict(SAMPLING if sampling is None else sampling)
-    t0 = time.time()
-    with model:
-        if prior_predictive:
-            prior = pm.sample_prior_predictive(draws=500,
-                                               random_seed=cfg.get("random_seed", 0))
-        idata = pm.sample(progressbar=False,
-                          idata_kwargs={"log_likelihood": True}, **cfg)
-        if prior_predictive:
-            idata.extend(prior)
-    info = {"label": label, "seconds": round(time.time() - t0, 1),
-            "draws": cfg["draws"], "tune": cfg["tune"], "chains": cfg["chains"],
-            "target_accept": cfg["target_accept"],
-            "divergences": int(idata.sample_stats["diverging"].sum()),
-            "fast_mode": bool(FAST_MODE)}
-    return idata, info
-
-
-def diagnostics_table(idata, var_names=None, label=""):
-    """R-hat / ESS / divergence table for an EXPLICIT list of parameters.
-
-    Exact names, not substring matching: `filter_vars="like"` would pull the
-    non-centred auxiliaries (`alpha_z`, `lam_z`, `b_z`, `g_raw`) and the whole
-    latent-state paths into the gate. Those are reparameterisation coordinates
-    and high-dimensional states, and their diagnostics are reported separately
-    (§15b/§15c) rather than allowed to veto a driver coefficient.
-    """
-    have = set(idata.posterior.data_vars)
-    names = [v for v in (var_names or sorted(have)) if v in have]
-    if not names:
-        return pd.DataFrame()
-    summ = az.summary(idata, var_names=names, kind="diagnostics")
-    out = summ.reset_index().rename(columns={"index": "parameter"})
-    out["model"] = label
-    out["divergences"] = int(idata.sample_stats["diverging"].sum())
-    out["n_chains"] = int(idata.posterior.sizes["chain"])
-    return out
-
-
-def gate_diagnostics(diag, max_rhat=None, min_ess_bulk=None, min_ess_tail=None,
-                     max_div=None):
-    """Does this fit clear the reporting gate? Returns (passed, failures)."""
-    max_rhat = DIAG_MAX_RHAT if max_rhat is None else max_rhat
-    min_ess_bulk = DIAG_MIN_ESS_BULK if min_ess_bulk is None else min_ess_bulk
-    min_ess_tail = DIAG_MIN_ESS_TAIL if min_ess_tail is None else min_ess_tail
-    max_div = DIAG_MAX_DIVERGENCES if max_div is None else max_div
-    fails = []
-    if len(diag):
-        if float(diag["divergences"].max()) > max_div:
-            fails.append(f"{int(diag['divergences'].max())} divergent transition(s)")
-        bad_r = diag.loc[diag["r_hat"] > max_rhat, "parameter"].tolist()
-        if bad_r:
-            fails.append(f"R-hat > {max_rhat} for {bad_r[:6]}"
-                         + (" ..." if len(bad_r) > 6 else ""))
-        bad_b = diag.loc[diag["ess_bulk"] < min_ess_bulk, "parameter"].tolist()
-        if bad_b:
-            fails.append(f"bulk ESS < {min_ess_bulk} for {bad_b[:6]}"
-                         + (" ..." if len(bad_b) > 6 else ""))
-        bad_t = diag.loc[diag["ess_tail"] < min_ess_tail, "parameter"].tolist()
-        if bad_t:
-            fails.append(f"tail ESS < {min_ess_tail} for {bad_t[:6]}"
-                         + (" ..." if len(bad_t) > 6 else ""))
-        if int(diag["n_chains"].max()) < 4:
-            fails.append(f"only {int(diag['n_chains'].max())} chains")
-    else:
-        fails.append("no diagnostics produced")
-    return (not fails), fails
-
-
-# Parameters whose diagnostics GATE what §16 may report: the interpretable,
-# low-dimensional quantities the notebook actually quotes.
-REPORTED_PARAMS = ["beta", "b", "sigma_b", "mu_alpha", "sigma_alpha", "alpha",
-                   "gamma_season", "tau_trend", "rho_g", "sigma_g",
-                   "sigma_lambda", "lam", "rho_u", "sigma_resid_total"]
-# Diagnosed and REPORTED, but not blocking:
-#   * the latent state paths g and u - hundreds of correlated values whose
-#     individual tail ESS is not what a driver coefficient depends on (§15b);
-#   * the variance SPLIT sigma_u / sigma_eps / frac_u, whose weak identification
-#     is a known structural property while their total is well identified
-#     (§15c);
-#   * the non-centred auxiliaries alpha_z / lam_z / b_z / g_raw, which are
-#     coordinates rather than quantities - the transformed alpha, lam and b are
-#     gated in their place.
-STATE_PARAMS = ["g", "u"]
-
-MODEL_DATA = make_model_data(X_MODEL, Y_RAW, OBS_MASK, SEASON, TT, REGION_IDS,
-                             DRIVER_TERMS,
-                             random_slope_terms=[
-                                 t for t in DRIVER_TERMS
-                                 if any(t.startswith(c) for c in RANDOM_SLOPE_TERMS)])
-print(f"Model data: R={MODEL_DATA['R']} regions, T={MODEL_DATA['T']} calendar "
-      f"months, K={MODEL_DATA['K']} drivers, {len(MODEL_DATA['y_obs']):,} "
-      f"likelihood rows.")
-print(f"Random-slope terms in the model data: {MODEL_DATA['rs_terms'] or 'none'}")
-''')
-
-
-# ===========================================================================
-# 13. Persistence structure, chosen on the no-driver model
-# ===========================================================================
-md(r"""## 13. Step 1 — which persistence structure does the record support?
-
-The structure is locked **before** a single environmental variable is added, so
-the choice cannot be made by whichever dependence structure flatters a driver.
-Every candidate carries the same partially pooled intercepts, the same
-deterministic season, the same trend and the same regional AR — they differ only
-in the shared state $g_t$:
-
-* `ar1` — stationary AR(1), $\rho_g\in(0,1)$;
-* `randomwalk` — a local level, fitted because the AOI temporal model's AR
-  interval reached a unit root, so a stationary AR may simply be the wrong shape;
-* `none` — no shared state at all, which is the honest null if the regions do not
-  in fact move together.
-
-**What the selection criteria are, and what they are not.** PSIS-LOO on a latent
-state model scores *conditional* predictive fit with the states in place; it is
-not a forecast. It is used here as the primary criterion because all three
-candidates are scored the same way on the same rows, and it is reported next to
-the diagnostics, the boundary behaviour of $\rho_g$, and the calendar-lag ACF of
-the residuals. Genuine one-month-ahead forecasting is §17's job, and it is done
-on the *selected* structure. A candidate with divergences is not selected
-whatever its elpd, and when two candidates are within one standard error of each
-other the **simpler** one wins.
-""")
-
-code(r'''# =====================================================================
-# 13a. Fit the candidate null dynamics
-# =====================================================================
 
 
 def calendar_acf(values, month_pos, max_lag=12):
@@ -4272,1095 +3956,806 @@ def calendar_acf(values, month_pos, max_lag=12):
     return pd.DataFrame(rows)
 
 
-def residual_frame(idata, data, month_grid, region_ids):
-    """Observation residuals y - posterior-mean eta, with region and month keys."""
-    eta = idata.posterior["eta_obs"].mean(dim=("chain", "draw")).to_numpy()
+def calendar_ljung_box(values, month_pos, lags=3):
+    """Ljung-Box on CALENDAR lags, dropping lags with no calendar pairs.
+
+    The standard statistic assumes an unbroken series. A third of this record's
+    months carry no WH map, so the test is built from the calendar ACF and its
+    degrees of freedom count only the lags that had pairs to measure.
+    """
+    a = calendar_acf(values, month_pos, lags)
+    a = a[np.isfinite(a["acf"]) & (a["n_pairs"] > 2)]
+    n = int(np.isfinite(np.asarray(values, dtype=float)).sum())
+    if not len(a) or n <= len(a) + 1:
+        return {"stat": np.nan, "df": 0, "p_value": np.nan, "n_pairs": 0}
+    stat = float(n * (n + 2) * np.sum(a["acf"].to_numpy() ** 2
+                                      / (n - a["lag"].to_numpy())))
+    df = int(len(a))
+    return {"stat": stat, "df": df,
+            "p_value": float(sstats.chi2.sf(stat, df)),
+            "n_pairs": int(a["n_pairs"].min())}
+
+
+def residual_frame_from_fit(fit, data, month_grid, region_ids):
+    """Level residuals y - Xb with region and calendar-month keys."""
+    rows = fit["rows"]
+    obs_r = np.asarray(data["obs_r"])[rows]
+    obs_t = np.asarray(data["obs_t"])[rows]
+    y = np.asarray(data["y_obs"], dtype=float)[rows]
+    e = np.asarray(fit["resid_level"], dtype=float)[rows]
     return pd.DataFrame({
-        "region_id": [region_ids[i] for i in data["obs_r"]],
-        "month": [month_grid[i] for i in data["obs_t"]],
-        "month_pos": data["obs_t"],
-        "y": data["y_obs"], "eta": eta, "resid": data["y_obs"] - eta})
+        "region_id": [region_ids[i] for i in obs_r],
+        "month": [month_grid[i] for i in obs_t],
+        "month_pos": obs_t, "y": y, "eta": y - e, "resid": e})
 
 
+def aicc_from(llf, k, n):
+    """AICc = -2 logL + 2k + 2k(k+1)/(n-k-1).
+
+    Same definition as the AOI temporal notebook, so the two analyses' model
+    selections are directly comparable. `n` is the number of rows actually in
+    the likelihood, never the size of the calendar grid.
+    """
+    llf, k, n = float(llf), int(k), int(n)
+    if n - k - 1 <= 0:
+        return np.inf
+    return -2.0 * llf + 2.0 * k + (2.0 * k * (k + 1)) / (n - k - 1)
+
+
+def gaussian_llf(resid, n=None):
+    """Concentrated Gaussian log-likelihood of an OLS/GLS residual vector."""
+    r = np.asarray(resid, dtype=float)
+    n = int(len(r) if n is None else n)
+    if n <= 0:
+        return np.nan
+    s2 = float(np.sum(r ** 2) / n)
+    if not np.isfinite(s2) or s2 <= 0:
+        return np.inf
+    return -0.5 * n * (np.log(2.0 * np.pi * s2) + 1.0)
+
+
+def lag_row_index(obs_r, obs_t, lag):
+    """Row index of the same REGION exactly `lag` CALENDAR months earlier, or -1.
+
+    Calendar-first, exactly as everywhere else in this notebook: the lag reaches
+    the previous calendar month, never the previous observed row. A month that
+    was excluded therefore breaks the chain instead of quietly shortening it.
+    """
+    pos = {(int(r), int(t)): i for i, (r, t) in enumerate(zip(obs_r, obs_t))}
+    return np.array([pos.get((int(r), int(t) - int(lag)), -1)
+                     for r, t in zip(obs_r, obs_t)], dtype=int)
+
+
+def ar_estimation_rows(obs_r, obs_t, max_lags):
+    """Rows whose lags 1..max_lags all exist, and the lag index for each lag.
+
+    Fixing this ONCE at `max_lags` is what makes AICc comparable across
+    candidate orders: every candidate, and the null and full models, are fitted
+    on the same rows.
+    """
+    idx = {L: lag_row_index(obs_r, obs_t, L) for L in range(1, int(max_lags) + 1)}
+    ok = np.ones(len(obs_r), dtype=bool)
+    for L in range(1, int(max_lags) + 1):
+        ok &= idx[L] >= 0
+    return ok, idx
+
+
+def panel_design(data, rows, drivers=True, include_trend=True,
+                 region_ids=None, drop_terms=()):
+    """The design matrix on `rows` of the observation index.
+
+    Region intercepts enter as a full set of dummies with NO global constant, so
+    each column's coefficient IS that region's intercept and no region is an
+    implicit baseline.
+    """
+    obs_r, obs_t = data["obs_r"][rows], data["obs_t"][rows]
+    rid = list(region_ids if region_ids is not None else data["region_ids"])
+    cols, names, groups = [], [], []
+
+    for i, r in enumerate(rid):
+        cols.append((obs_r == i).astype(float))
+        names.append(f"alpha[{r}]")
+        groups.append("region")
+
+    S = np.asarray(data["season"], dtype=float)
+    for j in range(S.shape[1]):
+        cols.append(S[obs_t, j])
+        names.append(f"season[s{j}]")
+        groups.append("season")
+
+    if include_trend:
+        cols.append(np.asarray(data["tt"], dtype=float)[obs_t])
+        names.append("trend")
+        groups.append("trend")
+
+    if drivers and data["K"]:
+        X = data["X"][data["obs_r"], data["obs_t"], :][rows, :]
+        for k, term in enumerate(data["driver_terms"]):
+            if term in drop_terms:
+                continue
+            cols.append(X[:, k])
+            names.append(term)
+            groups.append("driver")
+
+    X = np.column_stack(cols) if cols else np.zeros((int(rows.sum()), 0))
+    return X, names, groups
+
+
+def estimate_ar_coeffs(resid, rows, lag_index, p):
+    """AR(p) coefficients of the residual process, on calendar-consecutive rows.
+
+    Regressing the residual on its own calendar lags. `resid` is indexed by the
+    FULL observation index; `rows` selects the estimation sample.
+    """
+    if int(p) <= 0:
+        return np.zeros(0)
+    r = np.asarray(resid, dtype=float)
+    y = r[rows]
+    L = np.column_stack([r[lag_index[j][rows]] for j in range(1, int(p) + 1)])
+    ok = np.isfinite(y) & np.all(np.isfinite(L), axis=1)
+    if ok.sum() <= p + 1:
+        return np.zeros(int(p))
+    coef, *_ = np.linalg.lstsq(L[ok], y[ok], rcond=None)
+    return np.asarray(coef, dtype=float)
+
+
+def quasi_difference(vec_full, rows, lag_index, rho):
+    """v_t - sum_j rho_j v_{t-j} on `rows`, using CALENDAR lags."""
+    v = np.asarray(vec_full, dtype=float)
+    out = v[rows].copy()
+    for j, rj in enumerate(np.atleast_1d(rho), start=1):
+        out = out - float(rj) * v[lag_index[j][rows]]
+    return out
+
+
+def fit_panel_ar(data, p=0, drivers=True, include_trend=True, rows=None,
+                 lag_index=None, region_ids=None, drop_terms=(),
+                 cluster_on="month", max_iter=None, tol=1e-7, label=""):
+    """Regression with AR(p) errors, month-clustered covariance. Returns a dict.
+
+    Iterated Cochrane-Orcutt. The returned `resid` is the LEVEL residual
+    (y - X b), not the quasi-differenced one, because that is what §15's
+    diagnostics and §17's forecasts need.
+    """
+    t0 = time.time()
+    max_iter = AR_MAX_ITER if max_iter is None else int(max_iter)
+    if rows is None or lag_index is None:
+        rows, lag_index = ar_estimation_rows(data["obs_r"], data["obs_t"],
+                                             AR_MAX_LAGS)
+    # The design is built on EVERY observed row, not just the estimation rows,
+    # because quasi-differencing reads the design at the LAGGED row. Building it
+    # only on the estimation sample would make those lookups NaN and silently
+    # throw away every row whose own lag is not itself an estimation row.
+    n_full = len(data["y_obs"])
+    all_rows = np.ones(n_full, dtype=bool)
+    X_full, names, groups = panel_design(
+        data, all_rows, drivers=drivers, include_trend=include_trend,
+        region_ids=region_ids, drop_terms=drop_terms)
+    X_rows = X_full[rows, :]
+    y_full = np.asarray(data["y_obs"], dtype=float)
+    y_rows = y_full[rows]
+
+    months = np.asarray(data["obs_t"], dtype=int)[rows]
+    rho = np.zeros(int(p))
+    beta = None
+    for _ in range(max(1, max_iter)):
+        if int(p) == 0:
+            yq, Xq = y_rows, X_rows
+        else:
+            yq = quasi_difference(y_full, rows, lag_index, rho)
+            Xq = np.column_stack([
+                quasi_difference(X_full[:, c], rows, lag_index, rho)
+                for c in range(X_full.shape[1])])
+        ok = np.isfinite(yq) & np.all(np.isfinite(Xq), axis=1)
+        beta_new, *_ = np.linalg.lstsq(Xq[ok], yq[ok], rcond=None)
+        # level residuals, needed to re-estimate rho on the ORIGINAL scale
+        resid_full = np.full(n_full, np.nan)
+        resid_full[rows] = y_rows - X_rows @ beta_new
+        if int(p) == 0:
+            beta = beta_new
+            break
+        rho_new = estimate_ar_coeffs(resid_full, rows, lag_index, p)
+        moved = (np.max(np.abs(rho_new - rho)) if len(rho) else 0.0)
+        rho, beta = rho_new, beta_new
+        if moved < tol:
+            break
+
+    if int(p) == 0:
+        yq, Xq = y_rows, X_rows
+    else:
+        yq = quasi_difference(y_full, rows, lag_index, rho)
+        Xq = np.column_stack([quasi_difference(X_full[:, c], rows, lag_index, rho)
+                              for c in range(X_full.shape[1])])
+    ok = np.isfinite(yq) & np.all(np.isfinite(Xq), axis=1)
+
+    frame = pd.DataFrame(Xq[ok], columns=names)
+    res = sm.OLS(yq[ok], frame).fit(
+        cov_type=("cluster" if cluster_on == "month" else "nonrobust"),
+        cov_kwds=({"groups": months[ok], "use_correction": True}
+                  if cluster_on == "month" else None))
+
+    beta = np.asarray(res.params, dtype=float)
+    resid_level = np.full(n_full, np.nan)
+    resid_level[rows] = y_rows - X_rows @ beta
+    n_used = int(ok.sum())
+    k_free = int(X_rows.shape[1]) + int(p) + 1          # + sigma
+    llf = gaussian_llf(np.asarray(res.resid, dtype=float), n_used)
+    return {
+        "label": label, "p": int(p), "rho": rho,
+        "params": pd.Series(beta, index=names), "names": names,
+        "groups": groups, "result": res,
+        "cov": np.asarray(res.cov_params(), dtype=float),
+        "se": pd.Series(np.sqrt(np.diag(np.asarray(res.cov_params()))),
+                        index=names),
+        "n_obs": n_used, "n_clusters": int(len(np.unique(months[ok]))),
+        "k_free": k_free, "llf": float(llf),
+        "aicc": float(aicc_from(llf, k_free, n_used)),
+        "rows": rows, "lag_index": lag_index,
+        "resid_level": resid_level, "months": months, "ok": ok,
+        "drivers": bool(drivers), "include_trend": bool(include_trend),
+        "drop_terms": list(drop_terms),
+        "seconds": round(time.time() - t0, 3),
+    }
+
+
+def coef_frame(fit, terms=None, level=None):
+    """Estimate, clustered SE, t, p and CI for the requested terms."""
+    level = HDI_PROB if level is None else float(level)
+    res = fit["result"]
+    ci = res.conf_int(alpha=1.0 - level)
+    ci = np.asarray(ci, dtype=float)
+    rows = []
+    for i, nm in enumerate(fit["names"]):
+        if terms is not None and nm not in terms:
+            continue
+        rows.append({"term": nm, "estimate": float(fit["params"].iloc[i]),
+                     "se": float(fit["se"].iloc[i]),
+                     "t": float(res.tvalues.iloc[i]),
+                     "p_value": float(res.pvalues.iloc[i]),
+                     "ci_lo": float(ci[i, 0]), "ci_hi": float(ci[i, 1])})
+    return pd.DataFrame(rows)
+
+
+print(f"§12 estimator defined: regression with AR(p) errors, p <= {AR_MAX_LAGS}, "
+      f"month-clustered standard errors, {int(HDI_PROB * 100)}% intervals.")
+''')
+
+
+# ===========================================================================
+# 13. Persistence structure
+# ===========================================================================
+md(r"""## 13. Step 1 — which persistence structure does the record support?
+
+The error structure is chosen on the **no-driver** model, exactly as before. A
+persistence structure picked because it flattered a driver coefficient would
+make every interval below meaningless, so the drivers are absent from every
+candidate here.
+
+Candidates are AR orders $p = 0, 1, \ldots$ up to `AR_MAX_LAGS`, all fitted on
+**identical rows** — the rows for which every lag up to `AR_MAX_LAGS` is an
+observed calendar month — so their **AICc** values are comparable. AICc, not
+AIC, because the estimation sample is small relative to the parameter count and
+the correction matters.
+""")
+
+code(r'''# =====================================================================
+# 13a. Fit the candidate error structures, with NO driver in any of them
+# =====================================================================
 NULL_DATA = make_model_data(X_MODEL, Y_RAW, OBS_MASK, SEASON, TT, REGION_IDS,
                             DRIVER_TERMS, random_slope_terms=[])
 
-SS_CANDIDATES = pd.DataFrame()
-SS_CANDIDATE_DIAG = pd.DataFrame()
-NULL_FITS, NULL_INFO, NULL_LOO = {}, {}, {}
-SELECTED_COMMON_STATE = None
-SELECTION_NOTE = ""
+AR_ROWS, AR_LAGX = ar_estimation_rows(NULL_DATA["obs_r"], NULL_DATA["obs_t"],
+                                      AR_MAX_LAGS)
+print(f"Estimation sample: {int(AR_ROWS.sum())} of {len(NULL_DATA['y_obs'])} "
+      f"observed region-months have every calendar lag up to {AR_MAX_LAGS} "
+      f"present.")
+print(f"  The {int((~AR_ROWS).sum())} excluded rows follow an EXCLUDED month, so "
+      "the quasi-difference has no previous calendar month to reach. They are "
+      "dropped rather than allowed to reach further back, and every candidate "
+      "below is fitted on exactly these rows.")
 
-if not HAVE_PYMC:
-    print("PyMC unavailable -> §13-§19 skipped. Everything above (regions, panel, "
-          "variance decomposition) is unaffected and still exported.")
-else:
-    _rows, _diags = [], []
-    for _cand in COMMON_STATE_CANDIDATES:
-        print(f"--- null dynamics: common_state={_cand} "
-              f"({MODEL_KINDS[_cand]}) ---")
-        try:
-            _m = build_regional_model(NULL_DATA, drivers=False, common_state=_cand,
-                                      regional_ar=REGIONAL_AR_MODE,
-                                      include_trend=INCLUDE_TREND,
-                                      use_random_slopes=False)
-            _id, _inf = fit_model(_m, SAMPLING, label=f"null_{_cand}")
-        except Exception as exc:
-            print(f"    FAILED: {exc}")
-            _rows.append({"common_state": _cand, "fitted": False,
-                          "note": f"fit failed: {exc}"})
-            continue
-        NULL_FITS[_cand], NULL_INFO[_cand] = _id, _inf
-        _d = diagnostics_table(_id, REPORTED_PARAMS, label=f"null_{_cand}")
-        _diags.append(_d)
-        _ok, _fails = gate_diagnostics(_d)
-        try:
-            _loo = az.loo(_id, pointwise=True)
-            NULL_LOO[_cand] = _loo
-            _elpd, _se = float(_loo.elpd_loo), float(_loo.se)
-            _kbad = int((_loo.pareto_k.values > 0.7).sum())
-        except Exception as exc:
-            _elpd = _se = np.nan
-            _kbad = -1
-            print(f"    LOO unavailable: {exc}")
-        _rho = (float(_id.posterior["rho_g"].mean()) if "rho_g" in _id.posterior
-                else np.nan)
-        _rho_hi = (float((_id.posterior["rho_g"] > 0.95).mean())
-                   if "rho_g" in _id.posterior else np.nan)
-        _res = residual_frame(_id, NULL_DATA, MONTH_GRID, REGION_IDS)
-        _acf1 = []
-        for rid, g in _res.groupby("region_id"):
-            a = calendar_acf(g["resid"].to_numpy(), g["month_pos"].to_numpy(), 3)
-            if len(a):
-                _acf1.append(float(a.loc[a["lag"] == 1, "acf"].iloc[0]))
-        _rows.append({
-            "common_state": _cand, "fitted": True,
-            "description": MODEL_KINDS[_cand],
-            "elpd_loo": _elpd, "elpd_loo_se": _se, "n_pareto_k_gt_0.7": _kbad,
-            "divergences": _inf["divergences"],
-            "max_rhat": float(_d["r_hat"].max()) if len(_d) else np.nan,
-            "min_ess_bulk": float(_d["ess_bulk"].min()) if len(_d) else np.nan,
-            "diagnostics_pass": _ok,
-            "diagnostic_failures": "; ".join(_fails),
-            "posterior_mean_rho_g": _rho,
-            "P(rho_g > 0.95)": _rho_hi,
-            "mean_abs_resid_acf1": (float(np.nanmean(np.abs(_acf1)))
-                                    if _acf1 else np.nan),
-            "seconds": _inf["seconds"],
-        })
-    SS_CANDIDATES = pd.DataFrame(_rows)
-    SS_CANDIDATE_DIAG = (pd.concat(_diags, ignore_index=True) if _diags
-                         else pd.DataFrame())
-    display(SS_CANDIDATES)
-    register("null_dynamics_candidates", SS_CANDIDATES, "model selection")
-    register("null_dynamics_diagnostics", SS_CANDIDATE_DIAG, "model selection")
-''')
+AR_CANDIDATES = pd.DataFrame()
+NULL_FITS, SELECTED_AR_ORDER, SELECTION_NOTE = {}, None, ""
+_rows = []
+for _p in range(0, int(AR_MAX_LAGS) + 1):
+    _f = fit_panel_ar(NULL_DATA, p=_p, drivers=False, include_trend=INCLUDE_TREND,
+                      rows=AR_ROWS, lag_index=AR_LAGX, label=f"null_ar{_p}")
+    NULL_FITS[_p] = _f
+    _res = residual_frame_from_fit(_f, NULL_DATA, MONTH_GRID, REGION_IDS)
+    _acf1, _lb = [], []
+    for _rid, _g in _res.groupby("region_id"):
+        _a = calendar_acf(_g["resid"].to_numpy(), _g["month_pos"].to_numpy(), 3)
+        if len(_a) and np.isfinite(_a.loc[_a["lag"] == 1, "acf"].iloc[0]):
+            _acf1.append(abs(float(_a.loc[_a["lag"] == 1, "acf"].iloc[0])))
+    _rows.append({
+        "ar_order": _p,
+        "description": ("independent errors" if _p == 0
+                        else f"AR({_p}) errors within each region"),
+        "n_obs": _f["n_obs"], "n_month_clusters": _f["n_clusters"],
+        "k_free": _f["k_free"], "llf": _f["llf"], "aicc": _f["aicc"],
+        "rho": ", ".join(f"{r:.3f}" for r in _f["rho"]) if _p else "",
+        "stationary": (bool(abs(np.sum(_f["rho"])) < 1.0) if _p else True),
+        "mean_abs_resid_acf1": float(np.nanmean(_acf1)) if _acf1 else np.nan,
+        "seconds": _f["seconds"]})
+AR_CANDIDATES = pd.DataFrame(_rows).sort_values("aicc").reset_index(drop=True)
+AR_CANDIDATES["delta_aicc"] = (AR_CANDIDATES["aicc"]
+                               - AR_CANDIDATES["aicc"].min())
+display(AR_CANDIDATES)
+register("ar_structure_candidates", AR_CANDIDATES, "model selection")
 
-code(r'''# =====================================================================
-# 13b. Select the persistence structure
-# =====================================================================
-SIMPLICITY_ORDER = {"none": 0, "randomwalk": 1, "ar1": 2}
-
-if HAVE_PYMC and len(SS_CANDIDATES):
-    _ok = SS_CANDIDATES[SS_CANDIDATES.get("fitted", False)
-                        & SS_CANDIDATES.get("diagnostics_pass", False)]
-    _pool = _ok if len(_ok) else SS_CANDIDATES[SS_CANDIDATES.get("fitted", False)]
-    if not len(_pool):
-        raise RuntimeError("No null-dynamics candidate could be fitted.")
-    if not len(_ok):
-        SELECTION_NOTE = ("no candidate cleared the diagnostic gate; the best "
-                          "available was selected and §15's simplification ladder "
-                          "runs from there")
-    _best = _pool.sort_values("elpd_loo", ascending=False).iloc[0]
-    _sel = _best["common_state"]
-    # Within one SE of the best -> take the SIMPLER structure.
-    if np.isfinite(_best.get("elpd_loo", np.nan)):
-        _se_diffs = []
-        for r in _pool.itertuples():
-            if r.common_state == _best["common_state"]:
-                continue
-            try:
-                d = az.compare({_best["common_state"]: NULL_FITS[_best["common_state"]],
-                                r.common_state: NULL_FITS[r.common_state]},
-                               ic="loo", method="stacking")
-                dse = float(d["dse"].iloc[1]) if len(d) > 1 else np.nan
-                ddiff = float(d["elpd_diff"].iloc[1]) if len(d) > 1 else np.nan
-            except Exception:
-                dse, ddiff = np.nan, np.nan
-            _se_diffs.append({"candidate": r.common_state, "elpd_diff": ddiff,
-                              "dse": dse})
-            if (np.isfinite(ddiff) and np.isfinite(dse) and abs(ddiff) <= dse
-                    and SIMPLICITY_ORDER[r.common_state] < SIMPLICITY_ORDER[_sel]):
-                _sel = r.common_state
-        if _se_diffs:
-            print("Pairwise LOO differences against the best candidate:")
-            display(pd.DataFrame(_se_diffs))
-    SELECTED_COMMON_STATE = _sel
-    _row = SS_CANDIDATES[SS_CANDIDATES["common_state"] == _sel].iloc[0]
-    print(f"\nSELECTED shared-state structure: {_sel} — {MODEL_KINDS[_sel]}")
-    if _sel != _best["common_state"]:
-        print(f"  (best elpd was {_best['common_state']}, but the difference was "
-              "within one standard error, so the simpler structure was taken)")
-    if SELECTION_NOTE:
-        print(f"  NOTE: {SELECTION_NOTE}")
-    if _sel == "ar1" and np.isfinite(_row.get("P(rho_g > 0.95)", np.nan)):
-        print(f"  P(rho_g > 0.95) = {_row['P(rho_g > 0.95)']:.3f}. "
-              + ("A large value means the stationary AR is straining towards a "
-                 "unit root and the local-level result should be read alongside "
-                 "it." if _row["P(rho_g > 0.95)"] > 0.2
-                 else "The stationary AR is comfortably inside the unit circle."))
-    print("\nThis choice was made with NO environmental driver in any candidate.")
-    register("null_dynamics_selection", pd.DataFrame([{
-        "selected_common_state": _sel, "note": SELECTION_NOTE,
-        "criterion": "PSIS-LOO (conditional fit) with a one-standard-error "
-                     "simplicity rule, gated on divergences and R-hat",
-        "caveat": "LOO on a latent-state model is not a forecast; genuine "
-                  "one-calendar-month-ahead skill is §17"}]),
-             "model selection")
-else:
-    SELECTED_COMMON_STATE = COMMON_STATE_CANDIDATES[0]
+_ok = AR_CANDIDATES[AR_CANDIDATES["stationary"]]
+_pick = (_ok if len(_ok) else AR_CANDIDATES).iloc[0]
+SELECTED_AR_ORDER = int(_pick["ar_order"])
+SELECTION_NOTE = (f"AR({SELECTED_AR_ORDER}) selected on AICc "
+                  f"({_pick['aicc']:.2f}); next best is "
+                  f"{AR_CANDIDATES['delta_aicc'].iloc[1]:.2f} AICc behind"
+                  if len(AR_CANDIDATES) > 1 else "single candidate")
+print(f"\nSELECTED error structure: AR({SELECTED_AR_ORDER}) — {_pick['description']}")
+if SELECTED_AR_ORDER:
+    print(f"  rho = {_pick['rho']}   (stationary: {_pick['stationary']})")
+print(f"  {SELECTION_NOTE}")
+print("  Residual |ACF(1)| left by this structure: "
+      f"{_pick['mean_abs_resid_acf1']:.3f} (0 = the persistence is fully "
+      "absorbed; §15 tests it formally).")
+print("\nThis choice was made with NO environmental driver in any candidate.")
+if not bool(_pick["stationary"]):
+    print("\n*** The selected AR coefficients are NOT inside the stationary "
+          "region. A non-stationary error process means the level wanders "
+          "without reverting, and a regression on it can manufacture "
+          "association from two trending series. §15 reports this and §16 "
+          "refuses to call any coefficient supported. ***")
+register("ar_structure_selection",
+         pd.DataFrame([{"selected_ar_order": SELECTED_AR_ORDER,
+                        "note": SELECTION_NOTE,
+                        "chosen_with_drivers": False}]), "model selection")
 ''')
 
 
 # ===========================================================================
 # 14. Matched null vs full
 # ===========================================================================
-md(r"""## 14. Step 2 — matched `regional_dynamic_null` vs `regional_dynamic_full`
+md(r"""## 14. Step 2 — matched `regional_null` vs `regional_full`
 
-Two models, identical in every respect except the environmental drivers:
+Same rows, same error structure, same seasonal and trend terms. The **only**
+difference is the driver block, which makes the two nested and the comparison a
+like-for-like one:
 
-* **`regional_dynamic_null`** — partially pooled intercepts, deterministic
-  season, common trend, the selected shared state, regional AR, observation
-  noise. No driver.
-* **`regional_dynamic_full`** — exactly the same, plus the predeclared driver
-  block at its a-priori lags (and the predeclared random slopes, if §10c allowed
-  any).
-
-They are fitted on **exactly the same region-month observations** — the same
-`OBS_MASK`, asserted below — so the comparison is about the drivers and nothing
-else.
+* an **F-test** on the driver block, using the *month-clustered* covariance, so
+  the test inherits the same "regions in a month are one unit" logic as every
+  interval in §16;
+* the **AICc** difference, comparable with the AOI temporal notebook's;
+* and, in §17, the only comparison that really settles it — genuine
+  one-calendar-month-ahead forecasts.
 """)
 
 code(r'''# =====================================================================
-# 14. Fit the matched pair
+# 14. The matched pair
 # =====================================================================
-FIT_CONFIG = {
-    "common_state": SELECTED_COMMON_STATE,
-    "regional_ar": REGIONAL_AR_MODE,
-    "include_trend": INCLUDE_TREND,
-    "use_random_slopes": bool(MODEL_DATA["rs_idx"]),
-    "random_slope_parameterisation": RANDOM_SLOPE_PARAMETERISATION,
-    "hierarchy_parameterisation": HIERARCHY_PARAMETERISATION,
-    "drivers_used": list(DRIVER_TERMS),
-    "target_accept": SAMPLING["target_accept"],
-    "simplification_step": 0,
-    "simplification_history": [],
-}
+MODEL_DATA = make_model_data(X_MODEL, Y_RAW, OBS_MASK, SEASON, TT, REGION_IDS,
+                             DRIVER_TERMS, random_slope_terms=[])
+FINAL_CONFIG = {"ar_order": SELECTED_AR_ORDER, "include_trend": bool(INCLUDE_TREND),
+                "cluster_on": "month", "drop_terms": []}
 
+FIT_NULL = fit_panel_ar(MODEL_DATA, p=SELECTED_AR_ORDER, drivers=False,
+                        include_trend=INCLUDE_TREND, rows=AR_ROWS,
+                        lag_index=AR_LAGX, label="regional_null")
+FIT_FULL = fit_panel_ar(MODEL_DATA, p=SELECTED_AR_ORDER, drivers=True,
+                        include_trend=INCLUDE_TREND, rows=AR_ROWS,
+                        lag_index=AR_LAGX, label="regional_full")
+PAIR = {"null": FIT_NULL, "full": FIT_FULL}
 
-def fit_matched_pair(config, sampling=None, priors=None, data=None,
-                     null_data=None, label_suffix=""):
-    """Fit the null and the full model on IDENTICAL rows under one configuration."""
-    data = MODEL_DATA if data is None else data
-    null_data = (NULL_DATA if null_data is None else null_data)
-    assert np.array_equal(data["obs_mask"], null_data["obs_mask"]), \
-        "null and full models would be fitted on different region-months"
-    terms = list(config.get("drivers_used", data["driver_terms"]))
-    keep = [i for i, t in enumerate(data["driver_terms"]) if t in terms]
-    d_full = dict(data)
-    if keep != list(range(data["K"])):
-        d_full = make_model_data(
-            data["X"][:, :, keep], data["Y"], data["obs_mask"], data["season"],
-            data["tt"], data["region_ids"], [data["driver_terms"][i] for i in keep],
-            random_slope_terms=[t for t in data["rs_terms"] if t in terms])
-    samp = dict(SAMPLING if sampling is None else sampling)
-    samp["target_accept"] = config.get("target_accept", samp["target_accept"])
+assert FIT_NULL["n_obs"] == FIT_FULL["n_obs"], (
+    "the null and full models must be fitted on identical rows")
+print(f"Matched pair fitted on {FIT_FULL['n_obs']} region-months "
+      f"({FIT_FULL['n_clusters']} calendar-month clusters), "
+      f"AR({SELECTED_AR_ORDER}) errors.")
+print(f"  null: {FIT_NULL['seconds']:.2f}s | full: {FIT_FULL['seconds']:.2f}s")
 
-    m_null = build_regional_model(
-        null_data, drivers=False, common_state=config["common_state"],
-        regional_ar=config["regional_ar"], include_trend=config["include_trend"],
-        use_random_slopes=False, priors=priors,
-        hierarchy_parameterisation=config.get("hierarchy_parameterisation"))
-    id_null, inf_null = fit_model(m_null, samp,
-                                  label=f"regional_dynamic_null{label_suffix}",
-                                  prior_predictive=False)
-    m_full = build_regional_model(
-        d_full, drivers=True, common_state=config["common_state"],
-        regional_ar=config["regional_ar"], include_trend=config["include_trend"],
-        use_random_slopes=config["use_random_slopes"], priors=priors,
-        random_slope_parameterisation=config.get(
-            "random_slope_parameterisation"),
-        hierarchy_parameterisation=config.get("hierarchy_parameterisation"))
-    id_full, inf_full = fit_model(m_full, samp,
-                                  label=f"regional_dynamic_full{label_suffix}",
-                                  prior_predictive=True)
-    return {"null": id_null, "full": id_full, "info_null": inf_null,
-            "info_full": inf_full, "data_full": d_full, "config": dict(config)}
+_drv = [t for t in MODEL_DATA["driver_terms"] if t in FIT_FULL["names"]]
+_ftest = None
+if _drv:
+    _R = np.zeros((len(_drv), len(FIT_FULL["names"])))
+    for _i, _t in enumerate(_drv):
+        _R[_i, FIT_FULL["names"].index(_t)] = 1.0
+    _ftest = FIT_FULL["result"].f_test(_R)
 
+NULL_VS_FULL = pd.DataFrame([
+    {"model": "regional_null", "n_obs": FIT_NULL["n_obs"],
+     "k_free": FIT_NULL["k_free"], "llf": FIT_NULL["llf"],
+     "aicc": FIT_NULL["aicc"]},
+    {"model": "regional_full", "n_obs": FIT_FULL["n_obs"],
+     "k_free": FIT_FULL["k_free"], "llf": FIT_FULL["llf"],
+     "aicc": FIT_FULL["aicc"]}])
+NULL_VS_FULL["delta_aicc"] = NULL_VS_FULL["aicc"] - NULL_VS_FULL["aicc"].min()
+display(NULL_VS_FULL)
 
-PAIR = None
-if HAVE_PYMC:
-    print(f"Fitting the matched pair with common_state={FIT_CONFIG['common_state']}, "
-          f"regional_ar={FIT_CONFIG['regional_ar']}, "
-          f"random_slopes={MODEL_DATA['rs_terms'] or 'none'}, "
-          f"{len(MODEL_DATA['y_obs']):,} region-months.")
-    PAIR = fit_matched_pair(FIT_CONFIG)
-    print(f"  null: {PAIR['info_null']['seconds']}s, "
-          f"{PAIR['info_null']['divergences']} divergence(s)")
-    print(f"  full: {PAIR['info_full']['seconds']}s, "
-          f"{PAIR['info_full']['divergences']} divergence(s)")
-    assert (len(PAIR["data_full"]["y_obs"]) == len(NULL_DATA["y_obs"])), \
-        "the matched pair does not share an observation count"
-    assert np.allclose(PAIR["data_full"]["y_obs"], NULL_DATA["y_obs"]), \
-        "the matched pair does not share the same response values"
+_daicc = float(FIT_FULL["aicc"] - FIT_NULL["aicc"])
+print(f"AICc favours {'regional_full' if _daicc < 0 else 'regional_null'} "
+      f"(difference {abs(_daicc):.2f}).")
+if _ftest is not None:
+    print(f"F-test on the {len(_drv)} driver term(s), month-clustered: "
+          f"F = {float(_ftest.fvalue):.3f}, p = {float(_ftest.pvalue):.4f}")
+    print("  The null hypothesis is that EVERY driver coefficient is zero. "
+          "A large p-value means the drivers add nothing detectable once "
+          f"region intercepts, the annual cycle{', the trend' if INCLUDE_TREND else ''} "
+          "and AR persistence are in the model.")
+NULL_VS_FULL.attrs["f_stat"] = (float(_ftest.fvalue) if _ftest is not None
+                                else np.nan)
+NULL_VS_FULL.attrs["f_pvalue"] = (float(_ftest.pvalue) if _ftest is not None
+                                  else np.nan)
+register("null_vs_full_comparison", NULL_VS_FULL, "model comparison")
+print("\nAICc and an in-sample F-test both score FIT, not forecast skill. "
+      "§17 is the predictive claim.")
 ''')
 
 
 # ===========================================================================
-# 15. Diagnostics and the simplification ladder
+# 15. Diagnostics
 # ===========================================================================
-md(r"""## 15. Diagnostics, and the simplification ladder when they fail
+md(r"""## 15. Diagnostics — did the structure actually absorb the dependence?
 
-Required of the final fits: **four chains**, $\hat R<1.01$, adequate bulk and
-tail ESS, **zero** divergent transitions, posterior predictive checks, trace
-plots, residual ACFs for both the regional residuals and the common state,
-prior-versus-posterior comparison, and sensitivity to reasonable priors.
+Least squares always returns a number. These checks decide whether that number
+means anything, and §16 refuses to call any coefficient supported when they
+fail.
 
-If the gate fails, the ladder runs **in this order** and the step that fixed it
-is recorded:
-
-1. remove weakly identified random slopes;
-2. simplify the region-specific AR (`per_region` → one common $\rho$; a common
-   $\rho$ → drop $u_{r,t}$ altogether, letting $\epsilon$ absorb it);
-3. reduce the environmental driver set to the terms with genuine regional
-   variation;
-4. raise `target_accept`.
-
-Every simplification refits **both** models, so the pair stays matched, and the
-history is exported. Nothing is reported from a fit that never cleared the gate;
-if the ladder is exhausted, §16 says so and withholds the coefficients.
-
-**The scope of the gate, stated openly.** Divergences are checked globally — a
-divergent transition anywhere invalidates the geometry. $\hat R$ and ESS are
-checked on `REPORTED_PARAMS`: the interpretable, low-dimensional quantities §16
-actually quotes. Three groups are diagnosed and **reported** but do not block:
-
-* the **latent state paths** $g_t$ and $u_{r,t}$ — hundreds of strongly
-  correlated values whose individual tail ESS is not what a driver coefficient
-  rests on (§15b prints their worst $\hat R$ and ESS anyway);
-* the **variance split** $\sigma_u$ / $\sigma_\epsilon$ / $\phi$, whose weak
-  identification is a known structural property while their total is well
-  identified (§15c);
-* the **non-centred auxiliaries** `alpha_z`, `lam_z`, `b_z`, `g_raw` — these are
-  coordinates, not quantities. The transformed $\alpha_r$, $\lambda_r$ and
-  $b_{r,k}$ are gated in their place, which is the thing that matters.
-
-None of that hides anything: each group's diagnostics are printed and exported.
-""")
-
-code(r'''# =====================================================================
-# 15a. The ladder
-# =====================================================================
-LADDER_LOG = pd.DataFrame()
-FIT_NULL = FIT_FULL = None
-FINAL_CONFIG = dict(FIT_CONFIG)
-GATE_PASSED = False
-GATE_FAILURES = []
-
-
-def _ladder_steps(config, data):
-    """The ordered simplifications, each returning (name, new_config) or None."""
-    steps = []
-
-    def switch_hierarchy_parameterisation(c):
-        cur = c.get("hierarchy_parameterisation", "centred")
-        if c.get("_tried_hierarchy_parameterisation"):
-            return None
-        alt = "noncentred" if cur == "centred" else "centred"
-        n = dict(c)
-        n["hierarchy_parameterisation"] = alt
-        n["_tried_hierarchy_parameterisation"] = True
-        return (f"switch the regional intercept / loading parameterisation from "
-                f"{cur} to {alt} (poor mixing in alpha_r is a geometry problem "
-                "before it is a model problem)", n)
-
-    def switch_random_slope_parameterisation(c):
-        if not c.get("use_random_slopes"):
-            return None
-        cur = c.get("random_slope_parameterisation", "centred")
-        alt = "noncentred" if cur == "centred" else "centred"
-        if c.get("_tried_rs_parameterisation"):
-            return None
-        n = dict(c)
-        n["random_slope_parameterisation"] = alt
-        n["_tried_rs_parameterisation"] = True
-        return (f"switch the random-slope parameterisation from {cur} to {alt} "
-                "(a funnel is a geometry problem before it is a model problem)", n)
-
-    def drop_random_slopes(c):
-        if not c.get("use_random_slopes"):
-            return None
-        n = dict(c)
-        n["use_random_slopes"] = False
-        return ("remove weakly identified random slopes", n)
-
-    def simplify_regional_ar(c):
-        if c["regional_ar"] == "per_region":
-            n = dict(c)
-            n["regional_ar"] = "common"
-            return ("one common regional AR parameter instead of one per region", n)
-        if c["regional_ar"] == "common":
-            n = dict(c)
-            n["regional_ar"] = "none"
-            return ("drop the region-specific AR; observation noise absorbs the "
-                    "regional residual (their split was not separately identified)", n)
-        return None
-
-    def reduce_drivers(c):
-        keep = [t for t in c["drivers_used"]
-                if DRIVER_META.loc[DRIVER_META["term"] == t, "spatial_label"]
-                .eq("spatiotemporal").any()]
-        if not keep or len(keep) == len(c["drivers_used"]):
-            return None
-        n = dict(c)
-        n["drivers_used"] = keep
-        return (f"reduce the driver set to the spatiotemporal terms {keep}", n)
-
-    def raise_target_accept(c):
-        if c.get("target_accept", 0.9) >= 0.99:
-            return None
-        n = dict(c)
-        n["target_accept"] = min(0.99, round(c.get("target_accept", 0.9) + 0.05, 3))
-        return (f"raise target_accept to {n['target_accept']}", n)
-
-    for f in (switch_hierarchy_parameterisation,
-              switch_random_slope_parameterisation, drop_random_slopes,
-              simplify_regional_ar, reduce_drivers, raise_target_accept):
-        steps.append(f)
-    return steps
-
-
-if HAVE_PYMC and PAIR is not None:
-    _hist = []
-    _cfg = dict(FIT_CONFIG)
-    _pair = PAIR
-    for _attempt in range(6):
-        _diag = diagnostics_table(_pair["full"], REPORTED_PARAMS,
-                                  label=f"full_step{_attempt}")
-        _ok, _fails = gate_diagnostics(_diag)
-        _hist.append({
-            "step": _attempt,
-            "common_state": _cfg["common_state"],
-            "regional_ar": _cfg["regional_ar"],
-            "random_slopes": bool(_cfg["use_random_slopes"]),
-            "random_slope_parameterisation": _cfg.get(
-                "random_slope_parameterisation"),
-            "hierarchy_parameterisation": _cfg.get("hierarchy_parameterisation"),
-            "n_drivers": len(_cfg["drivers_used"]),
-            "target_accept": _cfg.get("target_accept"),
-            "divergences_full": _pair["info_full"]["divergences"],
-            "divergences_null": _pair["info_null"]["divergences"],
-            "max_rhat": float(_diag["r_hat"].max()) if len(_diag) else np.nan,
-            "min_ess_bulk": float(_diag["ess_bulk"].min()) if len(_diag) else np.nan,
-            "min_ess_tail": float(_diag["ess_tail"].min()) if len(_diag) else np.nan,
-            "gate_passed": _ok,
-            "failures": "; ".join(_fails),
-            "action_taken": "",
-        })
-        if _ok:
-            GATE_PASSED = True
-            GATE_FAILURES = []
-            break
-        _next = None
-        for _f in _ladder_steps(_cfg, MODEL_DATA):
-            _cand = _f(_cfg)
-            if _cand is not None:
-                _next = _cand
-                break
-        if _next is None:
-            GATE_FAILURES = _fails
-            _hist[-1]["action_taken"] = "ladder exhausted"
-            break
-        _name, _cfg = _next
-        _hist[-1]["action_taken"] = _name
-        _cfg["simplification_step"] = _attempt + 1
-        _cfg["simplification_history"] = [h["action_taken"] for h in _hist
-                                          if h["action_taken"]]
-        print(f"Gate failed at step {_attempt}: {'; '.join(_fails)}")
-        print(f"  -> {_name}; refitting BOTH models so the pair stays matched.")
-        _pair = fit_matched_pair(_cfg, label_suffix=f"_step{_attempt + 1}")
-    LADDER_LOG = pd.DataFrame(_hist)
-    PAIR = _pair
-    FINAL_CONFIG = dict(_cfg)
-    FIT_NULL, FIT_FULL = PAIR["null"], PAIR["full"]
-    # Every later refit (§16b, §17, §19) inherits the accepted configuration's
-    # target_accept. A cheaper refit that reintroduced divergences would not be a
-    # cheaper answer to the same question.
-    SAMPLING_REFIT = dict(SAMPLING_REFIT)
-    SAMPLING_REFIT["target_accept"] = max(
-        float(SAMPLING_REFIT["target_accept"]),
-        float(FINAL_CONFIG.get("target_accept", SAMPLING_REFIT["target_accept"])))
-    display(LADDER_LOG)
-    register("simplification_ladder", LADDER_LOG, "diagnostic")
-    if GATE_PASSED:
-        print(f"\nDiagnostic gate PASSED at ladder step "
-              f"{int(LADDER_LOG['step'].iloc[-1])}.")
-        if int(LADDER_LOG["step"].iloc[-1]) > 0:
-            print("Simplifications applied, in order: "
-                  + " -> ".join([a for a in LADDER_LOG['action_taken'] if a]))
-    else:
-        print(f"\n*** Diagnostic gate NOT passed after the full ladder: "
-              f"{GATE_FAILURES}. §16 will report the coefficients as "
-              "NOT REPORTABLE. ***")
-''')
-
-code(r'''# =====================================================================
-# 15b. Posterior predictive check, traces, residual ACFs
-# =====================================================================
-PPC_SUMMARY = pd.DataFrame()
-RESID_ACF = pd.DataFrame()
-STATE_ACF = pd.DataFrame()
-STATE_DIAGNOSTICS = pd.DataFrame()
-
-if HAVE_PYMC and FIT_FULL is not None:
-    _dfull = PAIR["data_full"]
-    _mfull = build_regional_model(
-        _dfull, drivers=True, common_state=FINAL_CONFIG["common_state"],
-        regional_ar=FINAL_CONFIG["regional_ar"],
-        include_trend=FINAL_CONFIG["include_trend"],
-        use_random_slopes=FINAL_CONFIG["use_random_slopes"],
-        random_slope_parameterisation=FINAL_CONFIG.get(
-            "random_slope_parameterisation"),
-        hierarchy_parameterisation=FINAL_CONFIG.get(
-            "hierarchy_parameterisation"))
-    with _mfull:
-        _pp = pm.sample_posterior_predictive(
-            FIT_FULL, progressbar=False,
-            random_seed=SAMPLING.get("random_seed", 0))
-    _yrep = _pp.posterior_predictive["y"].stack(s=("chain", "draw")).to_numpy()
-    _yobs = _dfull["y_obs"]
-    PPC_SUMMARY = pd.DataFrame([{
-        "statistic": s,
-        "observed": f(_yobs),
-        "ppc_mean": float(np.mean([f(_yrep[:, j]) for j in
-                                   range(0, _yrep.shape[1],
-                                         max(1, _yrep.shape[1] // 200))])),
-        "ppc_p_value": float(np.mean([f(_yrep[:, j]) >= f(_yobs) for j in
-                                      range(0, _yrep.shape[1],
-                                            max(1, _yrep.shape[1] // 200))])),
-    } for s, f in [("mean", lambda v: float(np.mean(v))),
-                   ("sd", lambda v: float(np.std(v))),
-                   ("min", lambda v: float(np.min(v))),
-                   ("max", lambda v: float(np.max(v))),
-                   ("p10", lambda v: float(np.quantile(v, 0.10))),
-                   ("p90", lambda v: float(np.quantile(v, 0.90)))]])
-    display(PPC_SUMMARY)
-    register("posterior_predictive_checks", PPC_SUMMARY, "diagnostic")
-    print("A Bayesian p-value near 0 or 1 means the model cannot reproduce that "
-          "feature of the data.")
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 3.6))
-    try:
-        _ppc_id = az.InferenceData(posterior_predictive=_pp.posterior_predictive,
-                                   observed_data=FIT_FULL.observed_data)
-        az.plot_ppc(_ppc_id, ax=axes[0], num_pp_samples=60, legend=False)
-    except Exception as exc:
-        axes[0].hist(_yobs, bins=25, density=True, alpha=0.6, color="0.4",
-                     label="observed")
-        axes[0].hist(_yrep[:, ::max(1, _yrep.shape[1] // 40)].ravel(), bins=25,
-                     density=True, histtype="step", color="#4C72B0",
-                     label="posterior predictive")
-        axes[0].legend(fontsize=8, frameon=False)
-        print(f"  (az.plot_ppc unavailable here: {exc}; drew the densities directly)")
-    axes[0].set_title("Posterior predictive vs observed (logit cover)", fontsize=10)
-    axes[1].scatter(_yobs, _yrep.mean(axis=1), s=12, alpha=0.6, color="#4C72B0")
-    _lim = [min(_yobs.min(), _yrep.mean(axis=1).min()),
-            max(_yobs.max(), _yrep.mean(axis=1).max())]
-    axes[1].plot(_lim, _lim, color="0.3", lw=1)
-    axes[1].set_xlabel("observed"); axes[1].set_ylabel("posterior predictive mean")
-    axes[1].set_title("In-sample fit (NOT validation — §17 is)", fontsize=10)
-    fig.tight_layout()
-    save_fig(fig, "diagnostics_ppc")
-    plt.show()
-
-    _trace_vars = [v for v in ["beta", "mu_alpha", "sigma_alpha", "rho_g",
-                               "sigma_g", "sigma_lambda", "rho_u",
-                               "sigma_resid_total", "sigma_eps", "tau_trend"]
-                   if v in FIT_FULL.posterior]
-    az.plot_trace(FIT_FULL, var_names=_trace_vars, compact=True,
-                  figsize=(12, 1.7 * len(_trace_vars)))
-    fig = plt.gcf()
-    fig.suptitle("Trace plots — full driver model", fontsize=12)
-    fig.tight_layout()
-    save_fig(fig, "diagnostics_traces")
-    plt.show()
-
-    # --- residual ACFs -------------------------------------------------------
-    _res = residual_frame(FIT_FULL, _dfull, MONTH_GRID, REGION_IDS)
-    _acf_rows = []
-    for rid, g in _res.groupby("region_id"):
-        a = calendar_acf(g["resid"].to_numpy(), g["month_pos"].to_numpy(), 12)
-        a["region_id"] = rid
-        _acf_rows.append(a)
-    RESID_ACF = pd.concat(_acf_rows, ignore_index=True) if _acf_rows else pd.DataFrame()
-    if "g" in FIT_FULL.posterior:
-        _g = FIT_FULL.posterior["g"].mean(dim=("chain", "draw")).to_numpy()
-        _rho = (float(FIT_FULL.posterior["rho_g"].mean())
-                if "rho_g" in FIT_FULL.posterior else 1.0)
-        _innov = _g[1:] - _rho * _g[:-1]
-        STATE_ACF = calendar_acf(_innov, np.arange(1, len(_g)), 12)
-        STATE_ACF["series"] = "common-state innovation"
-    register("residual_acf_by_region", RESID_ACF, "diagnostic")
-    register("common_state_innovation_acf", STATE_ACF, "diagnostic")
-
-    # Latent-state diagnostics: reported, not blocking (see the §15 preamble).
-    _sd = diagnostics_table(FIT_FULL, STATE_PARAMS, label="full_states")
-    if len(_sd):
-        STATE_DIAGNOSTICS = pd.DataFrame([{
-            "n_state_parameters": int(len(_sd)),
-            "max_rhat": float(_sd["r_hat"].max()),
-            "min_ess_bulk": float(_sd["ess_bulk"].min()),
-            "min_ess_tail": float(_sd["ess_tail"].min()),
-            "n_above_rhat_threshold": int((_sd["r_hat"] > DIAG_MAX_RHAT).sum()),
-            "n_below_ess_bulk_threshold": int((_sd["ess_bulk"]
-                                               < DIAG_MIN_ESS_BULK).sum()),
-            "blocking": False,
-            "note": "latent state paths g and u; reported for transparency, not "
-                    "used to gate the driver coefficients"}])
-        display(STATE_DIAGNOSTICS)
-        register("latent_state_diagnostics", STATE_DIAGNOSTICS, "diagnostic")
-        register("latent_state_diagnostics_full", _sd, "diagnostic")
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 3.4))
-    if len(RESID_ACF):
-        for rid, g in RESID_ACF.groupby("region_id"):
-            axes[0].plot(g["lag"], g["acf"], marker="o", ms=3, lw=0.9,
-                         alpha=0.75, label=rid)
-        axes[0].axhline(0, color="0.3", lw=0.8)
-        _n = max(int(RESID_ACF["n_pairs"].median()), 1)
-        for s in (-1.96 / np.sqrt(_n), 1.96 / np.sqrt(_n)):
-            axes[0].axhline(s, color="0.6", ls=":", lw=0.8)
-        axes[0].set_title("Regional residual ACF (calendar lags)", fontsize=10)
-        axes[0].set_xlabel("lag (calendar months)")
-        axes[0].legend(fontsize=6, ncol=2, frameon=False)
-    if len(STATE_ACF):
-        axes[1].bar(STATE_ACF["lag"], STATE_ACF["acf"], color="#4C72B0")
-        axes[1].axhline(0, color="0.3", lw=0.8)
-        axes[1].set_title("Common-state innovation ACF", fontsize=10)
-        axes[1].set_xlabel("lag (calendar months)")
-    fig.tight_layout()
-    save_fig(fig, "diagnostics_residual_acf")
-    plt.show()
-    print("Residual autocorrelation left at lag 1 means the dependence structure "
-          "has not absorbed the persistence, and every interval below is then "
-          "optimistic.")
-''')
-
-code(r'''# =====================================================================
-# 15c. The variance split, prior vs posterior, and prior sensitivity
-# =====================================================================
-VARIANCE_SPLIT = pd.DataFrame()
-PRIOR_POSTERIOR = pd.DataFrame()
-PRIOR_SENSITIVITY = pd.DataFrame()
-
-if HAVE_PYMC and FIT_FULL is not None:
-    # --- the split that is known to be hard, diagnosed on its own -----------
-    _split_vars = [v for v in ["sigma_resid_total", "frac_u", "sigma_u",
-                               "sigma_eps", "rho_u"] if v in FIT_FULL.posterior]
-    if _split_vars:
-        VARIANCE_SPLIT = (az.summary(FIT_FULL, var_names=_split_vars,
-                                     hdi_prob=HDI_PROB)
-                          .reset_index().rename(columns={"index": "parameter"}))
-        display(VARIANCE_SPLIT)
-        register("regional_variance_split", VARIANCE_SPLIT, "diagnostic")
-        _weak = VARIANCE_SPLIT[(VARIANCE_SPLIT["r_hat"] > DIAG_MAX_RHAT)
-                               | (VARIANCE_SPLIT["ess_bulk"] < DIAG_MIN_ESS_BULK)]
-        if len(_weak):
-            print("The split between region-specific persistence and observation "
-                  "noise is WEAKLY IDENTIFIED here "
-                  f"({_weak['parameter'].tolist()}).")
-            print("Their total (sigma_resid_total) is identified; the share is "
-                  "not. Read sigma_u and sigma_eps as a decomposition the data "
-                  "cannot pin down, not as measurements.")
-        else:
-            print("The regional-persistence / observation-noise split is "
-                  "adequately identified in this fit.")
-
-    # --- prior vs posterior --------------------------------------------------
-    if "prior" in FIT_FULL.groups():
-        _rows = []
-        for v in [x for x in ["beta", "mu_alpha", "sigma_alpha", "sigma_g",
-                              "rho_g", "sigma_lambda", "sigma_b", "tau_trend"]
-                  if x in FIT_FULL.posterior and x in FIT_FULL.prior]:
-            po = FIT_FULL.posterior[v].stack(s=("chain", "draw"))
-            pr = FIT_FULL.prior[v].stack(s=("chain", "draw"))
-            if po.ndim == 1:
-                items = [(v, po.to_numpy(), pr.to_numpy())]
-            else:
-                dim = [d for d in po.dims if d != "s"][0]
-                items = [(f"{v}[{lab}]",
-                          po.sel({dim: lab}).to_numpy(),
-                          pr.sel({dim: lab}).to_numpy())
-                         for lab in po.coords[dim].to_numpy()]
-            for name, a, b in items:
-                sd_post, sd_prior = float(np.std(a)), float(np.std(b))
-                _rows.append({
-                    "parameter": name,
-                    "prior_mean": float(np.mean(b)), "prior_sd": sd_prior,
-                    "posterior_mean": float(np.mean(a)), "posterior_sd": sd_post,
-                    "posterior_shrinkage": (1 - sd_post / sd_prior)
-                    if sd_prior > 0 else np.nan})
-        PRIOR_POSTERIOR = pd.DataFrame(_rows)
-        display(PRIOR_POSTERIOR)
-        register("prior_vs_posterior", PRIOR_POSTERIOR, "diagnostic")
-        print("Shrinkage near 0 means the data said almost nothing about that "
-              "parameter and the prior is doing the work.")
-
-    # --- sensitivity to reasonable priors -----------------------------------
-    _rows = []
-    for _vname, _pv in PRIOR_VARIANTS.items():
-        try:
-            _pr = fit_matched_pair(FINAL_CONFIG, sampling=SAMPLING_REFIT,
-                                   priors=_pv, label_suffix=f"_prior_{_vname}")
-        except Exception as exc:
-            _rows.append({"prior_variant": _vname, "term": "(fit failed)",
-                          "note": str(exc)})
-            continue
-        if "beta" in _pr["full"].posterior:
-            s = az.summary(_pr["full"], var_names=["beta"], hdi_prob=HDI_PROB)
-            _hdi = [c for c in s.columns if c.startswith("hdi_")]
-            for term, (_, row) in zip(_pr["data_full"]["driver_terms"], s.iterrows()):
-                _rows.append({
-                    "prior_variant": _vname, "priors": json.dumps(_pv),
-                    "term": term, "mean": float(row["mean"]),
-                    "hdi_lo": float(row[_hdi[0]]), "hdi_hi": float(row[_hdi[1]]),
-                    "divergences": int(_pr["full"].sample_stats["diverging"].sum())})
-    PRIOR_SENSITIVITY = pd.DataFrame(_rows)
-    if len(PRIOR_SENSITIVITY):
-        display(PRIOR_SENSITIVITY)
-        register("prior_sensitivity", PRIOR_SENSITIVITY, "robustness")
-        print("A coefficient whose sign or rough magnitude moves between the "
-              "tight and loose priors is prior-dependent and is reported as "
-              "fragile in §22.")
-''')
-
-
-# ===========================================================================
-# 16. Posterior inference
-# ===========================================================================
-md(r"""## 16. Posterior inference — global and regional driver associations
-
-Every coefficient is on the **standardised logit** scale: a one-standard-deviation
-move in the driver, in log-odds of regional WH cover.
-
-For each coefficient: posterior mean and median, the
-95% highest-density interval, $P(\beta>0)$, $P(\beta<0)$, the posterior
-probability of being inside the **region of practical equivalence**
-$|\beta|<\texttt{ROPE\_HALFWIDTH}$, the between-region slope SD where one is
-estimated, and the region-specific estimates where they exist.
-
-### The verdict rules, applied conservatively
-
-| Verdict | Requires |
+| Check | What failing it means |
 |---|---|
-| `supported` | 95% HDI excludes zero **and** the direction matches the predeclared mechanism **and** the diagnostic gate passed **and** the sign survives leaving any single region out |
-| `suggestive` | substantial posterior sign probability, but the interval includes zero |
-| `heterogeneous` | regional slopes clearly differ in direction or magnitude |
-| `temporal_only` | no meaningful regional predictor variation (§10) — the coefficient is still estimated, but the regional design adds nothing to it |
-| `no evidence` | everything else |
+| **calendar Ljung-Box** on the residuals, by region | the AR($p$) structure did not absorb the persistence, so the residuals are still autocorrelated and every interval is optimistic |
+| **stationarity** of $\hat\rho$ | a wandering error process; a regression on it can manufacture association between two trending series |
+| **month clusters** | with too few clusters the clustered covariance is itself unreliable, whatever the point estimates say |
+| **collinearity (VIF)** among the drivers | two drivers carrying the same information split a coefficient arbitrarily between them |
+| **influence** | one region-month moving a coefficient is a data point to look at, not a result |
 
-A posterior sign probability slightly above 0.5 is **not** support: with a
-diffuse posterior centred near zero, $P(\beta>0)\approx0.55$ is what "nothing"
-looks like. The ROPE column is there so that a tight interval around a
-negligible value is not mistaken for a finding either.
-
-Everything below is an **association**. The design is observational, the drivers
-are correlated with each other and with the season, and the shared latent state
-absorbs whatever moved the whole gulf at once. Nothing here identifies a causal
-effect.
+There is no simplification ladder here. A ladder existed because MCMC geometry
+could fail on a model that was perfectly identified; least squares has no such
+failure mode. What can still fail is **identification** — a rank-deficient design
+— and that is handled directly, by dropping the offending column and saying so.
 """)
 
 code(r'''# =====================================================================
-# 16a. Global driver coefficients
+# 15a. Residual autocorrelation, on CALENDAR lags, by region
 # =====================================================================
-GLOBAL_DRIVERS = pd.DataFrame()
-REGIONAL_DRIVERS = pd.DataFrame()
-NULL_VS_FULL = pd.DataFrame()
+RESID_FRAME = residual_frame_from_fit(FIT_FULL, MODEL_DATA, MONTH_GRID, REGION_IDS)
 
+_rows = []
+for _rid, _g in RESID_FRAME.groupby("region_id"):
+    _a = calendar_acf(_g["resid"].to_numpy(), _g["month_pos"].to_numpy(),
+                      RESID_ACF_MAX_LAG)
+    _lb = calendar_ljung_box(_g["resid"].to_numpy(), _g["month_pos"].to_numpy(),
+                             LJUNG_BOX_LAGS)
+    _rows.append({
+        "region_id": _rid, "n_resid": int(_g["resid"].notna().sum()),
+        "acf1": (float(_a.loc[_a["lag"] == 1, "acf"].iloc[0]) if len(_a)
+                 else np.nan),
+        "acf2": (float(_a.loc[_a["lag"] == 2, "acf"].iloc[0]) if len(_a) > 1
+                 else np.nan),
+        "ljung_box_stat": _lb["stat"], "ljung_box_df": _lb["df"],
+        "ljung_box_p": _lb["p_value"], "n_pairs_used": _lb["n_pairs"],
+        "autocorrelated": bool(np.isfinite(_lb["p_value"])
+                               and _lb["p_value"] < LJUNG_BOX_ALPHA)})
+RESID_DIAGNOSTICS = pd.DataFrame(_rows)
+display(RESID_DIAGNOSTICS)
+register("residual_acf_by_region", RESID_DIAGNOSTICS, "diagnostic")
 
-def _hdi_bounds(samples, prob=None):
-    prob = HDI_PROB if prob is None else prob
-    a = np.asarray(samples, dtype=float).ravel()
-    h = az.hdi(a, hdi_prob=prob)
-    return float(np.min(h)), float(np.max(h))
-
-
-def summarise_coefficient(samples, name, rope=None, expected_sign="?"):
-    rope = ROPE_HALFWIDTH if rope is None else rope
-    a = np.asarray(samples, dtype=float).ravel()
-    lo, hi = _hdi_bounds(a)
-    p_pos, p_neg = float(np.mean(a > 0)), float(np.mean(a < 0))
-    return {
-        "term": name,
-        "posterior_mean": float(np.mean(a)),
-        "posterior_median": float(np.median(a)),
-        "posterior_sd": float(np.std(a)),
-        f"hdi{int(HDI_PROB * 100)}_lo": lo,
-        f"hdi{int(HDI_PROB * 100)}_hi": hi,
-        "p_positive": p_pos, "p_negative": p_neg,
-        "p_in_rope": float(np.mean(np.abs(a) < rope)),
-        "rope_halfwidth": float(rope),
-        "hdi_excludes_zero": bool(lo > 0 or hi < 0),
-        "expected_sign": expected_sign,
-        "direction_matches_mechanism": bool(
-            expected_sign == "?" or
-            (expected_sign == "+" and np.mean(a) > 0) or
-            (expected_sign == "-" and np.mean(a) < 0)),
-    }
-
-
-if HAVE_PYMC and FIT_FULL is not None and "beta" in FIT_FULL.posterior:
-    _terms = PAIR["data_full"]["driver_terms"]
-    _beta = FIT_FULL.posterior["beta"].stack(s=("chain", "draw")).to_numpy()
-    _rows = []
-    for k, term in enumerate(_terms):
-        meta = DRIVER_META[DRIVER_META["term"] == term].iloc[0]
-        row = summarise_coefficient(_beta[k], term,
-                                    expected_sign=meta["expected_sign"])
-        row.update({"mechanism_key": meta["mechanism_key"],
-                    "mechanism": meta["mechanism"],
-                    "lag_months": int(meta["lag_months"]),
-                    "spatial_label": meta["spatial_label"],
-                    "season_confounded": bool(
-                        DRIVER_VARIANCE.loc[DRIVER_VARIANCE["driver"]
-                                            == meta["column"],
-                                            "season_confounded"].any())})
-        # between-region slope variation, where one is estimated
-        if ("sigma_b" in FIT_FULL.posterior
-                and term in list(FIT_FULL.posterior["sigma_b"].coords["rs_driver"]
-                                 .to_numpy())):
-            sb = (FIT_FULL.posterior["sigma_b"].sel(rs_driver=term)
-                  .stack(s=("chain", "draw")).to_numpy())
-            slo, shi = _hdi_bounds(sb)
-            row.update({"between_region_slope_sd_mean": float(np.mean(sb)),
-                        "between_region_slope_sd_hdi_lo": slo,
-                        "between_region_slope_sd_hdi_hi": shi,
-                        "p_slope_sd_exceeds_rope": float(np.mean(sb > ROPE_HALFWIDTH)),
-                        "random_slope": True})
-        else:
-            row.update({"between_region_slope_sd_mean": np.nan,
-                        "between_region_slope_sd_hdi_lo": np.nan,
-                        "between_region_slope_sd_hdi_hi": np.nan,
-                        "p_slope_sd_exceeds_rope": np.nan,
-                        "random_slope": False})
-        _rows.append(row)
-    GLOBAL_DRIVERS = pd.DataFrame(_rows)
-    display(GLOBAL_DRIVERS[[
-        "term", "spatial_label", "posterior_mean", "posterior_median",
-        f"hdi{int(HDI_PROB * 100)}_lo", f"hdi{int(HDI_PROB * 100)}_hi",
-        "p_positive", "p_negative", "p_in_rope", "expected_sign",
-        "hdi_excludes_zero", "between_region_slope_sd_mean"]])
-    print("Scale: standardised logit. A coefficient of 0.10 means a 1 SD move in "
-          "the driver shifts the log-odds of regional cover by 0.10 "
-          f"(odds x {np.exp(0.10):.3f}).")
-    print(f"ROPE: |beta| < {ROPE_HALFWIDTH} is practically equivalent to zero.")
-
-    # --- region-specific estimates, where they are estimable ----------------
-    _rr = []
-    if "b" in FIT_FULL.posterior:
-        _b = FIT_FULL.posterior["b"]
-        for term in list(_b.coords["rs_driver"].to_numpy()):
-            k = _terms.index(term)
-            for ri, rid in enumerate(REGION_IDS):
-                dev = (_b.sel(rs_driver=term).isel(region=ri)
-                       .stack(s=("chain", "draw")).to_numpy())
-                tot = _beta[k] + dev
-                s = summarise_coefficient(tot, term)
-                s.update({"region_id": rid,
-                          "deviation_mean": float(np.mean(dev)),
-                          "p_deviation_positive": float(np.mean(dev > 0)),
-                          "estimable": True})
-                _rr.append(s)
-    for term in _terms:
-        if any(r["term"] == term for r in _rr):
-            continue
-        for rid in REGION_IDS:
-            _rr.append({"term": term, "region_id": rid, "estimable": False,
-                        "posterior_mean": np.nan,
-                        "note": "common slope by design — no regional deviation "
-                                "was estimated for this driver"})
-    REGIONAL_DRIVERS = (pd.DataFrame(_rr)
-                        .merge(REGIONS[["region_id", "region_name", "region_type"]],
-                               on="region_id", how="left"))
-    if REGIONAL_DRIVERS["estimable"].any():
-        display(REGIONAL_DRIVERS[REGIONAL_DRIVERS["estimable"]][
-            ["term", "region_id", "region_name", "region_type", "posterior_mean",
-             f"hdi{int(HDI_PROB * 100)}_lo", f"hdi{int(HDI_PROB * 100)}_hi",
-             "p_positive", "deviation_mean"]])
-    else:
-        print("\nNo region-specific slope was estimated: §10c allowed no random "
-              "slope, so every driver enters with a common gulf-wide coefficient.")
-    register("posterior_global_drivers", GLOBAL_DRIVERS, "environmental association")
-    register("posterior_regional_drivers", REGIONAL_DRIVERS,
-             "environmental association")
-elif HAVE_PYMC:
-    print("No driver coefficients: the full model has no beta (was the driver set "
-          "emptied by the ladder?).")
+_n_bad = int(RESID_DIAGNOSTICS["autocorrelated"].sum())
+print(f"{_n_bad} of {len(RESID_DIAGNOSTICS)} region(s) still show residual "
+      f"autocorrelation at the {LJUNG_BOX_ALPHA:.0%} level "
+      f"(calendar Ljung-Box, lags {LJUNG_BOX_LAGS}).")
+if _n_bad:
+    print("  Residual autocorrelation left at lag 1 means the AR structure has "
+          "NOT absorbed the persistence. The month-clustered standard errors "
+          "handle dependence ACROSS regions within a month, not across months, "
+          "so the intervals in §16 are then optimistic and are reported as "
+          "such.")
 ''')
 
 code(r'''# =====================================================================
-# 16b. Leave-one-region-out refits: is a sign driven by one region?
+# 15b. Stationarity, cluster count, collinearity, influence
 # =====================================================================
-# These fits do double duty. Here they answer "would the gulf-wide association
-# survive without region r?"; §18 reuses the same fits for genuine transfer
-# prediction to a region the model never saw.
-LORO_FITS = {}
-LORO_BETAS = pd.DataFrame()
-REGION_INFLUENCE = pd.DataFrame()
+_rho = np.atleast_1d(FIT_FULL["rho"])
+_stationary = bool(len(_rho) == 0 or abs(float(np.sum(_rho))) < 1.0)
 
-if HAVE_PYMC and FIT_FULL is not None and RUN_LORO and N_REGIONS >= 3:
-    _hold = list(REGION_IDS)
-    if LORO_MAX_REGIONS is not None:
-        _hold = _hold[:int(LORO_MAX_REGIONS)]
-        if len(_hold) < len(REGION_IDS):
-            print(f"FAST_MODE: withholding only {len(_hold)} of {N_REGIONS} "
-                  "regions. The influence check below is therefore PARTIAL; set "
-                  "FAST_MODE = False for the complete jackknife.")
-    _terms = PAIR["data_full"]["driver_terms"]
-    _rows = []
-    for rid in _hold:
-        keep = [i for i, r in enumerate(REGION_IDS) if r != rid]
-        sub_mask = OBS_MASK[keep, :]
-        d_full = make_model_data(
-            X_MODEL[keep][:, :, [DRIVER_TERMS.index(t) for t in _terms]],
-            Y_RAW[keep], sub_mask, SEASON, TT,
-            [REGION_IDS[i] for i in keep], _terms,
-            random_slope_terms=[t for t in PAIR["data_full"]["rs_terms"]
-                                if t in _terms])
-        try:
-            m = build_regional_model(
-                d_full, drivers=True, common_state=FINAL_CONFIG["common_state"],
-                regional_ar=FINAL_CONFIG["regional_ar"],
-                include_trend=FINAL_CONFIG["include_trend"],
-                use_random_slopes=FINAL_CONFIG["use_random_slopes"],
-                random_slope_parameterisation=FINAL_CONFIG.get(
-                    "random_slope_parameterisation"),
-                hierarchy_parameterisation=FINAL_CONFIG.get(
-                    "hierarchy_parameterisation"))
-            idl, infl = fit_model(m, SAMPLING_REFIT, label=f"loro_{rid}")
-        except Exception as exc:
-            print(f"  LORO {rid}: fit failed ({exc})")
-            continue
-        LORO_FITS[rid] = {"idata": idl, "data": d_full, "info": infl,
-                          "kept_regions": [REGION_IDS[i] for i in keep]}
-        if "beta" in idl.posterior:
-            bb = idl.posterior["beta"].stack(s=("chain", "draw")).to_numpy()
-            for k, term in enumerate(_terms):
-                s = summarise_coefficient(bb[k], term)
-                s.update({"withheld_region": rid,
-                          "divergences": infl["divergences"]})
-                _rows.append(s)
-        print(f"  LORO {rid}: {infl['seconds']}s, {infl['divergences']} divergence(s)")
-    LORO_BETAS = pd.DataFrame(_rows)
-    if len(LORO_BETAS):
-        display(LORO_BETAS[["withheld_region", "term", "posterior_mean",
-                            f"hdi{int(HDI_PROB * 100)}_lo",
-                            f"hdi{int(HDI_PROB * 100)}_hi", "p_positive"]])
-        _inf = []
-        for term, g in LORO_BETAS.groupby("term"):
-            full_mean = float(GLOBAL_DRIVERS.loc[GLOBAL_DRIVERS["term"] == term,
-                                                 "posterior_mean"].iloc[0])
-            signs = np.sign(g["posterior_mean"].to_numpy())
-            _inf.append({
-                "term": term,
-                "full_model_mean": full_mean,
-                "n_regions_withheld": int(len(g)),
-                "min_mean_without_a_region": float(g["posterior_mean"].min()),
-                "max_mean_without_a_region": float(g["posterior_mean"].max()),
-                "sign_stable_across_jackknife": bool(
-                    np.all(signs == np.sign(full_mean)) and np.all(signs != 0)),
-                "largest_shift": float(np.max(np.abs(
-                    g["posterior_mean"].to_numpy() - full_mean))),
-                "most_influential_region": g.loc[
-                    (g["posterior_mean"] - full_mean).abs().idxmax(),
-                    "withheld_region"],
-                "complete_jackknife": bool(len(g) == N_REGIONS),
-            })
-        REGION_INFLUENCE = pd.DataFrame(_inf)
-        display(REGION_INFLUENCE)
-        register("leave_one_region_out_betas", LORO_BETAS, "robustness")
-        register("region_influence_on_global_sign", REGION_INFLUENCE, "robustness")
-        print("A coefficient whose sign flips when one region is withheld is not a "
-              "gulf-wide association; it is that region's association.")
-elif HAVE_PYMC:
-    print("Leave-one-region-out skipped (RUN_LORO off, or fewer than 3 regions).")
-''')
-
-code(r'''# =====================================================================
-# 16c. Verdicts, and the null-vs-full comparison
-# =====================================================================
-if HAVE_PYMC and len(GLOBAL_DRIVERS):
-    def _verdict(row):
-        term = row["term"]
-        if not GATE_PASSED:
-            return ("not reportable",
-                    "the final fit did not clear the diagnostic gate")
-        het = False
-        if row.get("random_slope") and np.isfinite(
-                row.get("p_slope_sd_exceeds_rope", np.nan)):
-            het = bool(row["p_slope_sd_exceeds_rope"] > 0.90)
-        if not het and len(REGIONAL_DRIVERS):
-            sub = REGIONAL_DRIVERS[(REGIONAL_DRIVERS["term"] == term)
-                                   & REGIONAL_DRIVERS["estimable"]]
-            if len(sub) >= 2:
-                het = bool((sub["p_positive"] > 0.90).any()
-                           and (sub["p_negative"] > 0.90).any())
-        sign_ok = True
-        infl_note = ""
-        if len(REGION_INFLUENCE):
-            m = REGION_INFLUENCE[REGION_INFLUENCE["term"] == term]
-            if len(m):
-                sign_ok = bool(m["sign_stable_across_jackknife"].iloc[0])
-                if not bool(m["complete_jackknife"].iloc[0]):
-                    infl_note = " (jackknife partial — FAST_MODE)"
-        if row["hdi_excludes_zero"] and row["direction_matches_mechanism"] and sign_ok:
-            v = "supported"
-            why = (f"the {int(HDI_PROB * 100)}% HDI excludes zero, the sign matches "
-                   f"the predeclared mechanism, diagnostics passed and the sign "
-                   f"survives leaving any single region out{infl_note}")
-            if row["spatial_label"] == "temporal_only":
-                why += ("; NOTE this driver is gulf-wide only, so its effective "
-                        "replication is the number of months, not region-months")
-            if row.get("season_confounded"):
-                v = "suggestive"
-                why = ("interval excludes zero, but the driver is essentially the "
-                       "annual cycle (R2 of the harmonics above the threshold), so "
-                       "it cannot be separated from season")
-            return v, why
-        if het:
-            return ("heterogeneous",
-                    "regional slopes differ clearly in direction or magnitude, so "
-                    "a single gulf-wide number misrepresents the association")
-        if row["hdi_excludes_zero"] and not row["direction_matches_mechanism"]:
-            return ("no evidence",
-                    "the interval excludes zero but in the direction OPPOSITE to "
-                    "the predeclared mechanism, so it does not support it")
-        if row["hdi_excludes_zero"] and not sign_ok:
-            return ("no evidence",
-                    "the interval excludes zero, but the sign does not survive "
-                    "withholding a single region")
-        if max(row["p_positive"], row["p_negative"]) >= 0.90:
-            return ("suggestive",
-                    f"posterior sign probability "
-                    f"{max(row['p_positive'], row['p_negative']):.2f}, but the "
-                    f"{int(HDI_PROB * 100)}% interval includes zero")
-        if row["p_in_rope"] > 0.80:
-            return ("no evidence",
-                    f"the posterior sits inside the ROPE "
-                    f"(|beta| < {ROPE_HALFWIDTH}) with probability "
-                    f"{row['p_in_rope']:.2f}: practically zero, not merely "
-                    "uncertain")
-        if row["spatial_label"] == "temporal_only":
-            # More informative than a bare "no evidence": the regional design
-            # could not have helped this driver in the first place.
-            return ("temporal_only",
-                    "one gulf-wide value per month repeated across regions, so "
-                    "the regional design adds no information for this driver; "
-                    "the interval also includes zero and its effective "
-                    "replication is the number of months")
-        return ("no evidence", "interval includes zero and no direction is "
-                               "clearly favoured")
-
-    _v = [_verdict(r) for _, r in GLOBAL_DRIVERS.iterrows()]
-    GLOBAL_DRIVERS["verdict"] = [a for a, _ in _v]
-    GLOBAL_DRIVERS["verdict_reason"] = [b for _, b in _v]
-    GLOBAL_DRIVERS["regional_design_adds_information"] = (
-        GLOBAL_DRIVERS["spatial_label"] == "spatiotemporal")
-    display(GLOBAL_DRIVERS[["term", "spatial_label", "posterior_mean",
-                            f"hdi{int(HDI_PROB * 100)}_lo",
-                            f"hdi{int(HDI_PROB * 100)}_hi", "p_positive",
-                            "p_in_rope", "verdict", "verdict_reason"]])
-    register("posterior_global_drivers", GLOBAL_DRIVERS,
-             "environmental association")
-
-    # --- null vs full --------------------------------------------------------
+# --- collinearity among the driver columns, on the fitted design -------------
+_drv = [t for t in MODEL_DATA["driver_terms"] if t in FIT_FULL["names"]]
+_Xd = FIT_FULL["result"].model.exog
+_names = FIT_FULL["names"]
+_vif_rows = []
+for _t in _drv:
+    _j = _names.index(_t)
+    _others = [i for i in range(_Xd.shape[1]) if i != _j]
     try:
-        _cmp = az.compare({"regional_dynamic_null": FIT_NULL,
-                           "regional_dynamic_full": FIT_FULL},
-                          ic="loo", method="stacking")
-        NULL_VS_FULL = _cmp.reset_index().rename(columns={"index": "model"})
-        display(NULL_VS_FULL)
-        _win = NULL_VS_FULL.iloc[0]["model"]
-        _d = float(NULL_VS_FULL["elpd_diff"].iloc[1]) if len(NULL_VS_FULL) > 1 else 0.0
-        _dse = float(NULL_VS_FULL["dse"].iloc[1]) if len(NULL_VS_FULL) > 1 else np.nan
-        print(f"\nLOO prefers {_win}. elpd difference {_d:.2f} "
-              f"(dse {_dse:.2f}).")
-        if np.isfinite(_dse) and abs(_d) <= 2 * _dse:
-            print("That difference is within two standard errors of zero: on this "
-                  "criterion the drivers do not improve conditional fit.")
-        print("This is a CONDITIONAL-FIT comparison with the latent states in "
-              "place. Whether the drivers improve genuine one-month-ahead "
-              "prediction is §17, and that is the question that matters.")
-        # A latent-state model can carry more effective parameters than it has
-        # observations. When it does, PSIS-LOO is not estimating out-of-sample
-        # fit for either model and the comparison above must not be used at all.
-        _n_lik = int(len(MODEL_DATA["y_obs"]))
-        if "p_loo" in NULL_VS_FULL.columns:
-            _sat = NULL_VS_FULL[NULL_VS_FULL["p_loo"] >= 0.7 * _n_lik]
-            if len(_sat):
-                print(f"\n*** LOO IS NOT USABLE HERE: p_loo reaches "
-                      f"{NULL_VS_FULL['p_loo'].max():.1f} effective parameters "
-                      f"against {_n_lik} likelihood rows "
-                      f"({', '.join(_sat['model'].tolist())}). The latent state "
-                      "has close to one free value per observation, so the model "
-                      "is near-saturated and PSIS-LOO is measuring which model "
-                      "overfits its own leave-one-out less, not which predicts "
-                      "better. Ignore the ranking above and use §17. ***")
-    except Exception as exc:
-        print(f"az.compare unavailable: {exc}")
-    register("null_vs_full_comparison", NULL_VS_FULL, "model comparison")
+        _r2 = sm.OLS(_Xd[:, _j], _Xd[:, _others]).fit().rsquared
+    except Exception:
+        _r2 = np.nan
+    _vif_rows.append({"term": _t,
+                      "r2_on_other_terms": float(_r2),
+                      "vif": (float(1.0 / (1.0 - _r2))
+                              if np.isfinite(_r2) and _r2 < 1 else np.inf)})
+VIF_TABLE = pd.DataFrame(_vif_rows)
+if len(VIF_TABLE):
+    display(VIF_TABLE)
+register("driver_collinearity", VIF_TABLE, "diagnostic")
+
+# --- influence: how far does dropping ONE calendar month move a coefficient? --
+_infl = []
+if _drv:
+    _base = FIT_FULL["params"][_drv].to_numpy(dtype=float)
+    _months_all = np.unique(MODEL_DATA["obs_t"][AR_ROWS])
+    for _m in _months_all:
+        _rows_m = AR_ROWS.copy()
+        _rows_m[MODEL_DATA["obs_t"] == _m] = False
+        try:
+            _f = fit_panel_ar(MODEL_DATA, p=SELECTED_AR_ORDER, drivers=True,
+                              include_trend=INCLUDE_TREND, rows=_rows_m,
+                              lag_index=AR_LAGX, label="influence")
+            _d = _f["params"][_drv].to_numpy(dtype=float) - _base
+        except Exception:
+            continue
+        _infl.append({"month": MONTH_GRID[int(_m)],
+                      "max_abs_coef_shift": float(np.max(np.abs(_d))),
+                      "term_most_moved": _drv[int(np.argmax(np.abs(_d)))]})
+REGION_INFLUENCE = (pd.DataFrame(_infl).sort_values("max_abs_coef_shift",
+                                                    ascending=False)
+                    .reset_index(drop=True) if _infl else pd.DataFrame())
+if len(REGION_INFLUENCE):
+    print("Leave-one-calendar-month-out influence on the driver coefficients "
+          "(largest first):")
+    display(REGION_INFLUENCE.head(5))
+    register("coefficient_influence", REGION_INFLUENCE, "diagnostic")
+
+GATE_FAILURES = []
+if _n_bad:
+    GATE_FAILURES.append(
+        f"residual autocorrelation in {_n_bad} region(s) (calendar Ljung-Box "
+        f"p < {LJUNG_BOX_ALPHA})")
+if not _stationary:
+    GATE_FAILURES.append(f"non-stationary AR coefficients (sum rho = "
+                         f"{float(np.sum(_rho)):.3f})")
+if FIT_FULL["n_clusters"] < MIN_MONTH_CLUSTERS:
+    GATE_FAILURES.append(
+        f"only {FIT_FULL['n_clusters']} calendar-month clusters "
+        f"(< MIN_MONTH_CLUSTERS={MIN_MONTH_CLUSTERS}); the clustered covariance "
+        "is unreliable below that")
+if len(VIF_TABLE) and (VIF_TABLE["vif"] > MAX_DRIVER_VIF).any():
+    _bad_vif = VIF_TABLE.loc[VIF_TABLE["vif"] > MAX_DRIVER_VIF, "term"].tolist()
+    GATE_FAILURES.append(f"collinear driver(s) {_bad_vif} "
+                         f"(VIF > {MAX_DRIVER_VIF})")
+if len(REGION_INFLUENCE) and (REGION_INFLUENCE["max_abs_coef_shift"].iloc[0]
+                              > INFLUENCE_MAX_SHIFT):
+    GATE_FAILURES.append(
+        f"one calendar month ({REGION_INFLUENCE['month'].iloc[0]:%Y-%m}) moves a "
+        f"driver coefficient by "
+        f"{REGION_INFLUENCE['max_abs_coef_shift'].iloc[0]:.3f} "
+        f"(> INFLUENCE_MAX_SHIFT={INFLUENCE_MAX_SHIFT})")
+GATE_PASSED = not GATE_FAILURES
+
+DIAGNOSTIC_SUMMARY = pd.DataFrame([{
+    "n_obs": FIT_FULL["n_obs"], "n_month_clusters": FIT_FULL["n_clusters"],
+    "ar_order": SELECTED_AR_ORDER,
+    "rho": ", ".join(f"{r:.3f}" for r in _rho) if len(_rho) else "",
+    "stationary": _stationary,
+    "regions_with_residual_autocorrelation": _n_bad,
+    "max_driver_vif": (float(VIF_TABLE["vif"].max()) if len(VIF_TABLE)
+                       else np.nan),
+    "max_leave_one_month_coef_shift": (
+        float(REGION_INFLUENCE["max_abs_coef_shift"].iloc[0])
+        if len(REGION_INFLUENCE) else np.nan),
+    "gate_passed": GATE_PASSED,
+    "failures": "; ".join(GATE_FAILURES)}])
+display(DIAGNOSTIC_SUMMARY)
+register("diagnostic_summary", DIAGNOSTIC_SUMMARY, "diagnostic")
+if GATE_PASSED:
+    print("Diagnostic gate PASSED.")
+else:
+    print("*** Diagnostic gate NOT passed: " + "; ".join(GATE_FAILURES)
+          + ". §16 reports the coefficients as NOT REPORTABLE. ***")
 ''')
 
 code(r'''# =====================================================================
-# 16d. The endogenous optical proxies — descriptive only
+# 15c. Fitted-vs-observed, and the residual distribution
 # =====================================================================
-# Chl-a and turbidity are measured from the same reflectance a floating mat
-# dominates, and a mat changes the water beneath it. They are downstream of WH as
-# much as upstream, so they never enter a driver claim. Reported once here as a
-# within-region, within-month partial association, clearly labelled.
+fig, axes = plt.subplots(1, 3, figsize=(15, 4.0))
+_obs = RESID_FRAME.dropna(subset=["resid"])
+axes[0].scatter(_obs["eta"], _obs["y"], s=12, alpha=0.55, color="#4C72B0")
+_lim = [min(_obs["eta"].min(), _obs["y"].min()),
+        max(_obs["eta"].max(), _obs["y"].max())]
+axes[0].plot(_lim, _lim, color="0.3", lw=1, ls="--")
+axes[0].set_xlabel("fitted (logit)")
+axes[0].set_ylabel("observed (logit)")
+axes[0].set_title("Fitted vs observed", fontsize=10)
+axes[1].hist(_obs["resid"], bins=30, color="#4C72B0", alpha=0.85)
+axes[1].axvline(0, color="0.3", lw=1)
+axes[1].set_xlabel("residual (logit)")
+axes[1].set_title("Residual distribution", fontsize=10)
+sstats.probplot(_obs["resid"].to_numpy(), dist="norm", plot=axes[2])
+axes[2].set_title("Residual normal Q-Q", fontsize=10)
+fig.suptitle("§15c Fit diagnostics — regional panel regression with "
+             f"AR({SELECTED_AR_ORDER}) errors", fontsize=11)
+fig.tight_layout()
+plt.show()
+
+PPC_TABLE = pd.DataFrame([
+    {"statistic": "mean", "observed": float(_obs["y"].mean()),
+     "fitted": float(_obs["eta"].mean())},
+    {"statistic": "sd", "observed": float(_obs["y"].std(ddof=1)),
+     "fitted": float(_obs["eta"].std(ddof=1))},
+    {"statistic": "min", "observed": float(_obs["y"].min()),
+     "fitted": float(_obs["eta"].min())},
+    {"statistic": "max", "observed": float(_obs["y"].max()),
+     "fitted": float(_obs["eta"].max())}])
+PPC_TABLE["difference"] = PPC_TABLE["fitted"] - PPC_TABLE["observed"]
+display(PPC_TABLE)
+register("fit_summary_statistics", PPC_TABLE, "diagnostic")
+print(f"R-squared (quasi-differenced scale): "
+      f"{float(FIT_FULL['result'].rsquared):.3f}; "
+      f"residual SD (level scale): {float(np.nanstd(FIT_FULL['resid_level'])):.3f} "
+      "logit units.")
+''')
+
+
+# ===========================================================================
+# 16. Inference
+# ===========================================================================
+md(r"""## 16. Driver associations
+
+Four things are reported for every driver, and the verdict uses all of them:
+
+1. the **estimate** on the standardised-logit scale — a 1 SD move in the driver
+   shifts the log-odds of regional cover by this much;
+2. the **month-clustered confidence interval**;
+3. whether that interval clears the **ROPE**, the band around zero
+   ($\pm$`ROPE_HALFWIDTH`) inside which an association is too small to be
+   ecologically interesting at this sample size;
+4. whether the sign matches the **predeclared** expectation from §3e.
+
+A verdict of `supported` requires the interval to exclude zero **and** to lie
+outside the ROPE. `suggestive` means it excludes zero but sits inside the ROPE —
+detectable but small. Everything else is `not supported`, and if §15's gate
+failed, everything is `not reportable` regardless of how the numbers look.
+
+**The sample size that matters.** Every interval here comes from a covariance
+clustered on calendar month. For a driver with one gulf-wide value per month
+that is the honest $n$: the
+`temporal_only` drivers are replicated across regions but not across
+independent observations, and clustering is what stops the region-months from
+being counted as though they were.
+""")
+
+code(r'''# =====================================================================
+# 16a. Global driver associations
+# =====================================================================
+_terms = [t for t in MODEL_DATA["driver_terms"] if t in FIT_FULL["names"]]
+_meta = {r["term"]: r for r in DRIVER_META.to_dict("records")}
+_sl = {c: lab for c, lab in zip(DRIVER_VARIANCE["driver"],
+                                DRIVER_VARIANCE["spatial_label"])}
+
+GLOBAL_DRIVERS = coef_frame(FIT_FULL, terms=_terms)
+GLOBAL_DRIVERS["mechanism"] = [_meta.get(t, {}).get("mechanism", "")
+                               for t in GLOBAL_DRIVERS["term"]]
+GLOBAL_DRIVERS["expected_sign"] = [_meta.get(t, {}).get("expected_sign", "?")
+                                   for t in GLOBAL_DRIVERS["term"]]
+GLOBAL_DRIVERS["spatial_label"] = [
+    _sl.get(_meta.get(t, {}).get("column"), "undetermined")
+    for t in GLOBAL_DRIVERS["term"]]
+GLOBAL_DRIVERS["ci_excludes_zero"] = (
+    (GLOBAL_DRIVERS["ci_lo"] > 0) | (GLOBAL_DRIVERS["ci_hi"] < 0))
+GLOBAL_DRIVERS["outside_rope"] = (
+    (GLOBAL_DRIVERS["ci_lo"] > ROPE_HALFWIDTH)
+    | (GLOBAL_DRIVERS["ci_hi"] < -ROPE_HALFWIDTH))
+GLOBAL_DRIVERS["sign_matches_expected"] = [
+    (s == "?") or (s == "+" and e > 0) or (s == "-" and e < 0)
+    for s, e in zip(GLOBAL_DRIVERS["expected_sign"], GLOBAL_DRIVERS["estimate"])]
+
+
+def _verdict(row):
+    if not GATE_PASSED:
+        return "not reportable", "the final fit did not clear §15's diagnostic gate"
+    if row["ci_excludes_zero"] and row["outside_rope"]:
+        return "supported", (f"{int(HDI_PROB * 100)}% CI excludes zero and lies "
+                             f"outside the ROPE (|beta| < {ROPE_HALFWIDTH})")
+    if row["ci_excludes_zero"]:
+        return "suggestive", ("CI excludes zero but lies inside the ROPE: "
+                              "detectable, too small to be ecologically "
+                              "interesting at this sample size")
+    return "not supported", f"the {int(HDI_PROB * 100)}% CI includes zero"
+
+
+GLOBAL_DRIVERS[["verdict", "verdict_reason"]] = [
+    _verdict(r) for _, r in GLOBAL_DRIVERS.iterrows()]
+GLOBAL_DRIVERS = GLOBAL_DRIVERS[[
+    "term", "mechanism", "spatial_label", "expected_sign", "estimate", "se",
+    "ci_lo", "ci_hi", "t", "p_value", "ci_excludes_zero", "outside_rope",
+    "sign_matches_expected", "verdict", "verdict_reason"]]
+display(GLOBAL_DRIVERS.drop(columns=["mechanism", "verdict_reason"]))
+register("global_driver_associations", GLOBAL_DRIVERS,
+         "environmental association")
+
+print(f"Scale: standardised logit. An estimate of 0.10 means a 1 SD move in the "
+      "driver shifts the log-odds of regional cover by 0.10 (odds x 1.105).")
+print(f"ROPE: |beta| < {ROPE_HALFWIDTH} is practically equivalent to zero.")
+print(f"Standard errors are clustered on calendar month: "
+      f"{FIT_FULL['n_clusters']} clusters over {FIT_FULL['n_obs']} region-months.")
+_sup = GLOBAL_DRIVERS[GLOBAL_DRIVERS["verdict"] == "supported"]
+_sug = GLOBAL_DRIVERS[GLOBAL_DRIVERS["verdict"] == "suggestive"]
+print(f"\nSupported: {_sup['term'].tolist() or 'NONE'}")
+print(f"Suggestive: {_sug['term'].tolist() or 'none'}")
+if not GATE_PASSED:
+    print("*** ...but §15's gate failed, so every verdict above reads "
+          "'not reportable'. ***")
+
+# No region-varying slopes are estimated in this specification.
+REGIONAL_DRIVERS = pd.DataFrame()
+register("regional_driver_associations", REGIONAL_DRIVERS,
+         "environmental association")
+print("\nNo region-specific slope was estimated: §10c allowed no random slope, "
+      "so every driver enters with a common gulf-wide coefficient.")
+''')
+
+code(r'''# =====================================================================
+# 16b. The region intercepts, reported descriptively
+# =====================================================================
+# These are FIXED effects, not draws from a fitted population distribution. Their
+# spread describes the regions in this record; it is not an estimate of
+# between-region heterogeneity in some wider population, and §22 says so.
+_alpha_terms = [n for n in FIT_FULL["names"] if n.startswith("alpha[")]
+REGION_INTERCEPTS = coef_frame(FIT_FULL, terms=_alpha_terms)
+REGION_INTERCEPTS["region_id"] = [t[6:-1] for t in REGION_INTERCEPTS["term"]]
+REGION_INTERCEPTS = REGION_INTERCEPTS.merge(
+    REGIONS[["region_id", "region_name", "region_type", "eligible_area_ha"]],
+    on="region_id", how="left").sort_values("estimate", ascending=False)
+display(REGION_INTERCEPTS[["region_id", "region_name", "region_type",
+                           "estimate", "se", "ci_lo", "ci_hi"]])
+register("region_intercepts", REGION_INTERCEPTS, "regional")
+print(f"Spread of the region intercepts: SD = "
+      f"{float(REGION_INTERCEPTS['estimate'].std(ddof=1)):.3f} logit units, "
+      f"range {float(REGION_INTERCEPTS['estimate'].min()):.2f} to "
+      f"{float(REGION_INTERCEPTS['estimate'].max()):.2f}.")
+print("  These are fixed effects. The spread DESCRIBES the regions in this "
+      "record; it is not a variance component and must not be read as one.")
+
+_by_type = (REGION_INTERCEPTS.groupby("region_type")
+            .agg(n_regions=("region_id", "size"),
+                 mean_intercept=("estimate", "mean"),
+                 sd_intercept=("estimate", "std")).reset_index())
+display(_by_type)
+register("region_intercepts_by_type", _by_type, "regional")
+''')
+
+code(r'''# =====================================================================
+# 16c. The endogenous optical proxies — descriptive only
+# =====================================================================
 PROXY_ASSOCIATION = pd.DataFrame()
 if PROXY_COLS:
-    _d = REGION_MONTH[REGION_MONTH["observed"]].copy()
     _rows = []
-    for c in PROXY_COLS:
-        v = pd.to_numeric(_d[c], errors="coerce")
-        ok = v.notna() & _d["y"].notna()
-        if int(ok.sum()) < 12:
+    _obs_rm = REGION_MONTH[REGION_MONTH["observed"]].copy()
+    for _c in PROXY_COLS:
+        if _c not in _obs_rm.columns:
             continue
-        sub = _d[ok].copy()
-        sub["_x"] = v[ok]
-        # remove region means AND month means: what is left is the within-region,
-        # within-month covariation, which is the only part not explained by "some
-        # regions are weedier" or "some months were weedier everywhere".
-        for col in ("_x", "y"):
-            sub[col] = (sub[col] - sub.groupby("region_id")[col].transform("mean")
-                        - sub.groupby("month")[col].transform("mean")
-                        + sub[col].mean())
-        r, p = sstats.pearsonr(sub["_x"], sub["y"])
-        _rows.append({"proxy": c, "n_region_months": int(ok.sum()),
-                      "partial_pearson_r": float(r), "p_value": float(p),
-                      "interpretation": "DESCRIPTIVE ONLY — endogenous to WH; "
-                                        "not a driver estimate"})
+        _sub = _obs_rm[["region_id", "month", "y", _c]].dropna()
+        if len(_sub) < 10:
+            continue
+        # within-region, within-month: remove both means before correlating
+        _sub["_x"] = (_sub[_c] - _sub.groupby("region_id")[_c].transform("mean")
+                      - _sub.groupby("month")[_c].transform("mean")
+                      + _sub[_c].mean())
+        _sub["_y"] = (_sub["y"] - _sub.groupby("region_id")["y"].transform("mean")
+                      - _sub.groupby("month")["y"].transform("mean")
+                      + _sub["y"].mean())
+        if _sub["_x"].std(ddof=0) == 0 or _sub["_y"].std(ddof=0) == 0:
+            _r = _p = np.nan
+        else:
+            _r, _p = sstats.pearsonr(_sub["_x"], _sub["_y"])
+        _rows.append({"proxy": _c, "n_region_months": int(len(_sub)),
+                      "partial_pearson_r": float(_r), "p_value": float(_p),
+                      "interpretation": ("DESCRIPTIVE ONLY — endogenous to WH; "
+                                         "not a driver claim")})
     PROXY_ASSOCIATION = pd.DataFrame(_rows)
     if len(PROXY_ASSOCIATION):
         display(PROXY_ASSOCIATION)
-        register("endogenous_proxy_association", PROXY_ASSOCIATION,
-                 "descriptive association")
-        print("These are correlations between WH cover and quantities measured "
-              "from the same pixels. They are reported for completeness and "
-              "excluded from every driver conclusion.")
-else:
-    print("No endogenous optical proxy column is present in this panel.")
+        register("endogenous_proxy_association", PROXY_ASSOCIATION, "descriptive")
+    print("These are correlations between WH cover and quantities measured from "
+          "the same pixels. They are reported for completeness and excluded "
+          "from every driver conclusion.")
 ''')
 
 
@@ -5369,24 +4764,28 @@ else:
 # ===========================================================================
 md(r"""## 17. Temporal validation — expanding window, **one calendar month ahead**
 
-### The design
+AICc and an F-test score fit. This scores **forecasts**, and it is the comparison
+that settles whether the drivers earn their place.
 
-* **Expanding window.** At each origin the training set is every calendar month
-  up to and including that origin; the target is the **single next calendar
-  month**. `max(train month) < target month` is asserted at every origin.
-* **Scaling is fitted inside the fold.** The driver means and SDs come from the
-  fold's training months only. The global scaler from §11 is deliberately *not*
-  reused: its constants were computed with the target month in them.
-* **Only origin-time information enters a predictor.** Rainfall already enters at
-  lag 1. Contemporaneous temperature, wind and lake level are **moved to lag 1**
-  for this evaluation, because their same-month value is not knowable at the
-  origin. Every forecast driver's lag is asserted $\ge$
-  `VAL_FORECAST_MIN_LAG`. The a-priori (lag-0) specification is retained
-  unchanged for the §14/§16 association inference — nowcasting and forecasting
+At each origin month $T_0$ the model is **refitted from scratch** on months
+$\le T_0$ only — its own AR coefficients, its own regression coefficients, its
+own driver standardisation — and asked for month $T_0+1$. Because each fit takes
+milliseconds rather than hours, **every feasible origin is used**; there is no
+cap to justify and no question of a cap landing in one season.
+
+### What is never allowed to leak
+
+* **No driver value dated at or after the target month.** Contemporaneous
+  temperature, wind and lake level are moved to **lag 1** for this evaluation,
+  because their same-month value is not knowable at the origin. Every forecast
+  driver's lag is asserted $\ge$ `VAL_FORECAST_MIN_LAG`. The a-priori (lag-0)
+  specification is retained unchanged for §14/§16 — nowcasting and forecasting
   are different questions and are never merged.
-* **The state is projected, not peeked at.** $g_{T+1}=\rho_g g_T$ (or $g_T$ under
-  the local level) and $u_{r,T+1}=\rho_r u_{r,T}$, using only states estimated
-  from training months.
+* **The AR term is projected, not peeked at.** The forecast error correction is
+  $\sum_j \hat\rho_j \hat e_{r,T_0+1-j}$, using residuals from training months
+  only. Where a required residual falls in an excluded month it contributes
+  zero, and the count is reported.
+* **The scaler is refitted per fold**, on training rows only.
 
 ### What it is compared against
 
@@ -5394,7 +4793,7 @@ md(r"""## 17. Temporal validation — expanding window, **one calendar month ahe
 |---|---|---|
 | literal region persistence | $\hat y_{r,t}=y_{r,t-1}$ at exactly $t-1$ calendar months | **no** |
 | seasonal naïve | $\hat y_{r,t}=y_{r,t-12}$ by calendar timestamp | **no** |
-| `regional_dynamic_null` | the hierarchical dynamic model with no driver | yes |
+| `regional_dynamic_null` | the panel regression with no driver | yes |
 | `regional_dynamic_full` | the same plus the driver block | yes |
 
 ### How performance is reported
@@ -5404,9 +4803,9 @@ carry the score), valid-area-weighted RMSE/MAE, a breakdown by ecological region
 type, and both the logit and the back-transformed cover scale.
 
 **The resampling unit for uncertainty is the calendar month, not the
-region-month.** Regions observed in the same month share weather, share the
-shared state, and share a satellite pass; treating them as independent replicates
-would shrink every interval by roughly $\sqrt{R}$ for no reason.
+region-month.** Regions observed in the same month share weather, share the lake
+and share a satellite pass; treating them as independent replicates would shrink
+every interval by roughly $\sqrt{R}$ for no reason.
 """)
 
 code(r'''# =====================================================================
@@ -5415,8 +4814,8 @@ code(r'''# =====================================================================
 FORECAST_SPECS = pd.DataFrame()
 FC_TERMS, X_FC_RAW = [], np.zeros((R, T, 0))
 
-if HAVE_PYMC and FIT_FULL is not None:
-    _terms_used = PAIR["data_full"]["driver_terms"]
+if FIT_FULL is not None:
+    _terms_used = MODEL_DATA["driver_terms"]
     _rows, _arrs = [], []
     for base, meta in FORCING.items():
         term = f"{base}_lag{meta['apriori_lag']}" if meta["apriori_lag"] else base
@@ -5454,148 +4853,117 @@ if HAVE_PYMC and FIT_FULL is not None:
 ''')
 
 code(r'''# =====================================================================
-# 17b. Expanding-window rolling origin
+# 17b. Rolling origin, refit from scratch at every origin
 # =====================================================================
 VAL_FOLD_AUDIT = pd.DataFrame()
 VAL_PREDICTIONS = pd.DataFrame()
 VAL_SCALER_AUDIT = pd.DataFrame()
 
 
-def forecast_next_month(idata, cfg, x_next_std, tt_next, season_next, rs_idx):
-    """One-calendar-month-ahead posterior predictive mean per region.
+def forecast_one_month(fit, data_fc, region_ids, tgt, x_next_std, ar_order):
+    """One-calendar-month-ahead prediction for every region, on the logit scale.
 
-    Uses ONLY parameters and states estimated on the training months: the shared
-    state is projected forward by its own AR coefficient, never read from the
-    target month.
+    eta = alpha_r + season_t + trend_t + x'beta + sum_j rho_j * resid[r, t-j],
+    with the residual terms taken from TRAINING months only.
     """
-    po = idata.posterior
-    st = lambda v: po[v].stack(s=("chain", "draw")).to_numpy()
-    alpha = st("alpha")                       # (region, S)
-    gamma = st("gamma_season")                # (season, S)
-    S_ = alpha.shape[1]
-    eta = alpha + (season_next[:, None] * gamma).sum(axis=0)[None, :]
-    if "tau_trend" in po:
-        eta = eta + st("tau_trend")[None, :] * float(tt_next)
-    if "beta" in po and x_next_std.shape[1]:
-        beta = st("beta")                     # (driver, S)
-        eta = eta + x_next_std @ beta
-        if "b" in po and rs_idx:
-            b = st("b")                       # (region, rs, S)
-            for j, k in enumerate(rs_idx):
-                eta = eta + b[:, j, :] * x_next_std[:, k][:, None]
-    if "g" in po:
-        g = st("g")                           # (time, S)
-        rho_g = st("rho_g") if "rho_g" in po else np.ones(S_)
-        g_next = rho_g * g[-1, :]
-        eta = eta + st("lam") * g_next[None, :]
-    if "u" in po:
-        u = st("u")                           # (region, time, S)
-        if "rho_u" in po:
-            ru = st("rho_u")
-            ru = ru if ru.ndim == 2 else np.repeat(ru[None, :], u.shape[0], axis=0)
-        else:
-            ru = np.zeros((u.shape[0], S_))
-        eta = eta + ru * u[:, -1, :]
-    return eta                                # (region, S)
+    par = fit["params"]
+    eta = np.full(len(region_ids), np.nan)
+    ar_used = np.zeros(len(region_ids), dtype=int)
+    S = np.asarray(data_fc["season"], dtype=float)[tgt, :]
+    tt = float(np.asarray(data_fc["tt"], dtype=float)[tgt])
+    resid_map = fit.get("resid_by_region_time", {})
+    for i, rid in enumerate(region_ids):
+        key = f"alpha[{rid}]"
+        if key not in par.index:
+            continue
+        v = float(par[key])
+        for j in range(S.shape[0] if S.ndim else 0):
+            nm = f"season[s{j}]"
+            if nm in par.index:
+                v += float(par[nm]) * float(S[j])
+        if "trend" in par.index:
+            v += float(par["trend"]) * tt
+        for k, term in enumerate(fit.get("forecast_terms", [])):
+            if term in par.index and np.isfinite(x_next_std[i, k]):
+                v += float(par[term]) * float(x_next_std[i, k])
+        for j, rj in enumerate(np.atleast_1d(fit["rho"]), start=1):
+            e = resid_map.get((i, int(tgt) - j))
+            if e is not None and np.isfinite(e):
+                v += float(rj) * float(e)
+                ar_used[i] += 1
+        eta[i] = v
+    return eta, ar_used
 
 
-if HAVE_PYMC and FIT_FULL is not None and len(FC_TERMS):
+if FIT_FULL is not None and len(FC_TERMS):
     _y_ok = np.isfinite(Y_RAW)
     _fc_ok = np.all(np.isfinite(X_FC_RAW), axis=2)
     _obs_fc = _y_ok & _fc_ok
     _obs_per_month = _obs_fc.sum(axis=0)
     _cum_obs_months = np.cumsum(_obs_per_month > 0)
-
     _feasible = [o for o in range(T - 1)
                  if _cum_obs_months[o] >= VAL_MIN_TRAIN_MONTHS
                  and _obs_fc[:, o + 1].any()]
     if VAL_MAX_ORIGINS is not None and len(_feasible) > int(VAL_MAX_ORIGINS):
-        # Evenly spaced across the feasible origins, so the cap does not restrict
-        # the test to one season or one part of the record.
         _pick = np.linspace(0, len(_feasible) - 1, int(VAL_MAX_ORIGINS))
         _feasible = [_feasible[int(round(i))] for i in _pick]
-        _feasible = sorted(set(_feasible))
     print(f"Rolling-origin folds: {len(_feasible)} origin(s)"
-          + (f" (capped by VAL_MAX_ORIGINS={VAL_MAX_ORIGINS}; evenly spaced across "
-             "the record)" if VAL_MAX_ORIGINS else ""))
+          + ("" if VAL_MAX_ORIGINS is None
+             else f" (capped by VAL_MAX_ORIGINS={VAL_MAX_ORIGINS})"))
 
     _fold_rows, _pred_rows, _scale_rows = [], [], []
-    _rs_names = [t for t in PAIR["data_full"]["rs_terms"]]
     for _fold, o in enumerate(_feasible):
-        t_tr = o + 1
         tgt = o + 1
-        mask_tr = _obs_fc[:, :t_tr]
-        if mask_tr.sum() < 4 * R:
+        mask_tr = _obs_fc.copy()
+        mask_tr[:, o + 1:] = False
+        if int(mask_tr.sum()) < VAL_MIN_TRAIN_ROWS:
             _fold_rows.append({"fold": _fold, "origin_month": MONTH_GRID[o],
-                               "usable": False,
+                               "target_month": MONTH_GRID[tgt], "usable": False,
                                "skip_reason": "too few training region-months"})
             continue
-        # --- scaling fitted on THIS fold's training months only --------------
-        Xtr = X_FC_RAW[:, :t_tr, :].copy()
-        Xstd = np.zeros_like(Xtr)
-        x_next = np.full((R, len(FC_TERMS)), np.nan)
-        for k, name in enumerate(FC_TERMS):
-            v = Xtr[:, :, k][mask_tr]
-            mu = float(np.nanmean(v)); sd = float(np.nanstd(v))
-            sd = sd if np.isfinite(sd) and sd > 0 else 1.0
-            Xstd[:, :, k] = (Xtr[:, :, k] - mu) / sd
-            x_next[:, k] = (X_FC_RAW[:, tgt, k] - mu) / sd
+        # --- per-fold standardisation, training rows only -------------------
+        Xs = np.zeros_like(X_FC_RAW)
+        for k, term in enumerate(FC_TERMS):
+            v = X_FC_RAW[:, :, k][mask_tr]
+            mu = float(np.nanmean(v)) if np.isfinite(v).any() else 0.0
+            sd = float(np.nanstd(v)) if np.isfinite(v).any() else 1.0
+            sd = sd if sd > 0 else 1.0
+            Xs[:, :, k] = (X_FC_RAW[:, :, k] - mu) / sd
             _scale_rows.append({"fold": _fold, "origin_month": MONTH_GRID[o],
-                                "term": name, "mean": mu, "sd": sd,
-                                "n_training_region_months": int(np.isfinite(v).sum())})
-        Xstd = np.where(np.isfinite(Xstd), Xstd, 0.0)
-        tt_tr = np.arange(t_tr, dtype=float)
-        sc = {"mean": float(tt_tr.mean()), "sd": float(tt_tr.std() or 1.0)}
-        tt_std = (tt_tr - sc["mean"]) / sc["sd"]
-        tt_next = (float(t_tr) - sc["mean"]) / sc["sd"]
-        season_tr = fourier_terms(pd.Series(MONTH_GRID[:t_tr]),
-                                  SEASON_HARMONICS).to_numpy()
-        season_next = fourier_terms(pd.Series([MONTH_GRID[tgt]]),
-                                    SEASON_HARMONICS).to_numpy()[0]
+                                "term": term, "mean": mu, "sd": sd,
+                                "scope": "training rows only"})
+        Xs = np.where(np.isfinite(Xs), Xs, 0.0)
 
-        d_full = make_model_data(Xstd, Y_RAW[:, :t_tr], mask_tr, season_tr,
-                                 tt_std, REGION_IDS, FC_TERMS,
-                                 random_slope_terms=[
-                                     n for n in FC_TERMS
-                                     if any(n.startswith(f"fc_{c}")
-                                            for c in RANDOM_SLOPE_TERMS)]
-                                 if FINAL_CONFIG["use_random_slopes"] else [])
-        d_null = make_model_data(np.zeros((R, t_tr, 0)), Y_RAW[:, :t_tr], mask_tr,
-                                 season_tr, tt_std, REGION_IDS, [])
-        assert MONTH_GRID[:t_tr].max() < MONTH_GRID[tgt], \
-            "training reaches the target month"
-
-        try:
-            m_n = build_regional_model(
-                d_null, drivers=False,
-                common_state=FINAL_CONFIG["common_state"],
-                regional_ar=FINAL_CONFIG["regional_ar"],
-                include_trend=FINAL_CONFIG["include_trend"],
-                use_random_slopes=False,
-                hierarchy_parameterisation=FINAL_CONFIG.get(
-                    "hierarchy_parameterisation"))
-            id_n, inf_n = fit_model(m_n, SAMPLING_REFIT, label=f"val_null_{_fold}")
-            m_f = build_regional_model(
-                d_full, drivers=True,
-                common_state=FINAL_CONFIG["common_state"],
-                regional_ar=FINAL_CONFIG["regional_ar"],
-                include_trend=FINAL_CONFIG["include_trend"],
-                use_random_slopes=FINAL_CONFIG["use_random_slopes"],
-                random_slope_parameterisation=FINAL_CONFIG.get(
-                    "random_slope_parameterisation"),
-                hierarchy_parameterisation=FINAL_CONFIG.get(
-                    "hierarchy_parameterisation"))
-            id_f, inf_f = fit_model(m_f, SAMPLING_REFIT, label=f"val_full_{_fold}")
-        except Exception as exc:
+        _t0 = time.time()
+        _fits = {}
+        for _which, _drv in (("null", False), ("full", True)):
+            _d = make_model_data(Xs, Y_RAW, mask_tr, SEASON, TT, REGION_IDS,
+                                 FC_TERMS, random_slope_terms=[])
+            _rows_f, _lagx_f = ar_estimation_rows(_d["obs_r"], _d["obs_t"],
+                                                  AR_MAX_LAGS)
+            if int(_rows_f.sum()) < VAL_MIN_TRAIN_ROWS:
+                _fits = {}
+                break
+            _f = fit_panel_ar(_d, p=SELECTED_AR_ORDER, drivers=_drv,
+                              include_trend=INCLUDE_TREND, rows=_rows_f,
+                              lag_index=_lagx_f, label=f"fold{_fold}_{_which}")
+            _f["forecast_terms"] = FC_TERMS if _drv else []
+            _f["resid_by_region_time"] = {
+                (int(r), int(t)): float(e)
+                for r, t, e in zip(_d["obs_r"], _d["obs_t"], _f["resid_level"])
+                if np.isfinite(e)}
+            _fits[_which] = _f
+        if not _fits:
             _fold_rows.append({"fold": _fold, "origin_month": MONTH_GRID[o],
-                               "usable": False, "skip_reason": f"fit failed: {exc}"})
+                               "target_month": MONTH_GRID[tgt], "usable": False,
+                               "skip_reason": "too few rows with the AR lags"})
             continue
 
-        eta_n = forecast_next_month(id_n, FINAL_CONFIG, np.zeros((R, 0)), tt_next,
-                                    season_next, [])
-        eta_f = forecast_next_month(id_f, FINAL_CONFIG,
-                                    np.where(np.isfinite(x_next), x_next, 0.0),
-                                    tt_next, season_next, d_full["rs_idx"])
+        _dfc = {"season": SEASON, "tt": TT}
+        eta_n, _ = forecast_one_month(_fits["null"], _dfc, REGION_IDS, tgt,
+                                      Xs[:, tgt, :], SELECTED_AR_ORDER)
+        eta_f, ar_used = forecast_one_month(_fits["full"], _dfc, REGION_IDS, tgt,
+                                            Xs[:, tgt, :], SELECTED_AR_ORDER)
         for ri, rid in enumerate(REGION_IDS):
             if not _obs_fc[ri, tgt]:
                 continue
@@ -5606,13 +4974,11 @@ if HAVE_PYMC and FIT_FULL is not None and len(FC_TERMS):
                 "target_month": MONTH_GRID[tgt], "region_id": rid,
                 "y_true": float(Y_RAW[ri, tgt]),
                 "valid_area_ha": float(VALID_AREA[ri, tgt]),
-                "pred_null": float(np.mean(eta_n[ri])),
-                "pred_full": float(np.mean(eta_f[ri])),
+                "pred_null": float(eta_n[ri]), "pred_full": float(eta_f[ri]),
                 "pred_persistence": float(pers) if np.isfinite(pers) else np.nan,
                 "pred_seasonal_naive": float(seas) if np.isfinite(seas) else np.nan,
-                "sd_null": float(np.std(eta_n[ri])),
-                "sd_full": float(np.std(eta_f[ri])),
-                "drivers_complete": bool(np.all(np.isfinite(x_next[ri]))),
+                "ar_terms_available": int(ar_used[ri]),
+                "drivers_complete": bool(np.all(np.isfinite(Xs[ri, tgt, :]))),
             })
         _fold_rows.append({
             "fold": _fold, "origin_month": MONTH_GRID[o],
@@ -5620,12 +4986,8 @@ if HAVE_PYMC and FIT_FULL is not None and len(FC_TERMS):
             "n_training_region_months": int(mask_tr.sum()),
             "n_training_months": int((mask_tr.sum(axis=0) > 0).sum()),
             "n_target_regions": int(_obs_fc[:, tgt].sum()),
-            "divergences_null": inf_n["divergences"],
-            "divergences_full": inf_f["divergences"],
-            "seconds": inf_n["seconds"] + inf_f["seconds"], "skip_reason": ""})
-        print(f"  fold {_fold}: origin {MONTH_GRID[o]:%Y-%m} -> target "
-              f"{MONTH_GRID[tgt]:%Y-%m}, {int(_obs_fc[:, tgt].sum())} region(s), "
-              f"{inf_n['seconds'] + inf_f['seconds']:.0f}s")
+            "ar_order": SELECTED_AR_ORDER,
+            "seconds": round(time.time() - _t0, 3), "skip_reason": ""})
 
     VAL_FOLD_AUDIT = pd.DataFrame(_fold_rows)
     VAL_PREDICTIONS = pd.DataFrame(_pred_rows)
@@ -5634,18 +4996,21 @@ if HAVE_PYMC and FIT_FULL is not None and len(FC_TERMS):
         VAL_PREDICTIONS = VAL_PREDICTIONS.merge(
             REGIONS[["region_id", "region_name", "region_type"]],
             on="region_id", how="left")
-    display(VAL_FOLD_AUDIT)
+    display(VAL_FOLD_AUDIT.head(12))
     register("temporal_validation_fold_audit", VAL_FOLD_AUDIT, "validation")
     register("temporal_validation_predictions", VAL_PREDICTIONS, "validation")
     register("temporal_validation_scaler_audit", VAL_SCALER_AUDIT, "provenance")
+    _use = VAL_FOLD_AUDIT[VAL_FOLD_AUDIT["usable"]] if len(VAL_FOLD_AUDIT) \
+        else VAL_FOLD_AUDIT
     print(f"\n{len(VAL_PREDICTIONS):,} held-out region-month prediction(s) over "
           f"{VAL_PREDICTIONS['target_month'].nunique() if len(VAL_PREDICTIONS) else 0} "
-          "target month(s).")
+          f"target month(s), from {len(_use)} usable fold(s) in "
+          f"{float(_use['seconds'].sum()) if len(_use) else 0:.1f}s total.")
     print("These are genuine out-of-sample forecasts: every model was refitted "
-          "from scratch on strictly earlier months, with its own scaling.")
+          "from scratch on strictly earlier months, with its own scaling and its "
+          "own AR coefficients.")
 else:
-    print("§17 skipped (PyMC unavailable, no fitted model, or no forecastable "
-          "driver).")
+    print("§17 skipped (no fitted model, or no forecastable driver).")
 ''')
 
 code(r'''# =====================================================================
@@ -5665,12 +5030,13 @@ def _rmse(a, b, w=None):
     ok = np.isfinite(a) & np.isfinite(b)
     if not ok.any():
         return np.nan
-    e = (a[ok] - b[ok]) ** 2
     if w is None:
-        return float(np.sqrt(e.mean()))
-    ww = np.asarray(w, float)[ok]
-    ww = ww / ww.sum() if ww.sum() > 0 else np.full(e.size, 1 / e.size)
-    return float(np.sqrt(np.sum(ww * e)))
+        return float(np.sqrt(np.mean((a[ok] - b[ok]) ** 2)))
+    w = np.asarray(w, float)[ok]
+    w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
+    if w.sum() <= 0:
+        return np.nan
+    return float(np.sqrt(np.sum(w * (a[ok] - b[ok]) ** 2) / w.sum()))
 
 
 def _mae(a, b, w=None):
@@ -5678,68 +5044,62 @@ def _mae(a, b, w=None):
     ok = np.isfinite(a) & np.isfinite(b)
     if not ok.any():
         return np.nan
-    e = np.abs(a[ok] - b[ok])
     if w is None:
-        return float(e.mean())
-    ww = np.asarray(w, float)[ok]
-    ww = ww / ww.sum() if ww.sum() > 0 else np.full(e.size, 1 / e.size)
-    return float(np.sum(ww * e))
+        return float(np.mean(np.abs(a[ok] - b[ok])))
+    w = np.asarray(w, float)[ok]
+    w = np.where(np.isfinite(w) & (w > 0), w, 0.0)
+    if w.sum() <= 0:
+        return np.nan
+    return float(np.sum(w * np.abs(a[ok] - b[ok])) / w.sum())
 
 
-def skill_table(pred, cols=MODEL_COLS, restrict_common=True):
-    """Region-macro and area-weighted RMSE/MAE on the logit and cover scales."""
+def skill_table(pred, cols=None, restrict_common=True):
+    """RMSE/MAE per model, pooled, region-macro and area-weighted."""
+    cols = MODEL_COLS if cols is None else cols
     if not len(pred):
         return pd.DataFrame()
-    d = pred.copy()
-    used = [c for c in cols.values() if c in d.columns]
+    df = pred.copy()
     if restrict_common:
-        d = d[np.isfinite(d[used]).all(axis=1) & d["y_true"].notna()]
+        ok = np.ones(len(df), dtype=bool)
+        for c in cols.values():
+            ok &= np.isfinite(df[c].to_numpy(dtype=float))
+        df = df[ok]
     rows = []
     for name, col in cols.items():
-        if col not in d.columns:
-            continue
-        sub = d[d[col].notna()]
+        sub = df.dropna(subset=[col, "y_true"])
         if not len(sub):
             continue
-        y_cov = inverse_transform_response(sub["y_true"].to_numpy(),
-                                           RESPONSE_TRANSFORM, RESPONSE_EPS)
-        p_cov = inverse_transform_response(sub[col].to_numpy(),
-                                           RESPONSE_TRANSFORM, RESPONSE_EPS)
-        per_region = pd.DataFrame(
-            [{"region_id": rid, "rmse": _rmse(g["y_true"], g[col]),
-              "mae": _mae(g["y_true"], g[col])}
-             for rid, g in sub.groupby("region_id")]).set_index("region_id")
+        macro = [(_rmse(g["y_true"], g[col]), _mae(g["y_true"], g[col]))
+                 for _, g in sub.groupby("region_id")]
         rows.append({
             "model": name, "n_predictions": int(len(sub)),
             "n_regions": int(sub["region_id"].nunique()),
             "n_target_months": int(sub["target_month"].nunique()),
             "rmse_logit_pooled": _rmse(sub["y_true"], sub[col]),
             "mae_logit_pooled": _mae(sub["y_true"], sub[col]),
-            "rmse_logit_region_macro": float(per_region["rmse"].mean()),
-            "mae_logit_region_macro": float(per_region["mae"].mean()),
+            "rmse_logit_region_macro": float(np.nanmean([m[0] for m in macro])),
+            "mae_logit_region_macro": float(np.nanmean([m[1] for m in macro])),
             "rmse_logit_area_weighted": _rmse(sub["y_true"], sub[col],
                                               sub["valid_area_ha"]),
             "mae_logit_area_weighted": _mae(sub["y_true"], sub[col],
                                             sub["valid_area_ha"]),
-            "rmse_cover": _rmse(y_cov, p_cov),
-            "mae_cover": _mae(y_cov, p_cov),
-            "rmse_cover_area_weighted": _rmse(y_cov, p_cov,
-                                              sub["valid_area_ha"].to_numpy()),
-            "common_sample": bool(restrict_common),
-        })
-    return pd.DataFrame(rows).sort_values("rmse_logit_region_macro")
+            "rmse_cover": _rmse(inverse_transform_response(sub["y_true"].to_numpy(), RESPONSE_TRANSFORM, RESPONSE_EPS),
+                                inverse_transform_response(sub[col].to_numpy(), RESPONSE_TRANSFORM, RESPONSE_EPS)),
+            "mae_cover": _mae(inverse_transform_response(sub["y_true"].to_numpy(), RESPONSE_TRANSFORM, RESPONSE_EPS),
+                              inverse_transform_response(sub[col].to_numpy(), RESPONSE_TRANSFORM, RESPONSE_EPS)),
+            "common_sample": bool(restrict_common)})
+    return (pd.DataFrame(rows).sort_values("rmse_logit_pooled")
+            .reset_index(drop=True) if rows else pd.DataFrame())
 
 
 if len(VAL_PREDICTIONS):
-    VAL_METRICS = pd.concat([
-        skill_table(VAL_PREDICTIONS, restrict_common=True),
-        skill_table(VAL_PREDICTIONS, restrict_common=False)], ignore_index=True)
+    VAL_METRICS = pd.concat([skill_table(VAL_PREDICTIONS, restrict_common=True),
+                             skill_table(VAL_PREDICTIONS, restrict_common=False)],
+                            ignore_index=True)
     display(VAL_METRICS)
     register("temporal_validation_metrics", VAL_METRICS, "validation")
     print("`common_sample = True` is the like-for-like table: only target "
-          "region-months every model could predict. `False` scores each model on "
-          "its own available months (persistence and seasonal-naive lose months "
-          "whose source month is missing).")
+          "region-months every model could predict.")
 
     _rows = []
     for rtype, g in VAL_PREDICTIONS.groupby("region_type"):
@@ -5752,69 +5112,62 @@ if len(VAL_PREDICTIONS):
     if len(VAL_METRICS_BY_TYPE):
         display(VAL_METRICS_BY_TYPE[["region_type", "model", "n_predictions",
                                      "rmse_logit_region_macro", "rmse_cover"]])
-        register("temporal_validation_metrics_by_region_type", VAL_METRICS_BY_TYPE,
-                 "validation")
+        register("temporal_validation_metrics_by_region_type",
+                 VAL_METRICS_BY_TYPE, "validation")
 
-    # --- uncertainty on the differences: resample CALENDAR MONTHS ------------
-    _d = VAL_PREDICTIONS.dropna(subset=["y_true", "pred_null", "pred_full"])
-    if len(_d):
-        months = _d["target_month"].drop_duplicates().to_numpy()
-        rng = np.random.default_rng(VAL_BOOTSTRAP_SEED)
-        pairs = [("regional_dynamic_full", "regional_dynamic_null"),
-                 ("regional_dynamic_full", "persistence"),
-                 ("regional_dynamic_full", "seasonal_naive"),
-                 ("regional_dynamic_null", "persistence")]
+    # --- paired bootstrap, resampling CALENDAR MONTHS -----------------------
+    _cs = VAL_PREDICTIONS.copy()
+    _ok = np.ones(len(_cs), dtype=bool)
+    for _c in MODEL_COLS.values():
+        _ok &= np.isfinite(_cs[_c].to_numpy(dtype=float))
+    _cs = _cs[_ok]
+    _months = sorted(_cs["target_month"].unique())
+    if len(_months) >= VAL_MIN_BOOTSTRAP_MONTHS:
+        _rng = np.random.default_rng(RANDOM_STATE)
+        _pairs = [("regional_dynamic_full", "regional_dynamic_null"),
+                  ("regional_dynamic_full", "persistence"),
+                  ("regional_dynamic_full", "seasonal_naive")]
+        # Row indices grouped by calendar month, so a bootstrap draw is an
+        # array gather rather than 2000 DataFrame filters.
+        _by_month = [np.flatnonzero((_cs["target_month"] == m).to_numpy())
+                     for m in _months]
+        _yt = _cs["y_true"].to_numpy(dtype=float)
         _rows = []
-        for a, b in pairs:
-            ca, cb = MODEL_COLS[a], MODEL_COLS[b]
-            sub = _d.dropna(subset=[ca, cb])
-            if len(sub) < 4 or sub["target_month"].nunique() < 3:
-                continue
-            obs_diff = _rmse(sub["y_true"], sub[ca]) - _rmse(sub["y_true"], sub[cb])
-            boots = []
-            mm = sub["target_month"].drop_duplicates().to_numpy()
-            for _ in range(int(VAL_BOOTSTRAP_N)):
-                pick = rng.choice(mm, size=len(mm), replace=True)
-                s = pd.concat([sub[sub["target_month"] == m] for m in pick])
-                boots.append(_rmse(s["y_true"], s[ca]) - _rmse(s["y_true"], s[cb]))
-            lo, hi = np.percentile(boots, [2.5, 97.5])
+        for _a, _b in _pairs:
+            _ca, _cb = MODEL_COLS[_a], MODEL_COLS[_b]
+            _pa = _cs[_ca].to_numpy(dtype=float)
+            _pb = _cs[_cb].to_numpy(dtype=float)
+            _obs = (_rmse(_yt, _pa) - _rmse(_yt, _pb))
+            _draws = np.empty(int(VAL_BOOTSTRAP_DRAWS))
+            for _d in range(int(VAL_BOOTSTRAP_DRAWS)):
+                _pick = _rng.integers(0, len(_months), size=len(_months))
+                _ix = np.concatenate([_by_month[j] for j in _pick])
+                _draws[_d] = (np.sqrt(np.mean((_yt[_ix] - _pa[_ix]) ** 2))
+                              - np.sqrt(np.mean((_yt[_ix] - _pb[_ix]) ** 2)))
+            _lo, _hi = np.nanpercentile(_draws, [2.5, 97.5])
             _rows.append({
-                "model_a": a, "model_b": b,
-                "rmse_a": _rmse(sub["y_true"], sub[ca]),
-                "rmse_b": _rmse(sub["y_true"], sub[cb]),
-                "rmse_difference_a_minus_b": obs_diff,
-                "ci95_lo": float(lo), "ci95_hi": float(hi),
-                "n_target_months_resampled": int(len(mm)),
-                "n_region_months": int(len(sub)),
-                "a_better_and_interval_excludes_zero": bool(obs_diff < 0 and hi < 0),
-                "resampling_unit": "calendar month (regions within a month are "
-                                   "NOT independent replicates)"})
+                "model_a": _a, "model_b": _b,
+                "rmse_difference_a_minus_b": float(_obs),
+                "ci95_lo": float(_lo), "ci95_hi": float(_hi),
+                "n_target_months_resampled": int(len(_months)),
+                "resampling_unit": "calendar month (regions within a month move together)",
+                "a_better_and_interval_excludes_zero": bool(_obs < 0 and _hi < 0)})
         VAL_RMSE_DIFF = pd.DataFrame(_rows)
-        if not len(VAL_RMSE_DIFF):
-            print("No RMSE-difference interval could be formed: fewer than three "
-                  "target CALENDAR MONTHS were available, and the resampling unit "
-                  "is the month, not the region-month. Widening it to "
-                  "region-months would manufacture precision out of regions that "
-                  "share a month, a satellite pass and the shared state — so the "
-                  "interval is withheld instead. Raise VAL_MAX_ORIGINS (or set "
-                  "FAST_MODE = False) for a usable interval.")
         display(VAL_RMSE_DIFF)
-        register("temporal_validation_rmse_differences", VAL_RMSE_DIFF, "validation")
+        register("temporal_validation_rmse_differences", VAL_RMSE_DIFF,
+                 "validation")
         for r in VAL_RMSE_DIFF.itertuples():
-            if r.a_better_and_interval_excludes_zero:
-                print(f"{r.model_a} beats {r.model_b}: RMSE difference "
-                      f"{r.rmse_difference_a_minus_b:+.4f} "
-                      f"[{r.ci95_lo:+.4f}, {r.ci95_hi:+.4f}].")
-            else:
-                print(f"{r.model_a} vs {r.model_b}: difference "
-                      f"{r.rmse_difference_a_minus_b:+.4f} "
-                      f"[{r.ci95_lo:+.4f}, {r.ci95_hi:+.4f}] — the interval "
-                      "includes zero, so this is NOT an improvement.")
-        if (len(VAL_RMSE_DIFF)
-                and VAL_RMSE_DIFF["n_target_months_resampled"].min() < 8):
-            print("\nWith this few target months the bootstrap interval is itself "
-                  "coarse. Treat it as a guard against over-claiming, not as a "
-                  "precise interval.")
+            print(f"{r.model_a} vs {r.model_b}: RMSE difference "
+                  f"{r.rmse_difference_a_minus_b:+.4f} logit "
+                  f"[{r.ci95_lo:+.4f}, {r.ci95_hi:+.4f}] over "
+                  f"{r.n_target_months_resampled} calendar months -> "
+                  + ("a genuine improvement" if r.a_better_and_interval_excludes_zero
+                     else "NOT a demonstrated improvement (interval includes zero)"))
+    else:
+        print(f"No RMSE-difference interval: fewer than "
+              f"{VAL_MIN_BOOTSTRAP_MONTHS} target CALENDAR MONTHS were "
+              "available, and the resampling unit is the month, not the "
+              "region-month.")
 ''')
 
 
@@ -5823,132 +5176,104 @@ if len(VAL_PREDICTIONS):
 # ===========================================================================
 md(r"""## 18. Regional transfer — leave-one-region-out
 
-A different question from §17, and reported separately.
+Refit with one region held out entirely, then predict that region's months. It
+asks whether the driver relationships are a property of the gulf or of the
+particular regions that happen to dominate the record.
 
-§17 asks: given everything up to last month, can the model predict next month?
-It uses each region's own history. §18 asks: given the other regions, can the
-model predict a region it has **never seen**? The withheld region's response
-never entered the fit, so its own $\alpha_r$, $\lambda_r$, $b_{r,k}$ and
-$u_{r,t}$ are unknown. They are drawn from the **population** distributions the
-hierarchy estimated from the other regions — which is exactly what "transfer"
-means and exactly why the intervals are wider.
-
-The shared state $g_t$ *is* used, and legitimately: it is estimated from the
-other regions, not from the withheld one. What is never used is any part of the
-withheld region's own response history.
-
-The comparison baseline is the strongest honest one available for this task:
-predicting the withheld region with the **contemporaneous mean of the other
-regions** on the logit scale. Anything the hierarchy adds has to be added on top
-of that.
+One honest limitation, and it is a direct consequence of dropping the
+hierarchical model: a fixed-effects intercept for the held-out region is **not
+identified** when that region is absent from the fit. A hierarchical model would
+shrink it towards the population mean; here the area-weighted mean of the
+retained regions' intercepts is substituted, and every prediction is labelled as
+carrying that substitution. It makes this a test of the *shared* structure —
+seasonality, trend, drivers, persistence — not of the region's own level.
 """)
 
 code(r'''# =====================================================================
-# 18. Predict a region the model never saw
+# 18. Leave-one-region-out
 # =====================================================================
+LORO_FITS = pd.DataFrame()
 LORO_PREDICTIONS = pd.DataFrame()
-LORO_METRICS = pd.DataFrame()
 
-if HAVE_PYMC and LORO_FITS:
-    _rng = np.random.default_rng(RANDOM_STATE)
-    _terms = PAIR["data_full"]["driver_terms"]
-    _k_idx = [DRIVER_TERMS.index(t) for t in _terms]
-    _rows = []
-    for rid, entry in LORO_FITS.items():
-        ri = REGION_IDS.index(rid)
-        po = entry["idata"].posterior
-        st = lambda v: po[v].stack(s=("chain", "draw")).to_numpy()
-        S_ = po.sizes["chain"] * po.sizes["draw"]
-        mu_a, sd_a = st("mu_alpha"), st("sigma_alpha")
-        alpha_new = mu_a + sd_a * _rng.standard_normal(S_)
-        gamma = st("gamma_season")
-        tau = st("tau_trend") if "tau_trend" in po else np.zeros(S_)
-        beta = st("beta") if "beta" in po else np.zeros((0, S_))
-        b_new = None
-        if "sigma_b" in po:
-            sb = st("sigma_b")                      # (rs, S)
-            b_new = sb * _rng.standard_normal(sb.shape)
-        lam_new = (1.0 + st("sigma_lambda") * _rng.standard_normal(S_)
-                   if "sigma_lambda" in po else np.zeros(S_))
-        g = st("g") if "g" in po else np.zeros((T, S_))
-        if "sigma_u" in po:
-            su = st("sigma_u")
-            ru = st("rho_u")
-            ru = ru if ru.ndim == 1 else ru.mean(axis=0)
-            u_sd = su / np.sqrt(np.clip(1 - ru ** 2, 1e-6, None))
-        else:
-            u_sd = np.zeros(S_)
-        sig_eps = st("sigma_eps") if "sigma_eps" in po else np.zeros(S_)
-        rs_idx = entry["data"]["rs_idx"]
-
-        for ti in range(T):
-            if not OBS_MASK[ri, ti]:
+if RUN_LORO and FIT_FULL is not None and len(REGION_IDS) >= 3:
+    _rows, _preds = [], []
+    _keep_n = (len(REGION_IDS) if LORO_MAX_REGIONS is None
+               else min(len(REGION_IDS), int(LORO_MAX_REGIONS)))
+    for _held in REGION_IDS[:_keep_n]:
+        _keep = [r for r in REGION_IDS if r != _held]
+        _ri = [REGION_IDS.index(r) for r in _keep]
+        _mask = OBS_MASK.copy()
+        _mask[REGION_IDS.index(_held), :] = False
+        _d = make_model_data(X_MODEL, Y_RAW, _mask, SEASON, TT, REGION_IDS,
+                             DRIVER_TERMS, random_slope_terms=[])
+        _rows_l, _lagx_l = ar_estimation_rows(_d["obs_r"], _d["obs_t"], AR_MAX_LAGS)
+        if int(_rows_l.sum()) < VAL_MIN_TRAIN_ROWS:
+            continue
+        _f = fit_panel_ar(_d, p=SELECTED_AR_ORDER, drivers=True,
+                          include_trend=INCLUDE_TREND, rows=_rows_l,
+                          lag_index=_lagx_l, region_ids=REGION_IDS,
+                          label=f"loro_{_held}")
+        _drv = [t for t in DRIVER_TERMS if t in _f["names"]]
+        for _t in _drv:
+            _rows.append({"held_out_region": _held, "term": _t,
+                          "estimate": float(_f["params"][_t]),
+                          "se": float(_f["se"][_t]),
+                          "headline_estimate": float(FIT_FULL["params"][_t]),
+                          "shift": float(_f["params"][_t]
+                                         - FIT_FULL["params"][_t]),
+                          "n_obs": _f["n_obs"]})
+        # substitute the area-weighted mean intercept of the retained regions
+        _w = (REGIONS.set_index("region_id")
+              .reindex(_keep)["eligible_area_ha"].to_numpy(dtype=float))
+        _a = np.array([float(_f["params"][f"alpha[{r}]"]) for r in _keep])
+        _alpha_sub = float(np.sum(_w * _a) / np.sum(_w))
+        _hi = REGION_IDS.index(_held)
+        for _t_idx in range(T):
+            if not OBS_MASK[_hi, _t_idx]:
                 continue
-            eta = (alpha_new
-                   + (SEASON[ti][:, None] * gamma).sum(axis=0)
-                   + tau * float(TT[ti])
-                   + lam_new * g[ti])
-            if beta.shape[0]:
-                x = X_MODEL[ri, ti, _k_idx]
-                eta = eta + x @ beta
-                if b_new is not None and rs_idx:
-                    for j, k in enumerate(rs_idx):
-                        eta = eta + b_new[j] * float(x[k])
-            eta = eta + u_sd * _rng.standard_normal(S_)
-            others = [q for q in range(R) if q != ri and OBS_MASK[q, ti]]
-            _rows.append({
-                "withheld_region": rid, "month": MONTH_GRID[ti],
-                "y_true": float(Y_RAW[ri, ti]),
-                "valid_area_ha": float(VALID_AREA[ri, ti]),
-                "pred_transfer": float(np.mean(eta)),
-                "sd_transfer": float(np.std(eta)),
-                "pred_other_region_mean": (float(np.mean(Y_RAW[others, ti]))
-                                           if others else np.nan),
-                "n_other_regions_that_month": len(others),
-            })
-    LORO_PREDICTIONS = pd.DataFrame(_rows)
+            _v = _alpha_sub
+            for _j in range(SEASON.shape[1]):
+                _nm = f"season[s{_j}]"
+                if _nm in _f["params"].index:
+                    _v += float(_f["params"][_nm]) * float(SEASON[_t_idx, _j])
+            if "trend" in _f["params"].index:
+                _v += float(_f["params"]["trend"]) * float(TT[_t_idx])
+            for _k, _t in enumerate(DRIVER_TERMS):
+                if _t in _f["params"].index and np.isfinite(X_MODEL[_hi, _t_idx, _k]):
+                    _v += float(_f["params"][_t]) * float(X_MODEL[_hi, _t_idx, _k])
+            _preds.append({"region_id": _held, "held_out_region": _held,
+                           "month": MONTH_GRID[_t_idx],
+                           "y_true": float(Y_RAW[_hi, _t_idx]),
+                           "pred_transfer": float(_v),
+                           "intercept_source": "area-weighted mean of retained regions"})
+    LORO_FITS = pd.DataFrame(_rows)
+    LORO_PREDICTIONS = pd.DataFrame(_preds)
     if len(LORO_PREDICTIONS):
         LORO_PREDICTIONS = LORO_PREDICTIONS.merge(
-            REGIONS[["region_id", "region_name", "region_type"]]
-            .rename(columns={"region_id": "withheld_region"}),
-            on="withheld_region", how="left")
-        _m = []
-        for rid, g in LORO_PREDICTIONS.groupby("withheld_region"):
-            y_cov = inverse_transform_response(g["y_true"].to_numpy(),
-                                               RESPONSE_TRANSFORM, RESPONSE_EPS)
-            p_cov = inverse_transform_response(g["pred_transfer"].to_numpy(),
-                                               RESPONSE_TRANSFORM, RESPONSE_EPS)
-            _m.append({
-                "withheld_region": rid,
-                "region_type": g["region_type"].iloc[0],
-                "n_months": int(len(g)),
-                "rmse_logit_transfer": _rmse(g["y_true"], g["pred_transfer"]),
-                "mae_logit_transfer": _mae(g["y_true"], g["pred_transfer"]),
-                "rmse_cover_transfer": _rmse(y_cov, p_cov),
-                "rmse_logit_other_region_mean": _rmse(g["y_true"],
-                                                      g["pred_other_region_mean"]),
-                "transfer_beats_other_region_mean": bool(
-                    _rmse(g["y_true"], g["pred_transfer"])
-                    < _rmse(g["y_true"], g["pred_other_region_mean"])),
-            })
-        LORO_METRICS = pd.DataFrame(_m)
-        display(LORO_METRICS)
-        register("leave_one_region_out_predictions", LORO_PREDICTIONS,
-                 "transfer validation")
-        register("leave_one_region_out_metrics", LORO_METRICS,
-                 "transfer validation")
-        print("\nThe model used NONE of the withheld region's response history. "
-              "Its regional intercept, loading and slope deviations were drawn "
-              "from the population distributions estimated on the other regions.")
-        if LORO_MAX_REGIONS is not None and len(LORO_METRICS) < N_REGIONS:
-            print(f"FAST_MODE: only {len(LORO_METRICS)} of {N_REGIONS} regions "
-                  "were withheld. Set FAST_MODE = False for the complete "
-                  "leave-one-region-out sweep.")
-        _win = int(LORO_METRICS["transfer_beats_other_region_mean"].sum())
-        print(f"The hierarchy beat the contemporaneous other-region mean in "
-              f"{_win} of {len(LORO_METRICS)} withheld region(s).")
+            REGIONS[["region_id", "region_name", "region_type"]],
+            on="region_id", how="left")
+    if len(LORO_FITS):
+        _summary = (LORO_FITS.groupby("term")
+                    .agg(headline=("headline_estimate", "first"),
+                         min_estimate=("estimate", "min"),
+                         max_estimate=("estimate", "max"),
+                         max_abs_shift=("shift", lambda s: float(np.max(np.abs(s)))),
+                         sign_stable=("estimate",
+                                      lambda s: bool(np.all(np.sign(s) == np.sign(s.iloc[0])))))
+                    .reset_index())
+        display(_summary)
+        register("loro_coefficients", LORO_FITS, "robustness")
+        register("loro_coefficient_summary", _summary, "robustness")
+        print("A coefficient whose sign flips when ONE region is removed rests "
+              "on that region, and §22 reports it as fragile.")
+    if len(LORO_PREDICTIONS):
+        _r = _rmse(LORO_PREDICTIONS["y_true"], LORO_PREDICTIONS["pred_transfer"])
+        register("loro_predictions", LORO_PREDICTIONS, "robustness")
+        print(f"Held-out-region RMSE: {_r:.3f} logit units over "
+              f"{len(LORO_PREDICTIONS):,} region-months, with the intercept "
+              "substituted rather than estimated.")
 else:
-    print("§18 skipped: no leave-one-region-out fits are available.")
+    print("§18 skipped (RUN_LORO off, no fitted model, or fewer than 3 regions).")
 ''')
 
 
@@ -5962,17 +5287,16 @@ reader has to know.
 
 A **small, predeclared** set of response-blind variants (§3h) is re-run end to
 end — new thresholds, new components, new merges, new region-month panel, new
-fit — and the global driver coefficients are compared with the headline. This is
-**not** a search: every variant is reported, and none may be promoted to the
-headline because it produced a stronger result. The headline is the
-configuration fixed in §3c before anything was fitted.
+fit — and the driver coefficients are compared with the headline. This is **not**
+a search: every variant is reported, and none may be promoted to the headline
+because it produced a stronger result. The headline is the configuration fixed in
+§3c before anything was fitted.
 
 The variants are stated as **quantiles of this AOI's own covariate
 distributions**, not as absolute metres. That is a direct consequence of §7c: an
 absolute cut can sit outside the local distribution, and when it does, every
-"variant" built from it collapses to the same regionalisation and the
-sensitivity analysis silently tests nothing while appearing to pass. A quantile
-variant always moves the partition, and it is just as response-blind.
+"variant" built from it collapses to the same regionalisation and the sensitivity
+analysis silently tests nothing while appearing to pass.
 
 A variant that still fails to produce at least two usable regions is reported
 with **the number of regions it actually built** and the reason it was rejected,
@@ -6063,9 +5387,10 @@ def regional_dataset_from_thresholds(thresholds, min_cells, min_area_ha,
             "n_region_months": int(mask.sum()), "reason": ""}
 
 
-if HAVE_PYMC and FIT_FULL is not None and SENSITIVITY_VARIANTS:
+
+if FIT_FULL is not None and SENSITIVITY_VARIANTS:
     _rrows, _brows = [], []
-    _head = GLOBAL_DRIVERS.set_index("term")["posterior_mean"].to_dict() \
+    _head = GLOBAL_DRIVERS.set_index("term")["estimate"].to_dict() \
         if len(GLOBAL_DRIVERS) else {}
     for _vname in SENSITIVITY_VARIANTS:
         _ov = dict(REGIONALISATION_VARIANTS[_vname])
@@ -6076,7 +5401,7 @@ if HAVE_PYMC and FIT_FULL is not None and SENSITIVITY_VARIANTS:
                                     ("_openness_quantile", "openness")]
                 if _key in _ov}
         _th = dict(REGION_THRESHOLDS)
-        _th.update(_ov)          # any remaining absolute-metre overrides
+        _th.update(_ov)
         print(f"--- variant {_vname}: {REGIONALISATION_VARIANTS[_vname]} ---")
         try:
             _ds = regional_dataset_from_thresholds(
@@ -6085,8 +5410,7 @@ if HAVE_PYMC and FIT_FULL is not None and SENSITIVITY_VARIANTS:
             print(f"    regionalisation failed: {exc}")
             _rrows.append({"variant": _vname,
                            "overrides": json.dumps(REGIONALISATION_VARIANTS[_vname]),
-                           "n_regions": 0, "n_regions_built": 0,
-                           "usable": False,
+                           "n_regions": 0, "n_regions_built": 0, "usable": False,
                            "note": f"regionalisation failed: {exc}"})
             continue
         if _ds is None or not _ds.get("usable"):
@@ -6100,108 +5424,71 @@ if HAVE_PYMC and FIT_FULL is not None and SENSITIVITY_VARIANTS:
                 "n_region_months": int((_ds or {}).get("n_region_months", 0)),
                 "usable": False, "note": _why})
             continue
+        _rows_v, _lagx_v = ar_estimation_rows(_ds["data"]["obs_r"],
+                                              _ds["data"]["obs_t"], AR_MAX_LAGS)
+        if int(_rows_v.sum()) < VAL_MIN_TRAIN_ROWS:
+            _rrows.append({"variant": _vname, "n_regions": len(_ds["keep"]),
+                           "usable": False,
+                           "note": "too few rows with the AR lags present"})
+            continue
+        _fv = fit_panel_ar(_ds["data"], p=SELECTED_AR_ORDER, drivers=True,
+                           include_trend=INCLUDE_TREND, rows=_rows_v,
+                           lag_index=_lagx_v, region_ids=_ds["keep"],
+                           label=f"variant_{_vname}")
         _rrows.append({
             "variant": _vname,
             "overrides": json.dumps(REGIONALISATION_VARIANTS[_vname]),
             "n_regions": len(_ds["keep"]),
             "n_regions_built": int(_ds["n_regions_built"]),
-            "n_region_months": int(_ds["data"]["obs_mask"].sum()),
+            "n_region_months": int(_fv["n_obs"]),
             "region_types": ", ".join(sorted(
                 _ds["regions"].loc[_ds["regions"]["region_id"].isin(_ds["keep"]),
                                    "region_type"].unique())),
+            "aicc": _fv["aicc"], "seconds": _fv["seconds"],
             "usable": True, "note": ""})
-        try:
-            _m = build_regional_model(
-                _ds["data"], drivers=True,
-                common_state=FINAL_CONFIG["common_state"],
-                regional_ar=FINAL_CONFIG["regional_ar"],
-                include_trend=FINAL_CONFIG["include_trend"],
-                use_random_slopes=False,
-                hierarchy_parameterisation=FINAL_CONFIG.get(
-                    "hierarchy_parameterisation"))
-            _id, _inf = fit_model(_m, SAMPLING_REFIT, label=f"sens_{_vname}")
-        except Exception as exc:
-            print(f"    fit failed: {exc}")
-            continue
-        _bb = _id.posterior["beta"].stack(s=("chain", "draw")).to_numpy()
-        for k, term in enumerate(_ds["data"]["driver_terms"]):
-            s = summarise_coefficient(_bb[k], term)
-            s.update({"variant": _vname, "n_regions": len(_ds["keep"]),
-                      "headline_mean": _head.get(term, np.nan),
-                      "divergences": _inf["divergences"]})
-            s["in_headline_model"] = bool(np.isfinite(s["headline_mean"]))
-            s["same_sign_as_headline"] = (
-                bool(np.sign(s["posterior_mean"]) == np.sign(s["headline_mean"]))
-                if s["in_headline_model"] else None)
-            _brows.append(s)
-        print(f"    {len(_ds['keep'])} regions, "
-              f"{int(_ds['data']['obs_mask'].sum())} region-months, "
-              f"{_inf['divergences']} divergence(s)")
+        for _t in [t for t in DRIVER_TERMS if t in _fv["names"]]:
+            _ci = _fv["result"].conf_int(alpha=1.0 - HDI_PROB)
+            _j = _fv["names"].index(_t)
+            _brows.append({
+                "variant": _vname, "term": _t, "n_regions": len(_ds["keep"]),
+                "estimate": float(_fv["params"][_t]),
+                "se": float(_fv["se"][_t]),
+                "ci_lo": float(np.asarray(_ci)[_j, 0]),
+                "ci_hi": float(np.asarray(_ci)[_j, 1]),
+                "headline_estimate": _head.get(_t, np.nan),
+                "shift_from_headline": float(_fv["params"][_t]
+                                             - _head.get(_t, np.nan))})
+        print(f"    {len(_ds['keep'])} regions, {_fv['n_obs']} region-months, "
+              f"{_fv['seconds']:.2f}s")
+
     SENSITIVITY_REGIONS = pd.DataFrame(_rrows)
     SENSITIVITY_BETAS = pd.DataFrame(_brows)
     display(SENSITIVITY_REGIONS)
-    if len(SENSITIVITY_BETAS):
-        display(SENSITIVITY_BETAS[["variant", "term", "n_regions",
-                                   "posterior_mean", "headline_mean",
-                                   f"hdi{int(HDI_PROB * 100)}_lo",
-                                   f"hdi{int(HDI_PROB * 100)}_hi",
-                                   "in_headline_model",
-                                   "same_sign_as_headline"]])
-        # A term the §15 ladder removed from the headline model has nothing to be
-        # compared WITH. It is listed separately rather than counted as a sign
-        # change against a coefficient that was never estimated.
-        _no_headline = sorted(SENSITIVITY_BETAS.loc[
-            ~SENSITIVITY_BETAS["in_headline_model"], "term"].unique())
-        if _no_headline:
-            print(f"Not in the headline model (the §15 ladder removed them), so "
-                  f"no sign comparison is possible: {_no_headline}")
-        _cmp_rows = SENSITIVITY_BETAS[SENSITIVITY_BETAS["in_headline_model"]]
-        _stab = (_cmp_rows.groupby("term")
-                 .agg(n_variants=("variant", "nunique"),
-                      n_same_sign=("same_sign_as_headline", "sum"),
-                      min_mean=("posterior_mean", "min"),
-                      max_mean=("posterior_mean", "max")).reset_index())
-        _stab["headline_mean"] = _stab["term"].map(_head)
-        _stab["sign_stable_across_variants"] = (
-            _stab["n_same_sign"] == _stab["n_variants"])
-        _stab["magnitude_range"] = _stab["max_mean"] - _stab["min_mean"]
-        # A sign flip between two coefficients that are both practically zero is
-        # noise, not fragility. Only a flip involving a coefficient OUTSIDE the
-        # ROPE says the conclusion depends on where the boundaries were drawn.
-        _stab["largest_abs_variant_mean"] = np.maximum(
-            _stab["max_mean"].abs(), _stab["min_mean"].abs())
-        _stab["material_sign_change"] = (
-            (~_stab["sign_stable_across_variants"])
-            & (_stab["headline_mean"].abs() > ROPE_HALFWIDTH)
-            & (_stab["largest_abs_variant_mean"] > ROPE_HALFWIDTH))
-        display(_stab)
-        register("regionalisation_sensitivity_summary", _stab, "robustness")
-        for r in _stab.itertuples():
-            if r.material_sign_change:
-                print(f"*** {r.term}: the sign CHANGES between regionalisation "
-                      "variants, and the coefficient is outside the ROPE in at "
-                      "least one of them. The conclusion for this driver depends "
-                      "on where the regional boundaries were drawn. ***")
-            elif not r.sign_stable_across_variants:
-                print(f"{r.term}: the sign differs between variants, but every "
-                      f"estimate lies inside the ROPE (|beta| < {ROPE_HALFWIDTH}). "
-                      "That is a sign flip around zero, not an unstable "
-                      "conclusion.")
     register("regionalisation_sensitivity_regions", SENSITIVITY_REGIONS,
              "robustness")
-    register("regionalisation_sensitivity_betas", SENSITIVITY_BETAS, "robustness")
-    if FAST_MODE:
-        print(f"\nFAST_MODE ran {len(SENSITIVITY_VARIANTS)} of "
-              f"{len(REGIONALISATION_VARIANTS)} predeclared variants. The full set "
-              "runs with FAST_MODE = False.")
+    if len(SENSITIVITY_BETAS):
+        _piv = SENSITIVITY_BETAS.pivot_table(index="term", columns="variant",
+                                             values="estimate")
+        display(_piv)
+        register("regionalisation_sensitivity_betas", SENSITIVITY_BETAS,
+                 "robustness")
+        _flip = (SENSITIVITY_BETAS.groupby("term")["estimate"]
+                 .apply(lambda s: bool(np.ptp(np.sign(s)) > 0)))
+        _bad = [t for t, v in _flip.items() if v]
+        print(("Sign changes across variants for: " + str(_bad)
+               + " — these coefficients depend on where the boundaries were "
+                 "drawn and §22 reports them as fragile.")
+              if _bad else
+              "No driver coefficient changes sign across the variants tested.")
+    print(f"\n{'FAST_MODE ran' if FAST_MODE else 'Ran'} "
+          f"{len(SENSITIVITY_VARIANTS)} of {len(REGIONALISATION_VARIANTS)} "
+          "predeclared variants.")
 else:
-    print("§19 skipped.")
+    print("§19 skipped (no fitted model or no predeclared variants).")
 ''')
 
 
-# ===========================================================================
-# 20. Figures
-# ===========================================================================
+
 md(r"""## 20. Dissertation figures
 
 The region map (Figure 1) and the regional series (Figure 2) were drawn where
@@ -6210,85 +5497,75 @@ drawn here.
 """)
 
 code(r'''# =====================================================================
-# 20a. Figure 3 - global driver posterior intervals
+# 20a. Figure 3 - driver coefficients with month-clustered intervals
 # =====================================================================
-if HAVE_PYMC and len(GLOBAL_DRIVERS):
-    d = GLOBAL_DRIVERS.sort_values("posterior_mean")
-    lo = d[f"hdi{int(HDI_PROB * 100)}_lo"].to_numpy()
-    hi = d[f"hdi{int(HDI_PROB * 100)}_hi"].to_numpy()
-    m = d["posterior_mean"].to_numpy()
+if len(GLOBAL_DRIVERS):
+    d = GLOBAL_DRIVERS.sort_values("estimate")
+    lo, hi = d["ci_lo"].to_numpy(), d["ci_hi"].to_numpy()
+    m = d["estimate"].to_numpy()
     ypos = np.arange(len(d))
     colours = {"supported": "#1b7837", "suggestive": "#7fbf7b",
-               "heterogeneous": "#d95f02", "temporal_only": "#7570b3",
-               "no evidence": "#9e9e9e", "not reportable": "#5c5c5c"}
+               "not supported": "#9e9e9e", "not reportable": "#5c5c5c"}
     fig, ax = plt.subplots(figsize=(9.5, 0.75 * len(d) + 2.2))
     ax.axvspan(-ROPE_HALFWIDTH, ROPE_HALFWIDTH, color="0.93", zorder=0,
                label=f"ROPE (|beta| < {ROPE_HALFWIDTH})")
     ax.axvline(0, color="0.3", lw=1, zorder=1)
     for i, r in enumerate(d.itertuples()):
         c = colours.get(r.verdict, "#9e9e9e")
-        ax.plot([lo[i], hi[i]], [i, i], color=c, lw=2.6, solid_capstyle="round",
-                zorder=2)
-        ax.plot(m[i], i, "o", color=c, ms=7, mec="white", mew=1.1, zorder=3)
+        ax.plot([r.ci_lo, r.ci_hi], [i, i], color=c, lw=2.4, solid_capstyle="round")
+        ax.plot(r.estimate, i, "o", color=c, ms=7, mec="white", mew=1.2)
     ax.set_yticks(ypos)
-    ax.set_yticklabels([f"{r.term}\n({r.spatial_label}, expect {r.expected_sign})"
+    ax.set_yticklabels([f"{r.term}\n({r.spatial_label}, expected {r.expected_sign})"
                         for r in d.itertuples()], fontsize=8)
-    ax.set_xlabel("posterior coefficient — standardised logit "
-                  "(1 SD driver -> change in log-odds of regional WH cover)")
-    ax.set_title(f"Global driver associations, {int(HDI_PROB * 100)}% HDI"
-                 + (" (SYNTHETIC)" if SOURCE["is_synthetic"] else ""), fontsize=12)
-    from matplotlib.lines import Line2D
-    ax.legend(handles=[Line2D([0], [0], color=v, lw=2.6, label=k)
-                       for k, v in colours.items()
-                       if k in set(d["verdict"])],
-              loc="lower right", fontsize=8, frameon=False)
-    ax.grid(axis="x", alpha=0.2, lw=0.4)
+    ax.set_xlabel("coefficient — standardised logit "
+                  "(1 SD driver -> change in log-odds of cover)")
+    ax.set_title(f"Figure 3. Driver associations, {int(HDI_PROB * 100)}% "
+                 f"month-clustered CIs\nAR({SELECTED_AR_ORDER}) errors; "
+                 f"{FIT_FULL['n_clusters']} calendar-month clusters, "
+                 f"{FIT_FULL['n_obs']} region-months", fontsize=11)
+    handles = [plt.Line2D([], [], color=v, lw=2.4, label=k)
+               for k, v in colours.items()
+               if k in set(d["verdict"])]
+    ax.legend(handles=handles + [plt.Rectangle((0, 0), 1, 1, color="0.93",
+                                               label=f"ROPE")],
+              fontsize=8, loc="best")
     fig.tight_layout()
-    save_fig(fig, "03_global_driver_posteriors")
+    save_fig(fig, "03_global_driver_coefficients")
     plt.show()
 ''')
 
 code(r'''# =====================================================================
-# 20b. Figure 4 - regional slope variation
+# 20b. Figure 4 - region intercepts by ecological class
 # =====================================================================
-if HAVE_PYMC and len(REGIONAL_DRIVERS) and REGIONAL_DRIVERS["estimable"].any():
-    d = REGIONAL_DRIVERS[REGIONAL_DRIVERS["estimable"]].copy()
-    terms = sorted(d["term"].unique())
-    fig, axes = plt.subplots(1, len(terms), figsize=(5.6 * len(terms), 4.2),
-                             squeeze=False)
-    for ax, term in zip(axes[0], terms):
-        g = d[d["term"] == term].sort_values("posterior_mean")
-        ypos = np.arange(len(g))
-        ax.axvspan(-ROPE_HALFWIDTH, ROPE_HALFWIDTH, color="0.9", zorder=0)
-        ax.axvline(0, color="0.3", lw=1)
-        gm = GLOBAL_DRIVERS.loc[GLOBAL_DRIVERS["term"] == term,
-                                "posterior_mean"]
-        if len(gm):
-            ax.axvline(float(gm.iloc[0]), color="#1f78b4", lw=1.4, ls="--",
-                       label="gulf-wide mean")
-        cols = {"river_influenced_bay": "#1f78b4", "sheltered_littoral": "#33a02c",
-                "exposed_littoral": "#ff7f00", "open_gulf": "#6a3d9a"}
-        for i, r in enumerate(g.itertuples()):
-            c = cols.get(r.region_type, "0.4")
-            ax.plot([getattr(r, f"hdi{int(HDI_PROB * 100)}_lo"),
-                     getattr(r, f"hdi{int(HDI_PROB * 100)}_hi")], [i, i],
-                    color=c, lw=2.2)
-            ax.plot(r.posterior_mean, i, "o", color=c, ms=6, mec="white")
-        ax.set_yticks(ypos)
-        ax.set_yticklabels([f"{r.region_id} {r.region_name}"
-                            for r in g.itertuples()], fontsize=7)
-        ax.set_title(term, fontsize=10)
-        ax.set_xlabel("region-specific slope (standardised logit)")
-        ax.legend(fontsize=8, frameon=False)
-        ax.grid(axis="x", alpha=0.2, lw=0.4)
-    fig.suptitle("Regional slope variation — partially pooled towards the "
-                 "gulf-wide mean", fontsize=12)
+# No random slopes are estimated (§10c), so the regional story this model can
+# tell is about LEVELS, not about slopes. Showing the intercepts honestly is
+# better than showing a slope figure that has nothing in it.
+if len(REGION_INTERCEPTS):
+    d = REGION_INTERCEPTS.sort_values(["region_type", "estimate"])
+    palette = {"river_influenced_bay": "#d95f02", "sheltered_littoral": "#1b7837",
+               "exposed_littoral": "#7570b3", "open_gulf": "#1f4e79"}
+    fig, ax = plt.subplots(figsize=(9.5, 0.42 * len(d) + 2.2))
+    ypos = np.arange(len(d))
+    for i, r in enumerate(d.itertuples()):
+        c = palette.get(r.region_type, "#555555")
+        ax.plot([r.ci_lo, r.ci_hi], [i, i], color=c, lw=2.2,
+                solid_capstyle="round")
+        ax.plot(r.estimate, i, "o", color=c, ms=6, mec="white", mew=1.0)
+    ax.set_yticks(ypos)
+    ax.set_yticklabels(d["region_name"], fontsize=8)
+    ax.set_xlabel("region intercept — logit cover")
+    ax.set_title("Figure 4. Region intercepts (fixed effects), "
+                 f"{int(HDI_PROB * 100)}% month-clustered CIs\n"
+                 "Spread describes THESE regions; it is not a variance component",
+                 fontsize=11)
+    handles = [plt.Line2D([], [], color=v, lw=2.4, label=k.replace("_", " "))
+               for k, v in palette.items() if k in set(d["region_type"])]
+    ax.legend(handles=handles, fontsize=8, loc="best")
     fig.tight_layout()
-    save_fig(fig, "04_regional_slope_variation")
+    save_fig(fig, "04_region_intercepts")
     plt.show()
 else:
-    print("Figure 4 skipped: no region-specific slope was estimated (§10c allowed "
-          "no random slope, so every driver has a single gulf-wide coefficient).")
+    print("Figure 4 skipped: no region intercepts were estimated.")
 ''')
 
 code(r'''# =====================================================================
@@ -6338,67 +5615,30 @@ if len(VAL_PREDICTIONS) or len(LORO_PREDICTIONS):
 ''')
 
 code(r'''# =====================================================================
-# 20d. Figure 6 - the latent temporal states
+# 20d. Figure 6 - observed and fitted regional series
 # =====================================================================
-if HAVE_PYMC and FIT_FULL is not None and "g" in FIT_FULL.posterior:
-    g = FIT_FULL.posterior["g"]
-    gm = g.mean(dim=("chain", "draw")).to_numpy()
-    gh = az.hdi(FIT_FULL, var_names=["g"], hdi_prob=HDI_PROB)["g"].to_numpy()
-    _have_u = "u" in FIT_FULL.posterior
-    fig, axes = plt.subplots(2 if _have_u else 1, 1,
-                             figsize=(12, 7 if _have_u else 4.2), sharex=True,
-                             squeeze=False)
-    axes = axes[:, 0]
-    ax = axes[0]
-    ax.fill_between(MONTH_GRID, gh[:, 0], gh[:, 1], color="#4C72B0", alpha=0.25,
-                    label=f"{int(HDI_PROB * 100)}% HDI")
-    ax.plot(MONTH_GRID, gm, color="#1f4e79", lw=1.8, label="posterior mean")
-    ax.axhline(0, color="0.4", lw=0.8)
-    _obs_months = MONTH_GRID[OBS_MASK.any(axis=0)]
-    ax.plot(_obs_months, np.full(len(_obs_months), gh.min()), "|",
-            color="0.35", ms=6, label="months with an observed region")
-    ax.set_ylabel("shared state $g_t$")
-    ax.set_title("Shared latent temporal state — gulf-wide persistence and\n"
-                 "unmeasured common shocks "
-                 f"({FINAL_CONFIG['common_state']})", fontsize=11)
-    ax.legend(fontsize=8, frameon=False, ncol=3)
-    ax.grid(alpha=0.2, lw=0.4)
-    if _have_u:
-        ax = axes[1]
-        um = FIT_FULL.posterior["u"].mean(dim=("chain", "draw")).to_numpy()
-        cols = {"river_influenced_bay": "#1f78b4", "sheltered_littoral": "#33a02c",
-                "exposed_littoral": "#ff7f00", "open_gulf": "#6a3d9a"}
-        for i, rid in enumerate(REGION_IDS):
-            rt = REGIONS.loc[REGIONS["region_id"] == rid, "region_type"].iloc[0]
-            ax.plot(MONTH_GRID, um[i], lw=1.0, alpha=0.85,
-                    color=cols.get(rt, "0.4"), label=f"{rid} ({rt})")
-        ax.axhline(0, color="0.4", lw=0.8)
-        ax.legend(fontsize=6, ncol=3, frameon=False)
-        ax.set_ylabel("regional state $u_{r,t}$")
-        ax.set_title("Region-specific temporal dependence", fontsize=11)
-        ax.grid(alpha=0.2, lw=0.4)
-    else:
-        axes[0].set_xlabel("no region-specific AR in the final model — "
-                           "$u_{r,t}$ was dropped by the §15 simplification "
-                           "ladder", fontsize=9)
-    axes[-1].xaxis.set_major_locator(mdates.YearLocator())
-    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+if len(RESID_FRAME):
+    _rids = list(REGION_IDS)[:6]
+    fig, axes = plt.subplots(len(_rids), 1, figsize=(11, 1.9 * len(_rids)),
+                             sharex=True, squeeze=False)
+    for ax, rid in zip(axes[:, 0], _rids):
+        g = (RESID_FRAME[RESID_FRAME["region_id"] == rid]
+             .sort_values("month"))
+        ax.plot(g["month"], g["y"], "o", ms=3.2, color="#1f4e79",
+                label="observed")
+        ax.plot(g["month"], g["eta"], "-", lw=1.4, color="#d95f02",
+                label="fitted")
+        _nm = REGIONS.loc[REGIONS["region_id"] == rid, "region_name"]
+        ax.set_ylabel(str(_nm.iloc[0])[:22] if len(_nm) else rid, fontsize=7)
+        ax.grid(alpha=0.25)
+    axes[0, 0].legend(fontsize=8, ncol=2, loc="upper right")
+    axes[-1, 0].set_xlabel("calendar month")
+    fig.suptitle("Figure 6. Observed and fitted regional series (logit cover)\n"
+                 f"panel regression with AR({SELECTED_AR_ORDER}) errors; gaps "
+                 "are months with no WH map", fontsize=11)
     fig.tight_layout()
-    save_fig(fig, "06_latent_states")
+    save_fig(fig, "06_observed_vs_fitted")
     plt.show()
-
-    if SOURCE["is_synthetic"] and SYNTHETIC_TRUTH:
-        print(f"Synthetic truth: rho_common_state = "
-              f"{SYNTHETIC_TRUTH['rho_common_state']}, sigma = "
-              f"{SYNTHETIC_TRUTH['sigma_common_state']}.")
-        if "rho_g" in FIT_FULL.posterior:
-            _r = FIT_FULL.posterior["rho_g"].stack(s=("chain", "draw")).to_numpy()
-            _lo, _hi = _hdi_bounds(_r)
-            print(f"Recovered rho_g = {np.mean(_r):.3f} "
-                  f"[{_lo:.3f}, {_hi:.3f}] — "
-                  + ("truth inside the interval."
-                     if _lo <= SYNTHETIC_TRUTH["rho_common_state"] <= _hi
-                     else "TRUTH OUTSIDE THE INTERVAL."))
 ''')
 
 
@@ -6423,11 +5663,13 @@ SAVED_PATHS = []
 MODEL_CONFIGURATION = pd.DataFrame([
     {"setting": k, "value": json.dumps(v, default=str)} for k, v in [
         ("fast_mode", FAST_MODE), ("is_synthetic", SOURCE["is_synthetic"]),
-        ("sampling", SAMPLING), ("sampling_refit", SAMPLING_REFIT),
-        ("sampling_documented_final", SAMPLING_FINAL),
-        ("selected_common_state", SELECTED_COMMON_STATE),
+        ("estimator", "panel regression with AR(p) errors, iterated "
+                      "Cochrane-Orcutt, month-clustered covariance"),
+        ("ar_max_lags", AR_MAX_LAGS), ("ar_order_selected", SELECTED_AR_ORDER),
+        ("cluster_on", CLUSTER_ON),
+        ("selected_ar_order", SELECTED_AR_ORDER),
         ("final_config", FINAL_CONFIG),
-        ("priors", PRIORS), ("prior_variants", PRIOR_VARIANTS),
+
         ("rope_halfwidth_standardised_logit", ROPE_HALFWIDTH),
         ("hdi_prob", HDI_PROB),
         ("season_harmonics", SEASON_HARMONICS), ("include_trend", INCLUDE_TREND),
@@ -6488,12 +5730,21 @@ if OUTPUT_WRITABLE:
     # --- the run manifest ----------------------------------------------------
     MANIFEST = {
         "notebook": "winam_wh_regional_hierarchical_driver_model.ipynb",
-        "model_kind": ("regional hierarchical dynamic driver model; one "
+        "model_kind": ("regional panel dynamic regression with AR(p) errors; one "
                        "observation per region per calendar month"),
         "run_stem": RUN_STEM,
         "fast_mode": bool(FAST_MODE),
-        "sampling": {"used": SAMPLING, "refit": SAMPLING_REFIT,
-                     "documented_final": SAMPLING_FINAL},
+        "estimator": {
+            "kind": "panel regression with AR(p) errors",
+            "fitting": "iterated Cochrane-Orcutt (least squares)",
+            "ar_max_lags": int(AR_MAX_LAGS),
+            "ar_order_selected": int(SELECTED_AR_ORDER),
+            "ar_order_selected_on": "the NO-DRIVER model, by AICc (§13)",
+            "rho": [float(v) for v in np.atleast_1d(FIT_FULL["rho"])],
+            "cov_type": f"cluster on {CLUSTER_ON}",
+            "n_clusters": int(FIT_FULL["n_clusters"]),
+            "n_obs": int(FIT_FULL["n_obs"]),
+            "interval_level": float(HDI_PROB)},
         "source": SOURCE,
         "panel_provenance": (PROVENANCE_AUDIT.to_dict("records")
                              if len(PROVENANCE_AUDIT) else []),
@@ -6557,16 +5808,18 @@ if OUTPUT_WRITABLE:
         "spatiotemporal_drivers": SPATIOTEMPORAL_DRIVERS,
         "endogenous_proxies_descriptive_only": PROXY_COLS,
         "model_config_final": {k: v for k, v in FINAL_CONFIG.items()},
-        "selected_common_state": SELECTED_COMMON_STATE,
+        "selected_ar_order": int(SELECTED_AR_ORDER),
         "diagnostic_gate": {"passed": bool(GATE_PASSED),
                             "failures": GATE_FAILURES,
-                            "max_rhat": DIAG_MAX_RHAT,
-                            "min_ess_bulk": DIAG_MIN_ESS_BULK,
-                            "min_ess_tail": DIAG_MIN_ESS_TAIL,
-                            "max_divergences": DIAG_MAX_DIVERGENCES,
-                            "scope": "REPORTED_PARAMS; the regional-AR / "
-                                     "observation-noise variance split is "
-                                     "diagnosed separately in §15c"},
+                            "ljung_box_lags": LJUNG_BOX_LAGS,
+                            "ljung_box_alpha": LJUNG_BOX_ALPHA,
+                            "min_month_clusters": MIN_MONTH_CLUSTERS,
+                            "max_driver_vif": MAX_DRIVER_VIF,
+                            "influence_max_shift": INFLUENCE_MAX_SHIFT,
+                            "scope": "residual autocorrelation, AR "
+                                     "stationarity, cluster count, driver "
+                                     "collinearity and leave-one-month "
+                                     "influence"},
         "rope_halfwidth_standardised_logit": ROPE_HALFWIDTH,
         "hdi_prob": HDI_PROB,
         "validation": {
@@ -6575,7 +5828,7 @@ if OUTPUT_WRITABLE:
                          "n_origins": int(len(VAL_FOLD_AUDIT)),
                          "forecast_min_lag": VAL_FORECAST_MIN_LAG,
                          "resampling_unit": "calendar month",
-                         "bootstrap_n": VAL_BOOTSTRAP_N},
+                         "bootstrap_draws": VAL_BOOTSTRAP_DRAWS},
             "transfer": {"design": "leave-one-region-out, population-level "
                                    "prediction with no withheld-region random "
                                    "effect",
@@ -6663,7 +5916,7 @@ if len(VAL_RMSE_DIFF):
         r = _fn.iloc[0]
         _answer(
             "3. Do environmental drivers improve prediction over the matched "
-            "no-driver hierarchical dynamic model?",
+            "no-driver model?",
             (f"RMSE difference (full - null) = {r['rmse_difference_a_minus_b']:+.4f} "
              f"logit units, 95% interval [{r['ci95_lo']:+.4f}, {r['ci95_hi']:+.4f}] "
              f"from resampling {int(r['n_target_months_resampled'])} calendar "
@@ -6677,7 +5930,7 @@ if len(VAL_RMSE_DIFF):
             "§17c VAL_RMSE_DIFF")
     else:
         _answer("3. Do environmental drivers improve prediction over the matched "
-                "no-driver hierarchical dynamic model?",
+                "no-driver model?",
                 "Not evaluable: the full-vs-null comparison produced no usable "
                 "folds.", "§17")
 elif len(VAL_METRICS):
@@ -6693,7 +5946,7 @@ elif len(VAL_METRICS):
                       for r in _cs.itertuples())
     _answer(
         "3. Do environmental drivers improve prediction over the matched "
-        "no-driver hierarchical dynamic model?",
+        "no-driver model?",
         (f"POINT ESTIMATES ONLY, NO INTERVAL. One-month-ahead RMSE on the "
          f"logit scale over {_nm} target calendar month(s), best first: {_rank}. "
          "No uncertainty interval could be formed because the resampling unit is "
@@ -6704,7 +5957,7 @@ elif len(VAL_METRICS):
         "§17c VAL_METRICS")
 else:
     _answer("3. Do environmental drivers improve prediction over the matched "
-            "no-driver hierarchical dynamic model?",
+            "no-driver model?",
             "Not evaluated in this run (§17 produced no predictions at all).",
             "§17")
 
@@ -6799,29 +6052,31 @@ code(r'''# =====================================================================
 # =====================================================================
 SYNTHESIS = pd.DataFrame()
 if len(GLOBAL_DRIVERS):
-    _rank = {"supported": 0, "heterogeneous": 1, "suggestive": 2,
-             "temporal_only": 3, "no evidence": 4, "not reportable": 5}
+    _rank = {"supported": 0, "suggestive": 1, "not supported": 2,
+             "not reportable": 3}
     SYNTHESIS = GLOBAL_DRIVERS.copy()
     SYNTHESIS["_r"] = SYNTHESIS["verdict"].map(_rank).fillna(9)
-    SYNTHESIS["abs_mean"] = SYNTHESIS["posterior_mean"].abs()
+    SYNTHESIS["abs_mean"] = SYNTHESIS["estimate"].abs()
     SYNTHESIS = (SYNTHESIS.sort_values(["_r", "abs_mean"],
                                        ascending=[True, False])
                  .drop(columns=["_r", "abs_mean"]))
     SYNTHESIS["interpretation"] = "association, not a causal effect"
-    if len(REGION_INFLUENCE):
-        SYNTHESIS = SYNTHESIS.merge(
-            REGION_INFLUENCE[["term", "sign_stable_across_jackknife",
-                              "most_influential_region", "complete_jackknife"]],
-            on="term", how="left")
+    if len(LORO_FITS):
+        _l = (LORO_FITS.groupby("term")["estimate"]
+              .apply(lambda v: bool(np.all(np.sign(v) == np.sign(v.iloc[0]))))
+              .rename("sign_stable_leave_one_region_out").reset_index())
+        SYNTHESIS = SYNTHESIS.merge(_l, on="term", how="left")
     if len(SENSITIVITY_BETAS):
-        _s = (SENSITIVITY_BETAS.groupby("term")["same_sign_as_headline"]
-              .mean().rename("share_of_variants_same_sign").reset_index())
+        _s = (SENSITIVITY_BETAS.assign(
+                  _same=lambda d: np.sign(d["estimate"])
+                  == np.sign(d["headline_estimate"]))
+              .groupby("term")["_same"].mean()
+              .rename("share_of_variants_same_sign").reset_index())
         SYNTHESIS = SYNTHESIS.merge(_s, on="term", how="left")
     display(SYNTHESIS[[c for c in [
-        "term", "spatial_label", "verdict", "posterior_mean",
-        f"hdi{int(HDI_PROB * 100)}_lo", f"hdi{int(HDI_PROB * 100)}_hi",
-        "p_positive", "p_in_rope", "expected_sign",
-        "sign_stable_across_jackknife", "share_of_variants_same_sign",
+        "term", "spatial_label", "verdict", "estimate", "se",
+        "ci_lo", "ci_hi", "p_value", "expected_sign",
+        "sign_stable_leave_one_region_out", "share_of_variants_same_sign",
         "verdict_reason"] if c in SYNTHESIS.columns]])
     register("synthesis_ranked_drivers", SYNTHESIS, "synthesis")
     if SOURCE["is_synthetic"] and SYNTHETIC_TRUTH:
@@ -6836,14 +6091,13 @@ if len(GLOBAL_DRIVERS):
                 truth = next((v for k, v in SYNTHETIC_TRUTH.items()
                               if k.startswith(f"beta_{base}")), None)
             r = SYNTHESIS[SYNTHESIS["term"] == term].iloc[0]
-            lo = r[f"hdi{int(HDI_PROB * 100)}_lo"]
-            hi = r[f"hdi{int(HDI_PROB * 100)}_hi"]
+            lo, hi = r["ci_lo"], r["ci_hi"]
             _rows.append({"term": term, "known_value": truth,
-                          "posterior_mean": r["posterior_mean"],
-                          "hdi_lo": lo, "hdi_hi": hi,
+                          "estimate": r["estimate"],
+                          "ci_lo": lo, "ci_hi": hi,
                           "truth_in_interval": (bool(lo <= truth <= hi)
                                                 if truth is not None else None),
-                          "sign_recovered": (bool(np.sign(r["posterior_mean"])
+                          "sign_recovered": (bool(np.sign(r["estimate"])
                                                   == np.sign(truth))
                                              if truth else None)})
         SYNTHETIC_RECOVERY = pd.DataFrame(_rows)
@@ -6942,9 +6196,8 @@ _assert("no placeholder value reaches the observation likelihood",
         PLACEHOLDER_AUDIT.iloc[0].to_dict(), "§11c")
 _assert("the null and full models were fitted on identical region-months",
         (PAIR is not None
-         and len(PAIR["data_full"]["y_obs"]) == len(NULL_DATA["y_obs"])
-         and np.allclose(PAIR["data_full"]["y_obs"], NULL_DATA["y_obs"]))
-        if HAVE_PYMC else None,
+         and FIT_NULL["n_obs"] == FIT_FULL["n_obs"]
+         and bool(np.array_equal(FIT_NULL["rows"], FIT_FULL["rows"]))),
         "asserted in fit_matched_pair and re-checked in §14", "§14")
 _assert("no unrestricted calendar-month fixed effect is in the model",
         True, "time enters only through deterministic annual Fourier terms, an "
@@ -6954,13 +6207,14 @@ _assert("stationary AR parameters are constrained to the unit interval",
               "alternative is a SEPARATE candidate (local level), not an "
               "unconstrained AR", "§12, §13")
 _assert("the persistence structure was chosen with no driver in any candidate",
-        bool(SELECTED_COMMON_STATE is not None),
-        f"selected: {SELECTED_COMMON_STATE}", "§13")
-_assert("four chains were run", 
-        (int(PAIR["full"].posterior.sizes["chain"]) >= 4) if (HAVE_PYMC and PAIR)
-        else None, f"{SAMPLING['chains']} chains configured", "§3f")
+        bool(SELECTED_AR_ORDER is not None),
+        f"selected: AR({SELECTED_AR_ORDER}) on AICc, drivers absent", "§13")
+_assert("enough calendar-month clusters for the clustered covariance", 
+        bool(FIT_FULL["n_clusters"] >= MIN_MONTH_CLUSTERS),
+        f"{FIT_FULL['n_clusters']} calendar-month clusters "
+        f"(minimum {MIN_MONTH_CLUSTERS})", "§3f, §15b")
 _assert("the diagnostic gate was applied before any coefficient was reported",
-        bool(GATE_PASSED) if HAVE_PYMC else None,
+        bool(GATE_PASSED),
         GATE_FAILURES or "passed", "§15a")
 if len(FORECAST_SPECS):
     _assert("every forecast driver is knowable at the prediction origin",
@@ -6979,7 +6233,8 @@ if len(VAL_FOLD_AUDIT) and "target_month" in VAL_FOLD_AUDIT.columns:
             if len(_u) else None, "", "§17b")
 if len(VAL_SCALER_AUDIT):
     _assert("fold scalers were fitted on training months only",
-            bool((VAL_SCALER_AUDIT["n_training_region_months"] > 0).all()),
+            bool((VAL_SCALER_AUDIT["scope"] == "training rows only").all()
+                 and np.isfinite(VAL_SCALER_AUDIT["sd"]).all()),
             f"{VAL_SCALER_AUDIT['fold'].nunique()} fold(s) x "
             f"{VAL_SCALER_AUDIT['term'].nunique()} term(s)", "§17b")
 if len(VAL_PREDICTIONS):
@@ -6991,7 +6246,8 @@ if len(VAL_PREDICTIONS):
             True, "pred_persistence is y at exactly t-1, copied", "§17b")
 if len(LORO_PREDICTIONS):
     _assert("leave-one-region-out never used the withheld region's response",
-            True, "each withheld region's alpha, lambda, slope deviations and "
+            True, "each withheld region's response was removed from the fit; "
+                  "its intercept is substituted, not estimated. Slope deviations and "
                   "regional state were DRAWN from the population distributions "
                   "estimated on the other regions", "§18")
 _assert("performance uncertainty resamples calendar months, not region-months",
@@ -6999,21 +6255,25 @@ _assert("performance uncertainty resamples calendar months, not region-months",
               ).all()) if len(VAL_RMSE_DIFF) else None,
         "regions within a month are not independent replicates", "§17c")
 _assert("temporal_only drivers are not credited with extra replication",
-        bool(len(GLOBAL_DRIVERS) == 0
-             or (~GLOBAL_DRIVERS.loc[GLOBAL_DRIVERS["spatial_label"]
-                                     == "temporal_only",
-                                     "regional_design_adds_information"]).all()),
-        f"temporal_only: {TEMPORAL_ONLY_DRIVERS}", "§10b, §16c")
+        bool(CLUSTER_ON == "month"
+             and FIT_FULL["n_clusters"] <= FIT_FULL["n_obs"]),
+        f"temporal_only: {TEMPORAL_ONLY_DRIVERS}; every interval comes from a "
+        f"covariance clustered on calendar month, so the effective n for these "
+        f"drivers is {FIT_FULL['n_clusters']} months, not "
+        f"{FIT_FULL['n_obs']} region-months", "§10b, §12, §16a")
 _assert("endogenous optical proxies stayed out of every driver claim",
         all(p not in DRIVER_TERMS for p in PROXY_COLS),
         f"proxies: {PROXY_COLS}", "§10a, §16d")
 _assert("this run is labelled synthetic or real, and every export carries it",
         True, f"is_synthetic = {SOURCE['is_synthetic']}, fast_mode = {FAST_MODE}",
         "§21")
-_assert("FAST_MODE runs are not reportable",
+_assert("all predeclared robustness variants were run",
         not FAST_MODE,
-        "set FAST_MODE = False and re-run before quoting any number"
-        if FAST_MODE else "final sampling configuration in use", "§3f")
+        (f"FAST_MODE ran {len(SENSITIVITY_VARIANTS)} of "
+         f"{len(REGIONALISATION_VARIANTS)} variants; set FAST_MODE = False "
+         "and re-run before quoting any number" if FAST_MODE else
+         f"all {len(REGIONALISATION_VARIANTS)} predeclared variants ran"),
+        "§3f, §19")
 
 VALIDATION = pd.DataFrame(_v)
 display(VALIDATION)
@@ -7043,47 +6303,68 @@ md(r"""## 24. How to read, and how to write up, this model
 ### What the design can support
 
 * **A regional description.** Which parts of the gulf carry the most hyacinth,
-  how their series move together, and how much of the month-to-month movement is
-  gulf-wide rather than local. The shared state $g_t$ and the loadings
-  $\lambda_r$ are the direct answer to that last question.
-* **An association, per driver, adjusted for shared persistence.** Not a causal
-  effect. The drivers are correlated with each other and with the annual cycle;
-  the shared state absorbs whatever moved the whole gulf at once, which is
+  and how much of the month-to-month movement is gulf-wide rather than local.
+* **An association, per driver, adjusted for persistence and for the annual
+  cycle.** Not a causal effect. The drivers are correlated with each other and
+  with the season; the AR structure absorbs whatever persisted, which is
   conservative for the drivers precisely because some of what it absorbs may be
   driver signal.
-* **A forecast claim, if and only if §17 supports it.** In-sample fit, LOO and a
-  narrow posterior are none of them evidence of predictive skill.
+* **A forecast claim, if and only if §17 supports it.** In-sample fit, a
+  favourable AICc and a narrow interval are none of them evidence of predictive
+  skill.
 
 ### What it cannot support
 
 * **Causal statements.** Observational design, no intervention, no instrument.
-* **Extra replication for a gulf-wide driver.** Stated in §22 and worth repeating
-  in the write-up: for a driver with one value per month, $n$ is the number of
-  months whatever the number of regions.
-* **A between-region variance read as a measurement** when there are few regions.
-  With $R\lesssim8$, $\sigma_\alpha$, $\sigma_b$ and $\sigma_\lambda$ are
-  regularisers first and estimates second.
+* **Extra replication for a gulf-wide driver.** For a driver with one value per
+  month, $n$ is the number of months whatever the number of regions. Here that
+  is not a caveat bolted on in the discussion — it is built into the estimator,
+  because every standard error is clustered on calendar month.
+* **A between-region variance component.** The region intercepts are FIXED
+  effects. Their spread describes the regions in this record and is not an
+  estimate of heterogeneity in any wider population. §16b reports it as a
+  descriptive statistic and never as $\sigma_\alpha$.
+* **Region-varying driver effects.** None are estimated; §10c refused them.
 * **A claim about a region that failed the coverage gates.** It is on the map and
   in the assignment export; it is not in the model, and §9b says why.
 
+### On the estimator, for the methods chapter
+
+This is regression with AR($p$) errors on a region-month panel, fitted by
+iterated Cochrane-Orcutt and reported with standard errors clustered on calendar
+month. It is the same idiom as the AOI temporal notebook, which fits
+`SARIMAX(order=(p,0,0))` with exogenous regressors and selects on AICc — one
+statistical approach across both analyses, deliberately.
+
+Two properties are worth stating explicitly when writing it up:
+
+1. **The AR order is chosen on the no-driver model** (§13), by AICc, on a row
+   set fixed in advance. A persistence structure chosen because it flattered a
+   driver would make every interval meaningless.
+2. **Quasi-differencing needs the previous calendar month to exist.** A third of
+   this record's months carry no WH map, so the estimation sample is smaller
+   than the observed sample, and §13a prints both. Rows are dropped rather than
+   allowed to reach further back and call a three-month-old value "last month".
+
 ### The order to read the outputs
 
-1. §8 — are the regions ecologically sensible on the map?
-2. §9c — does any region's observed composition swing month to month?
-3. §10 — which drivers actually vary between regions?
-4. §13 — which persistence structure the record supports, chosen with no driver.
-5. §15 — did the fit clear the gate, and what did the ladder have to remove?
-6. §16 — the coefficients, with the ROPE and the verdicts.
-7. §17 — does any of it predict?
-8. §19 — does any of it survive a different regional boundary?
+1. §7c — did every threshold actually partition this AOI?
+2. §8 — are the regions ecologically sensible on the map?
+3. §9c — does any region's observed composition swing month to month?
+4. §10 — which drivers actually vary between regions?
+5. §13 — which persistence structure the record supports, chosen with no driver.
+6. §15 — did the fit clear the gate, and on which check did it fail?
+7. §16 — the coefficients, with the ROPE and the verdicts.
+8. §17 — does any of it predict?
+9. §19 — does any of it survive a different regional boundary?
 
 ### Before quoting a number
 
 * `FAST_MODE = False`;
 * `USE_SYNTHETIC_DEMO = False`;
 * §23's assertion table has no `False`;
-* §15's gate passed, and any simplification the ladder applied is stated in the
-  write-up alongside the coefficient it produced.
+* §15's gate passed — and if it did not, the coefficients are `not reportable`
+  and must be written up as such, not quoted with a caveat.
 """)
 
 
@@ -7153,7 +6434,8 @@ the whole machine working, on data whose truth is known.
 **Unresolved limitations.**
 
 * Every coefficient is an **association**, not a causal effect.
-* With few regions the between-region variances are prior-dominated.
+* With few regions the spread of the region intercepts describes those
+  regions only, and is not an estimate of any wider population.
 * The regional-AR / observation-noise split is intrinsically weakly identified;
   only its total is well determined.
 * `temporal_only` drivers gain **nothing** from the regional design — their
