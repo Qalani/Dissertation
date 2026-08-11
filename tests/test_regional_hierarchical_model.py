@@ -52,6 +52,13 @@ import pandas as pd
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
+
+try:                       # shapely >= 2 + pyproj drive the §7a-ii river layer
+    import shapely as _shapely
+    import pyproj as _pyproj  # noqa: F401
+    _HAVE_SHAPELY = hasattr(_shapely, "distance")
+except Exception:
+    _HAVE_SHAPELY = False
 NOTEBOOK = REPO / "winam_wh_regional_hierarchical_driver_model.ipynb"
 
 
@@ -109,6 +116,15 @@ def ns():
     exec(compile(_defs(_cell("# 7c. Resolve the thresholds"),
                        ["threshold_capture_share", "resolve_thresholds"]),
                  "<thr>", "exec"), space)
+    try:
+        import shapely, shapely.geometry, shapely.ops, pyproj
+        space["shapely"] = shapely
+        space["pyproj"] = pyproj
+        space["HAVE_SHAPELY"] = hasattr(shapely, "distance")
+    except Exception:
+        space["HAVE_SHAPELY"] = False
+    exec(compile(_defs(_cell("# 7a-ii. Distance to the nearest MAJOR river"),
+                       ["load_major_rivers"]), "<riv>", "exec"), space)
     exec(compile(_defs(_cell("# 17c. Skill, by region"),
                        ["_rmse", "_mae", "skill_table"]), "<skill>", "exec"),
          space)
@@ -674,6 +690,212 @@ def test_a_threshold_with_no_declared_fallback_is_flagged_not_silently_kept(ns):
     row = table.set_index("threshold").loc["river_dist_m"]
     assert row["kind"] == "configured but NON-DISCRIMINATING"
     assert bool(row["discriminates"]) is False
+
+
+# ---------------------------------------------------------------------------
+# Merging terminates
+# ---------------------------------------------------------------------------
+def _lattice(i0, j0, ni, nj, cs=500):
+    """Cells on the same integer lattice `grid_cell_indices` reconstructs."""
+    rows = []
+    for i in range(i0, i0 + ni):
+        for j in range(j0, j0 + nj):
+            rows.append({"grid_id": f"c{i}_{j}",
+                         "x_km": (i * cs + cs / 2) / 1000.0,
+                         "y_km": (j * cs + cs / 2) / 1000.0,
+                         "eligible_area_ha": cs * cs / 1e4,
+                         "cov_a": 0.0, "cov_b": 0.0})
+    return rows
+
+
+def test_merging_terminates_when_a_component_cannot_be_merged(ns):
+    """An isolated component must be dropped ONCE, not re-selected forever.
+
+    Cells with no adjacent component are dropped to the `-1` sentinel. If `-1`
+    stays in the too-small candidate set it is re-selected on every iteration —
+    dropping it again is a no-op — so the loop spins until its budget runs out
+    and returns a half-merged partition full of one-cell "regions". This is the
+    Winam water mask's normal case: the occurrence mask carries small ponds that
+    touch nothing.
+    """
+    cells = pd.DataFrame(_lattice(0, 0, 10, 10)          # 100 cells, mergeable
+                         + _lattice(60, 60, 1, 1)        # an isolated single cell
+                         + _lattice(80, 80, 1, 1))       # and another
+    comp = np.array([0] * 100 + [1] + [2])
+    merged, log = ns["merge_small_components"](
+        cells, comp, ["cov_a", "cov_b"], min_cells=40, min_area_ha=100.0)
+
+    assert "merge_incomplete" not in set(log.get("action", [])), (
+        "the merge loop did not converge: " + str(log))
+    # the isolated cells are dropped exactly once each, and only they are dropped
+    assert list(merged[:100]) == [0] * 100
+    assert merged[100] == -1 and merged[101] == -1
+    dropped = log[log["action"] == "dropped"]
+    assert len(dropped) == 2, f"expected 2 drops, got {len(dropped)}"
+
+
+def test_merging_reports_an_exhausted_budget_instead_of_pretending(ns):
+    """A budget too small to finish must say so, not return a half-merged map."""
+    cells = pd.DataFrame(_lattice(0, 0, 12, 12))
+    comp = np.arange(144)                     # every cell its own component
+    _, log = ns["merge_small_components"](
+        cells, comp, ["cov_a", "cov_b"], min_cells=40, min_area_ha=100.0,
+        max_iter=3)
+    assert "merge_incomplete" in set(log["action"])
+    row = log[log["action"] == "merge_incomplete"].iloc[0]
+    assert "budget" in row["reason"] and "HALF-MERGED" in row["reason"]
+
+
+# ---------------------------------------------------------------------------
+# The mapped river network
+# ---------------------------------------------------------------------------
+def _rivers_fc():
+    """Three watercourses: one major, one too short, one that misses the gulf."""
+    def line(x0, x1, y):
+        return {"type": "LineString",
+                "coordinates": [[x0, y], [x1, y]]}
+    return {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "geometry": line(34.4, 34.6, -0.30),
+         "properties": {"name": "Major", "length_km": 80.0,
+                        "dist_to_gulf_km": 0.0}},
+        {"type": "Feature", "geometry": line(34.4, 34.45, -0.31),
+         "properties": {"name": "TooShort", "length_km": 6.0,
+                        "dist_to_gulf_km": 0.0}},
+        {"type": "Feature", "geometry": line(34.4, 34.6, -0.32),
+         "properties": {"name": "MissesGulf", "length_km": 90.0,
+                        "dist_to_gulf_km": 45.0}},
+    ]}
+
+
+@pytest.mark.skipif(not _HAVE_SHAPELY, reason="shapely>=2 / pyproj not installed")
+def test_major_rivers_apply_both_declared_thresholds(ns, tmp_path):
+    p = tmp_path / "rivers.geojson"
+    p.write_text(json.dumps(_rivers_fc()))
+    geom, table, src, sha = ns["load_major_rivers"](
+        [str(p)], 20.0, 10.0, "EPSG:32736")
+    assert src == str(p)
+    sel = table[table["selected"]]
+    assert sel["name"].tolist() == ["Major"]
+    reasons = table.set_index("name")["reason"].to_dict()
+    assert "shorter than" in reasons["TooShort"]
+    assert "never comes within" in reasons["MissesGulf"]
+    assert geom is not None and not geom.is_empty
+
+
+@pytest.mark.skipif(not _HAVE_SHAPELY, reason="shapely>=2 / pyproj not installed")
+def test_missing_river_layer_is_reported_not_invented(ns, tmp_path):
+    geom, table, src, sha = ns["load_major_rivers"](
+        [str(tmp_path / "absent.geojson")], 20.0, 10.0, "EPSG:32736",
+        verbose=False)
+    assert geom is None and src is None and sha is None and table.empty
+
+
+@pytest.mark.skipif(not _HAVE_SHAPELY, reason="shapely>=2 / pyproj not installed")
+def test_a_non_river_payload_is_refused_not_read_as_an_empty_layer(ns, tmp_path):
+    """A 404 body or some other GeoJSON must not pass for a layer with no rivers.
+
+    The notebook fetches this layer over the network. If a "404: Not Found"
+    body, an HTML error page or an unrelated FeatureCollection were accepted,
+    the run would continue with zero selected rivers — indistinguishable from a
+    legitimate empty selection, and silently back on the weak covariate.
+    """
+    bad_html = tmp_path / "err.geojson"
+    bad_html.write_text("404: Not Found")
+    other_fc = tmp_path / "other.geojson"
+    other_fc.write_text(json.dumps({
+        "type": "FeatureCollection",
+        "features": [{"type": "Feature", "properties": {"foo": 1},
+                      "geometry": {"type": "Point", "coordinates": [34.5, -0.3]}}]}))
+    empty_fc = tmp_path / "empty.geojson"
+    empty_fc.write_text(json.dumps({"type": "FeatureCollection", "features": []}))
+
+    good = tmp_path / "good.geojson"
+    good.write_text(json.dumps(_rivers_fc()))
+
+    # each bad payload is skipped, and the good one further down the list wins
+    geom, table, src, sha = ns["load_major_rivers"](
+        [str(bad_html), str(other_fc), str(empty_fc), str(good)],
+        20.0, 10.0, "EPSG:32736")
+    assert src == str(good)
+    assert table.loc[table["selected"], "name"].tolist() == ["Major"]
+
+    # with no good candidate at all, nothing is invented
+    geom, table, src, sha = ns["load_major_rivers"](
+        [str(bad_html), str(other_fc), str(empty_fc)], 20.0, 10.0, "EPSG:32736",
+        verbose=False)
+    assert geom is None and src is None and sha is None and table.empty
+
+
+@pytest.mark.skipif(not _HAVE_SHAPELY, reason="shapely>=2 / pyproj not installed")
+def test_the_layer_digest_identifies_the_bytes_actually_read(ns, tmp_path):
+    """The run manifest ties a result to a river network by hash."""
+    import hashlib
+    p = tmp_path / "rivers.geojson"
+    payload = json.dumps(_rivers_fc())
+    p.write_text(payload)
+    _, _, _, sha = ns["load_major_rivers"]([str(p)], 20.0, 10.0, "EPSG:32736")
+    assert sha == hashlib.sha256(payload.encode()).hexdigest()
+
+
+def test_the_river_layer_is_fetched_from_github_by_default():
+    """The notebook must not require the layer to be staged by hand."""
+    cfg = _cell("# 3c. Regionalisation")
+    assert "RIVER_VECTOR_REPO" in cfg and "raw.githubusercontent.com" in cfg
+    # every declared ref must be reachable as a candidate URL
+    assert "RIVER_VECTOR_REFS" in cfg
+    src = _cell("# 7a-ii. Distance to the nearest MAJOR river")
+    assert "RIVER_LAYER_SHA256" in src, "the layer's digest must be recorded"
+
+
+@pytest.mark.skipif(not _HAVE_SHAPELY, reason="shapely>=2 / pyproj not installed")
+def test_the_shipped_river_layer_selects_winam_s_known_inflows(ns):
+    """The layer in aoi/ must actually contain the gulf's real rivers."""
+    layer = REPO / "aoi" / "winam_major_rivers.geojson"
+    assert layer.exists(), "aoi/winam_major_rivers.geojson is missing"
+    geom, table, _s, sha = ns["load_major_rivers"](
+        [str(layer)], 20.0, 10.0, "EPSG:32736")
+    chosen = set(table.loc[table["selected"], "name"])
+    for river in ["Nzoia", "Yala", "Nyando", "Miriu (Sondu)"]:
+        assert river in chosen, f"{river} missing from {sorted(chosen)}"
+    assert geom is not None
+
+
+@pytest.mark.skipif(not _HAVE_SHAPELY, reason="shapely>=2 / pyproj not installed")
+def test_the_mapped_network_separates_cells_the_hydrosheds_column_cannot(ns):
+    """The point of the change: a river covariate that varies across the gulf.
+
+    The panel's HydroSHEDS RIV_ORD<=7 column spanned 77-3,746 m over the real
+    cell set — a factor of ~50 — which is why a 5 km river cut captured 100% of
+    the AOI. Measured against the mapped network over the same water body, the
+    spread has to be far wider or the regionalisation collapses again.
+    """
+    import shapely
+    layer = REPO / "aoi" / "winam_major_rivers.geojson"
+    mask_path = REPO / "aoi" / "winam_gulf_water_mask_occ05.geojson"
+    assert layer.exists() and mask_path.exists()
+    geom, _t, _s, _h = ns["load_major_rivers"](
+        [str(layer)], 20.0, 10.0, "EPSG:32736")
+
+    import pyproj
+    import shapely.geometry
+    import shapely.ops
+    to_m = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:32736",
+                                       always_xy=True).transform
+    fc = json.loads(mask_path.read_text())
+    mask = shapely.ops.transform(to_m, shapely.ops.unary_union(
+        [shapely.geometry.shape(f["geometry"]) for f in fc["features"]]))
+
+    x0, y0, x1, y1 = mask.bounds
+    gx, gy = np.meshgrid(np.arange(x0, x1, 2000.0), np.arange(y0, y1, 2000.0))
+    pts = shapely.points(gx.ravel(), gy.ravel())
+    pts = pts[shapely.contains(mask, pts)]
+    assert len(pts) > 200
+
+    d = shapely.distance(pts, geom)
+    # the HydroSHEDS column's 95th percentile over the real cells was 2,467 m
+    assert np.percentile(d, 95) > 10_000, np.percentile(d, 95)
+    # and a 5 km river cut must now select a minority of the gulf, not all of it
+    assert 0.02 < float(np.mean(d <= 5000.0)) < 0.60, float(np.mean(d <= 5000.0))
 
 
 # ---------------------------------------------------------------------------

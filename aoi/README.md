@@ -18,6 +18,8 @@ project notebooks. All geometries are **EPSG:4326 (WGS84 lon/lat)**.
 | `make_winam_mask.py` | Self-contained generator for the masks above (downloads the source tile). |
 | `make_planetscope_aoi.py` | Generator for the simplified PlanetScope AOI (reads the `occ30` mask). |
 | `make_main_lake_aoi.py` | Generator for the classifier main-lake AOI (reads the `occ05` mask). |
+| **`winam_major_rivers.geojson`** | **Mapped river network** — named watercourses draining towards the gulf, each carrying its total mapped course length and its distance to the `occ05` water body. Read by `winam_wh_regional_hierarchical_driver_model.ipynb` §7a-ii to build the `dist_majriver_local_m` covariate. |
+| `make_winam_major_rivers.py` | Generator for the river layer (reads the `occ05` mask + the KEN_Rivers shapefile). |
 | `winam_gulf_mask_preview.png` / `planetscope_aoi_preview.png` | Previews. |
 
 Each mask is a single dissolved `(Multi)Polygon` feature; lake islands are
@@ -103,11 +105,62 @@ change the western edge, shoreline collar, or vertex budget, then re-run.
 ## Reproduce
 
 ```bash
-pip install rasterio shapely numpy pyproj
+pip install rasterio shapely numpy pyproj pyshp
 python make_winam_mask.py       # auto-downloads the ~52 MB source tile
 python make_planetscope_aoi.py  # reads winam_gulf_water_mask_occ30.geojson
 python make_main_lake_aoi.py    # reads winam_gulf_water_mask_occ05.geojson
+python make_winam_major_rivers.py /path/to/KEN_Rivers/KEN_Rivers.shp
 ```
 
 > Note: the source GeoTIFF (`occurrence_30E_0N_v1_4_2021.tif`) is not committed;
 > it is fetched on demand and is git-ignored.
+
+## The river network
+
+`winam_major_rivers.geojson` exists because the cell-month panel's
+`dist_majriver_m` — Earth Engine's HydroSHEDS `RIV_ORD <= 7` cut — is far too
+permissive for a water body this small. Over the 5,879 eligible Winam Gulf cells
+it spans only 77 m to 3,746 m, so the project's 5 km river-influence length scale
+classifies **every** cell as river-influenced and the regional model's
+regionalisation collapses to a single region.
+
+Measured instead against the mapped network, the same 5 km cut selects about an
+eighth of the gulf, and the covariate spans 0 to ~33 km.
+
+- **Source:** KEN_Rivers (ILRI / OCHA Kenya, `KEN_Rivers-250_polyline`), an ESRI
+  shapefile of 13,914 polylines covering Kenya at 1:250,000, EPSG:4326. The
+  shapefile itself is **not committed** — pass its path to the generator.
+- **Attributes:** the source carries only `NAME`, with no stream-order field, so
+  "major" cannot be read off an attribute. The generator instead dissolves
+  segments by name and records two response-blind quantities per watercourse:
+  `length_km` (the size of the river) and `dist_to_gulf_km` (whether it actually
+  reaches the analysed water body). **The file makes no selection itself** — the
+  notebook applies its own declared thresholds (`RIVER_MAJOR_MIN_LENGTH_KM`,
+  `RIVER_MAJOR_MAX_GULF_DIST_KM`) so the decision lives with every other
+  threshold, in one configuration cell, fixed before anything is fitted.
+- **At the notebook's defaults** (course ≥ 20 km, within 10 km of the gulf) this
+  selects 18 watercourses, among them Nzoia, Migori, Yala, Nyando, Sondu-Miriu,
+  Awach Kibuon, Awach Tende, Ombeyi and Kibos — the gulf's documented inflows.
+- **Geometry** is clipped to the AOI padded by 0.40°, since only reaches near the
+  gulf can be the nearest river to a gulf cell; `length_km` is measured *before*
+  that clip, over a wider Lake Victoria basin window, so a long river truncated
+  at the window edge is not mistaken for a short one.
+
+### How the notebook gets it
+
+`winam_wh_regional_hierarchical_driver_model.ipynb` fetches this file **from
+GitHub over `raw.githubusercontent.com`**, so a fresh Colab runtime needs nothing
+staged on Drive and every run reads the same versioned file. The notebook tries,
+in order:
+
+1. local paths (`MyDrive/WH_regional_hierarchical_model/`, `MyDrive/`, `aoi/`) —
+   so a deliberately modified layer still wins;
+2. `RIVER_VECTOR_PATH` on each ref in `RIVER_VECTOR_REFS`, built from
+   `RIVER_VECTOR_REPO`.
+
+Whatever is read is validated as a river layer before use — a `404: Not Found`
+body or an unrelated FeatureCollection is skipped rather than accepted as a layer
+with no qualifying rivers. The source URL **and the SHA-256 of the bytes actually
+read** are printed and written into the run manifest, so a result can be tied
+back to the exact network that produced it. To freeze the layer for a final run,
+put a commit SHA in `RIVER_VECTOR_REFS` instead of a branch name.
