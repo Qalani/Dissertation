@@ -2774,7 +2774,8 @@ def mask_outline_segments(cells, cell_size_m):
 
 
 def plot_regions(assignments, regions, thresholds, covariates, cell_size_m,
-                 title="Winam Gulf — response-blind ecological regions"):
+                 title="Winam Gulf — response-blind ecological regions",
+                 river_geom=None):
     from matplotlib.collections import LineCollection
     cs_km = float(cell_size_m) / 1000.0
     ids = regions["region_id"].tolist()
@@ -2783,6 +2784,15 @@ def plot_regions(assignments, regions, thresholds, covariates, cell_size_m,
     hatch = {"river_influenced_bay": "//", "sheltered_littoral": "",
              "exposed_littoral": "..", "open_gulf": ""}
     type_of = dict(zip(regions["region_id"], regions["region_type"]))
+    # The map is of the analysed water body. Its extent is fixed HERE, from the
+    # cells, so nothing drawn afterwards can rescale it - a mapped river runs
+    # tens of km inland, and letting it drive the autoscale would shrink the
+    # gulf to a corner of its own figure.
+    xmin, xmax = (float(assignments["x_km"].min()),
+                  float(assignments["x_km"].max()))
+    ymin, ymax = (float(assignments["y_km"].min()),
+                  float(assignments["y_km"].max()))
+    pad_km = 2.0
 
     fig, ax = plt.subplots(figsize=(13, 7.5))
     patches, colours = [], []
@@ -2807,28 +2817,68 @@ def plot_regions(assignments, regions, thresholds, covariates, cell_size_m,
         colors="black", linewidths=1.1, zorder=4,
         label="shoreline of the analysed water body"))
 
+    # --- the river network the distance is measured FROM ---------------------
+    # Drawn first, and only where cells exist, so the contour below has a
+    # visible source instead of floating over the map unexplained.
+    drew_rivers = False
+    if river_geom is not None:
+        try:
+            import shapely.geometry as _sg
+            _clip = river_geom.intersection(
+                _sg.box((xmin - pad_km) * 1000.0, (ymin - pad_km) * 1000.0,
+                        (xmax + pad_km) * 1000.0, (ymax + pad_km) * 1000.0))
+            _paths = []
+            _stack = [_clip]
+            while _stack:
+                g = _stack.pop()
+                if g.is_empty:
+                    continue
+                if getattr(g, "geom_type", "") == "LineString":
+                    _paths.append(np.asarray(g.coords, dtype=float) / 1000.0)
+                elif hasattr(g, "geoms"):
+                    _stack.extend(list(g.geoms))
+            if _paths:
+                ax.add_collection(LineCollection(
+                    _paths, colors="#08306b", linewidths=1.0, alpha=0.9,
+                    zorder=5))
+                drew_rivers = True
+        except Exception as exc:
+            print(f"  river network not drawn: {exc}")
+
     riv_col = covariates.get("river_dist_m")
     t_riv = thresholds.get("river_dist_m")
     if riv_col and riv_col in assignments.columns and t_riv is not None:
         try:
-            ax.tricontour(assignments["x_km"].to_numpy(),
-                          assignments["y_km"].to_numpy(),
-                          pd.to_numeric(assignments[riv_col], errors="coerce")
-                          .fillna(1e9).to_numpy(),
-                          levels=[float(t_riv)], colors="#1f78b4",
-                          linewidths=1.8, linestyles="--", zorder=5)
+            import matplotlib.tri as mtri
+            _x = assignments["x_km"].to_numpy(dtype=float)
+            _y = assignments["y_km"].to_numpy(dtype=float)
+            _z = (pd.to_numeric(assignments[riv_col], errors="coerce")
+                  .fillna(1e9).to_numpy(dtype=float))
+            # Delaunay triangulates the CONVEX HULL of the cell centroids, and
+            # this water body is nowhere near convex: long thin triangles bridge
+            # the land between opposite shores, across the gulf mouth and over
+            # the islands. Contouring those bridges interpolates between cells
+            # that are tens of km apart and draws a dead-straight dashed line
+            # across dry land where nothing was ever measured. Keep only
+            # triangles whose vertices are genuine lattice neighbours: a
+            # diagonal step is sqrt(2) * cs and a two-cell span is 2 * cs, so
+            # 1.5 * cs separates the two cleanly.
+            _tri = mtri.Triangulation(_x, _y)
+            _v = _tri.triangles
+            _edge = np.maximum.reduce(
+                [np.hypot(_x[_v[:, i]] - _x[_v[:, j]], _y[_v[:, i]] - _y[_v[:, j]])
+                 for i, j in ((0, 1), (1, 2), (2, 0))])
+            _tri.set_mask(_edge > 1.5 * cs_km)
+            _kept = int((~_tri.mask).sum())
+            if _kept:
+                ax.tricontour(_tri, _z, levels=[float(t_riv)], colors="#1f78b4",
+                              linewidths=1.8, linestyles="--", zorder=6)
+            print(f"  river-distance contour: {_kept:,} of {len(_v):,} Delaunay "
+                  f"triangles retained ({len(_v) - _kept:,} spanning gaps in the "
+                  "cell set were dropped, so the contour is confined to the "
+                  "analysed water body)")
         except Exception as exc:
             print(f"  river-distance contour skipped: {exc}")
-        near = assignments.nsmallest(1, riv_col)
-        _grp = assignments[pd.to_numeric(assignments[riv_col], errors="coerce")
-                           <= float(t_riv) * 0.25]
-        if len(_grp):
-            for rid, sub in _grp.groupby("region_id"):
-                ax.plot(sub["x_km"].mean(), sub["y_km"].mean(), marker="v",
-                        ms=12, mfc="white", mec="#08306b", mew=2.0, zorder=6)
-        elif len(near):
-            ax.plot(near["x_km"].iloc[0], near["y_km"].iloc[0], marker="v",
-                    ms=12, mfc="white", mec="#08306b", mew=2.0, zorder=6)
 
     for r in regions.itertuples():
         # Anchor the label on a cell that really belongs to the region: a
@@ -2852,16 +2902,17 @@ def plot_regions(assignments, regions, thresholds, covariates, cell_size_m,
                for r in regions.itertuples()]
     handles.append(Line2D([0], [0], color="black", lw=1.1,
                           label="shoreline of the analysed water body"))
+    if drew_rivers:
+        handles.append(Line2D([0], [0], color="#08306b", lw=1.0,
+                              label="major river (selected mapped network, §7a-ii)"))
     if riv_col and t_riv is not None:
         handles.append(Line2D([0], [0], color="#1f78b4", lw=1.8, ls="--",
                               label=f"major-river distance = {t_riv:,.0f} m"))
-        handles.append(Line2D([0], [0], marker="v", lw=0, ms=11, mfc="white",
-                              mec="#08306b", mew=2.0,
-                              label="major river / river mouth"))
     ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5),
               fontsize=8, frameon=False)
     ax.set_aspect("equal")
-    ax.autoscale_view()
+    ax.set_xlim(xmin - pad_km, xmax + pad_km)
+    ax.set_ylim(ymin - pad_km, ymax + pad_km)
     ax.set_xlabel("easting (km, panel CRS)")
     ax.set_ylabel("northing (km, panel CRS)")
     ax.set_title(title, fontsize=13)
@@ -2873,7 +2924,8 @@ def plot_regions(assignments, regions, thresholds, covariates, cell_size_m,
 REGION_MAP_FIG, _ax = plot_regions(
     ASSIGNMENTS, REGIONS, THRESHOLDS, REGION_COVARIATES, EXPECTED_CELL_SIZE_M,
     title=("Winam Gulf — response-blind ecological regions"
-           + (" (SYNTHETIC)" if SOURCE["is_synthetic"] else "")))
+           + (" (SYNTHETIC)" if SOURCE["is_synthetic"] else "")),
+    river_geom=_river_geom)
 
 # Real shoreline overlay, when geopandas and a polygon are both available.
 _shore_path = next((p for p in SHORELINE_GEOJSON_CANDIDATES if Path(p).exists()), None)
@@ -6209,7 +6261,7 @@ _assert("stationary AR parameters are constrained to the unit interval",
 _assert("the persistence structure was chosen with no driver in any candidate",
         bool(SELECTED_AR_ORDER is not None),
         f"selected: AR({SELECTED_AR_ORDER}) on AICc, drivers absent", "§13")
-_assert("enough calendar-month clusters for the clustered covariance", 
+_assert("enough calendar-month clusters for the clustered covariance",
         bool(FIT_FULL["n_clusters"] >= MIN_MONTH_CLUSTERS),
         f"{FIT_FULL['n_clusters']} calendar-month clusters "
         f"(minimum {MIN_MONTH_CLUSTERS})", "§3f, §15b")
