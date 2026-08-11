@@ -160,7 +160,22 @@ in order:
 
 Whatever is read is validated as a river layer before use — a `404: Not Found`
 body or an unrelated FeatureCollection is skipped rather than accepted as a layer
-with no qualifying rivers. The source URL **and the SHA-256 of the bytes actually
-read** are printed and written into the run manifest, so a result can be tied
-back to the exact network that produced it. To freeze the layer for a final run,
-put a commit SHA in `RIVER_VECTOR_REFS` instead of a branch name.
+with no qualifying rivers.
+
+**The layer is pinned.** The first entry in `RIVER_VECTOR_REFS` is an immutable
+commit SHA rather than a branch name, so the notebook reads the same bytes
+whatever happens to `main` afterwards, and keeps working if the branch that
+introduced the layer is deleted. `main` follows only as a safety net.
+
+The SHA-256 of the bytes actually read is checked against
+`RIVER_LAYER_EXPECTED_SHA256`, printed beside the source, written into the run
+manifest (`regionalisation.river_layer`) and asserted in §23. The river network
+defines the regions, so a different layer is a different partition — a run made
+against unpinned bytes is not comparable with one made against these.
+
+### Changing the layer
+
+Regenerate it, commit it, then update **both** `RIVER_VECTOR_REFS[0]` (to the new
+commit) and `RIVER_LAYER_EXPECTED_SHA256` (to the new digest, which
+`make_winam_major_rivers.py` prints). Updating one without the other makes §23
+fail, which is the intended behaviour — the pin is meant to notice.

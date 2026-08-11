@@ -434,10 +434,27 @@ THRESHOLD_FALLBACK_QUANTILES = {
 # the fact.
 RIVER_VECTOR_REPO = "Qalani/Dissertation"
 RIVER_VECTOR_PATH = "aoi/winam_major_rivers.geojson"
-# Tried in order. `main` is the long-term home; the feature branch is listed
-# after it so the notebook also works before that branch is merged. Pin a commit
-# SHA here instead of a branch name to freeze the layer for a final run.
-RIVER_VECTOR_REFS = ["main", "claude/river-network-covariate-n3dd10"]
+# Tried in order. The first entry is a COMMIT SHA, not a branch: a branch name
+# resolves to whatever that branch points at today, so a run that reads `main`
+# is reproducible only for as long as nobody touches the layer. A commit SHA is
+# immutable, survives the branch being deleted, and makes "which river network
+# produced this number" answerable from the notebook alone.
+#
+# `main` follows as a safety net so the notebook still runs if the pinned commit
+# is ever unreachable — and because the digest below is verified either way, a
+# fallback that quietly served different bytes could not pass unnoticed.
+#
+# To adopt a NEW river layer: regenerate it with aoi/make_winam_major_rivers.py,
+# commit it, then update BOTH the SHA below and RIVER_LAYER_EXPECTED_SHA256.
+RIVER_VECTOR_REFS = [
+    "31491ab52eb265c2b991a6393e254958ac0ab895",   # added aoi/winam_major_rivers.geojson
+    "main",
+]
+# SHA-256 of the layer's bytes. §7a-ii checks what it read against this and says
+# so loudly on a mismatch, so the pin above is verified rather than trusted.
+# Set to None to accept whatever is found (and record its digest anyway).
+RIVER_LAYER_EXPECTED_SHA256 = (
+    "a9f1a4c416d744e05690ceb5f93e55b2ea8aefc5d37d8eaef6beda03196b5779")
 RIVER_VECTOR_CANDIDATES = [
     # explicit local overrides win, if a copy has been staged deliberately
     "/content/drive/MyDrive/WH_regional_hierarchical_model/winam_major_rivers.geojson",
@@ -2326,7 +2343,7 @@ def load_major_rivers(candidates, min_length_km, max_gulf_dist_km, crs,
 
 
 RIVER_SELECTION = pd.DataFrame()
-RIVER_LAYER_SOURCE = RIVER_LAYER_SHA256 = None
+RIVER_LAYER_SOURCE = RIVER_LAYER_SHA256 = RIVER_LAYER_SHA256_OK = None
 _river_geom = None
 if HAVE_SHAPELY:
     try:
@@ -2344,6 +2361,27 @@ if _river_geom is not None:
     _sel = RIVER_SELECTION[RIVER_SELECTION["selected"]]
     print(f"Major-river layer: {RIVER_LAYER_SOURCE}")
     print(f"  sha256 {RIVER_LAYER_SHA256}")
+    RIVER_LAYER_SHA256_OK = (None if not RIVER_LAYER_EXPECTED_SHA256
+                             else RIVER_LAYER_SHA256 == RIVER_LAYER_EXPECTED_SHA256)
+    if RIVER_LAYER_SHA256_OK is True:
+        print("  digest matches RIVER_LAYER_EXPECTED_SHA256 — this is the pinned "
+              "layer")
+    elif RIVER_LAYER_SHA256_OK is False:
+        print(f"\n*** RIVER LAYER IS NOT THE PINNED ONE. Expected\n"
+              f"***   {RIVER_LAYER_EXPECTED_SHA256}\n"
+              f"*** but read\n"
+              f"***   {RIVER_LAYER_SHA256}\n"
+              f"*** from {RIVER_LAYER_SOURCE}.\n"
+              "*** The river network defines the regions, so a different layer "
+              "is a different partition and the numbers below are not comparable "
+              "with a run made against the pinned one. Either restore the pinned "
+              "layer, or — if the change is intended — update "
+              "RIVER_VECTOR_REFS and RIVER_LAYER_EXPECTED_SHA256 together so the "
+              "pin keeps meaning something. §23 records this as a failed "
+              "check. ***\n")
+    else:
+        print("  no expected digest configured (RIVER_LAYER_EXPECTED_SHA256 = "
+              "None): the layer is recorded but not pinned")
     print(f"  {len(_sel)} of {len(RIVER_SELECTION)} named watercourses qualify "
           f"(mapped course >= {RIVER_MAJOR_MIN_LENGTH_KM:g} km AND within "
           f"{RIVER_MAJOR_MAX_GULF_DIST_KM:g} km of the analysed water body):")
@@ -6477,6 +6515,8 @@ if OUTPUT_WRITABLE:
             "river_layer": {
                 "source": RIVER_LAYER_SOURCE,
                 "sha256": RIVER_LAYER_SHA256,
+                "expected_sha256": RIVER_LAYER_EXPECTED_SHA256,
+                "sha256_matches_pin": RIVER_LAYER_SHA256_OK,
                 "repo": RIVER_VECTOR_REPO,
                 "path": RIVER_VECTOR_PATH,
                 "refs_tried": list(RIVER_VECTOR_REFS),
@@ -6863,6 +6903,15 @@ _assert("the regionalisation actually partitions the AOI",
         "groups, the shared latent state is saturated, and §10's regional "
         "variance shares are 0 by arithmetic rather than by measurement",
         "§8a")
+_assert("the river network is the pinned one",
+        RIVER_LAYER_SHA256_OK,
+        (f"sha256 {RIVER_LAYER_SHA256} from {RIVER_LAYER_SOURCE}"
+         if RIVER_LAYER_SHA256 else
+         "no river layer was read; the run fell back to the panel's "
+         "dist_majriver_m")
+        + ("" if RIVER_LAYER_SHA256_OK is not False
+           else f"; expected {RIVER_LAYER_EXPECTED_SHA256}"),
+        "§3c, §7a-ii")
 _assert("every threshold in force discriminates on this AOI",
         bool(THRESHOLD_PROVENANCE["discriminates"].astype(bool).all()),
         "; ".join(
