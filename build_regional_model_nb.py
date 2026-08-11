@@ -239,6 +239,24 @@ except Exception as exc:
     shapely_box = None
     print(f"geopandas unavailable -> GeoPackage export and the shoreline overlay "
           f"are skipped; the region map and CSV exports still run: {exc}")
+
+# --- shapely + pyproj: needed for the mapped river network in §7a-ii ---------
+# Both ship with geopandas, but they are imported separately because §7a-ii
+# needs only them, and the river covariate is worth having even where the
+# GeoPackage export is not available.
+try:
+    import shapely
+    import shapely.geometry
+    import shapely.ops
+    import pyproj
+    HAVE_SHAPELY = hasattr(shapely, "distance")   # shapely >= 2.0
+    print(f"shapely {shapely.__version__} | pyproj {pyproj.__version__}"
+          + ("" if HAVE_SHAPELY else "  (shapely < 2.0 -> §7a-ii skipped)"))
+except Exception as exc:
+    HAVE_SHAPELY = False
+    shapely = pyproj = None
+    print(f"shapely/pyproj unavailable -> §7a-ii falls back to the panel's "
+          f"dist_majriver_m: {exc}")
 ''')
 
 
@@ -386,9 +404,46 @@ THRESHOLD_FALLBACK_QUANTILES = {
     "depth_m": None,        # stays unset; the class collapses into its parent
 }
 
+# --- the river network the river-distance covariate is measured from ---------
+# The panel's `dist_majriver_m` comes from Earth Engine's HydroSHEDS
+# `RIV_ORD <= EE_RIVER_MAJOR_MAX_ORD = 7` cut. For a water body this small that
+# order is far too permissive: it places EVERY eligible Winam Gulf cell within
+# 3,746 m of a "major river" (77 m at the closest), so the covariate spans a
+# factor of fifty and cannot separate a river-influenced bay from open water.
+#
+# `aoi/winam_major_rivers.geojson` in this repository is a mapped river network
+# (KEN_Rivers, ILRI / OCHA Kenya, 1:250,000, built by
+# `aoi/make_winam_major_rivers.py`). It carries, for every named watercourse,
+# its total mapped course length and its distance to the analysed water body.
+# The two thresholds below decide which of those count as MAJOR, and §7a-ii
+# measures each cell's distance to the nearest one as `dist_majriver_local_m`.
+#
+# Both thresholds are declared HERE, before anything is fitted, and neither may
+# be chosen by looking at WH cover. A named watercourse qualifies when it is
+# long enough to have a real catchment AND close enough to discharge into the
+# analysed water body — a long river that never approaches the gulf is not a
+# source of river influence on it.
+RIVER_VECTOR_CANDIDATES = [
+    "/content/drive/MyDrive/WH_regional_hierarchical_model/winam_major_rivers.geojson",
+    "/content/drive/MyDrive/winam_major_rivers.geojson",
+    "aoi/winam_major_rivers.geojson",
+    "../aoi/winam_major_rivers.geojson",
+    "https://raw.githubusercontent.com/Qalani/Dissertation/main/aoi/"
+    "winam_major_rivers.geojson",
+]
+RIVER_MAJOR_MIN_LENGTH_KM = 20.0      # a major river has a real catchment
+RIVER_MAJOR_MAX_GULF_DIST_KM = 10.0   # ...and it must actually reach the gulf
+# When the layer cannot be found the notebook falls back to the panel's
+# `dist_majriver_m` and says so loudly. It does not silently proceed as though
+# nothing changed, because on this AOI that column is the reason the first run
+# collapsed.
+REQUIRE_LOCAL_RIVER_VECTOR = False
+
 # Column preferences. The first present column is used; the choice is printed.
+# `dist_majriver_local_m` (§7a-ii, mapped network) outranks the panel's
+# HydroSHEDS-derived column when it is available.
 REGION_COVARIATE_PREFERENCE = {
-    "river_dist_m": ["dist_majriver_m", "dist_river_m"],
+    "river_dist_m": ["dist_majriver_local_m", "dist_majriver_m", "dist_river_m"],
     "shore_dist_m": ["dist_shore_m"],
     "openness": ["openness_index", "gsw_water_fraction"],
     "depth_m": ["depth_m"],
@@ -1511,13 +1566,19 @@ def _standardise(frame, cols):
 
 def merge_small_components(cells, comp, sim_cols, min_cells, min_area_ha,
                            area_col="eligible_area_ha", contiguity="queen",
-                           cell_size_m=500, max_iter=500):
+                           cell_size_m=500, max_iter=None):
     """Merge under-sized components into the most physically similar neighbour.
 
     "Physically similar" is Euclidean distance between the components' means in
     the standardised static-covariate space, which is response-blind by
     construction. Merging is iterative and always starts from the SMALLEST
     offending component, so the result does not depend on component ordering.
+
+    Each iteration disposes of exactly ONE component, so the iteration budget
+    has to scale with the number of components. A fixed budget silently returns
+    a half-merged partition — one-cell "regions" that no size rule ever caught —
+    so `max_iter=None` derives it from the component count and an exhausted
+    budget is logged as `merge_incomplete` rather than passing for convergence.
     Components with no adjacent component are dropped and reported.
     """
     assert_response_blind(sim_cols, "merge_small_components")
@@ -1526,15 +1587,24 @@ def merge_small_components(cells, comp, sim_cols, min_cells, min_area_ha,
     z = _standardise(cells, sim_cols)
     log = []
 
-    for _ in range(int(max_iter)):
+    budget = (int(max_iter) if max_iter
+              else max(2000, 10 * int(len(np.unique(comp)))))
+    converged = False
+    for _ in range(budget):
         df = pd.DataFrame({"comp": comp,
                            "area": cells[area_col].to_numpy() if area_col in cells
                            else np.ones(len(comp))})
         size = df.groupby("comp").size()
         area = df.groupby("comp")["area"].sum()
+        # `-1` is the sentinel for cells already dropped from the analysis. It is
+        # NOT a component: leaving it in the candidate set makes the loop
+        # re-select it every iteration (it has no neighbour to merge into, so
+        # dropping it again is a no-op) and the merge never converges.
         too_small = [c for c in size.index
-                     if size[c] < int(min_cells) or area[c] < float(min_area_ha)]
+                     if c >= 0
+                     and (size[c] < int(min_cells) or area[c] < float(min_area_ha))]
         if not too_small:
+            converged = True
             break
         target = min(too_small, key=lambda c: (size[c], area[c], c))
         adj = component_adjacency(ix, iy, comp, contiguity)
@@ -1561,6 +1631,24 @@ def merge_small_components(cells, comp, sim_cols, min_cells, min_area_ha,
                               f"MIN_REGION_ELIGIBLE_AREA_HA={min_area_ha:g}; merged "
                               f"into the most physically similar adjacent component"})
         comp[comp == target] = best
+    if not converged:
+        d2 = pd.DataFrame({"comp": comp,
+                           "area": cells[area_col].to_numpy() if area_col in cells
+                           else np.ones(len(comp))})
+        s2, a2 = d2.groupby("comp").size(), d2.groupby("comp")["area"].sum()
+        left = [c for c in s2.index
+                if c >= 0
+                and (s2[c] < int(min_cells) or a2[c] < float(min_area_ha))]
+        log.append({"component": None, "action": "merge_incomplete",
+                    "n_cells": int(sum(s2[c] for c in left)),
+                    "area_ha": float(sum(a2[c] for c in left)),
+                    "merged_into": None,
+                    "reason": f"the merge budget of {budget} iterations was "
+                              f"exhausted with {len(left)} component(s) still "
+                              f"below MIN_REGION_CELLS={min_cells} / "
+                              f"MIN_REGION_ELIGIBLE_AREA_HA={min_area_ha:g}; the "
+                              "partition is HALF-MERGED and its small units are "
+                              "not regions"})
     return comp, pd.DataFrame(log)
 
 
@@ -2123,6 +2211,133 @@ print(f"\nEligible water area: {CELL_STATIC['eligible_area_ha'].sum():,.0f} ha o
       f"{len(CELL_STATIC):,} cells "
       f"({'cell area x water fraction' if _wfrac is not None else 'cell area (no water-fraction column)'}).")
 
+
+# =====================================================================
+# 7a-ii. Distance to the nearest MAJOR river, from a mapped river network
+# =====================================================================
+# Response-blind by construction: river geometry, the analysed water body and
+# the cell centroids. No WH quantity is read, and the result is static because
+# all three inputs are.
+
+
+def load_major_rivers(candidates, min_length_km, max_gulf_dist_km, crs):
+    """The major-river geometry in `crs`, plus the selection table and source.
+
+    Every named watercourse in the layer is scored against the two DECLARED
+    thresholds; the table records which qualified and which did not, so the
+    selection can be defended river by river rather than as a black box.
+    """
+    import urllib.request
+
+    raw, used = None, None
+    for cand in candidates:
+        try:
+            if str(cand).startswith(("http://", "https://")):
+                with urllib.request.urlopen(str(cand), timeout=30) as fh:
+                    raw = json.loads(fh.read().decode("utf-8"))
+            else:
+                p = Path(cand)
+                if not p.exists():
+                    continue
+                raw = json.loads(p.read_text())
+            used = str(cand)
+            break
+        except Exception:
+            continue
+    if raw is None:
+        return None, pd.DataFrame(), None
+
+    rows = []
+    for feat in raw.get("features", []):
+        p = feat.get("properties", {})
+        length_km = float(p.get("length_km", np.nan))
+        gulf_km = float(p.get("dist_to_gulf_km", np.nan))
+        long_enough = np.isfinite(length_km) and length_km >= float(min_length_km)
+        near_enough = np.isfinite(gulf_km) and gulf_km <= float(max_gulf_dist_km)
+        rows.append({"name": p.get("name"), "length_km": length_km,
+                     "dist_to_gulf_km": gulf_km,
+                     "long_enough": bool(long_enough),
+                     "reaches_gulf": bool(near_enough),
+                     "selected": bool(long_enough and near_enough),
+                     "reason": ("selected" if long_enough and near_enough
+                                else "shorter than "
+                                     f"{min_length_km:g} km" if not long_enough
+                                else f"never comes within {max_gulf_dist_km:g} km "
+                                     "of the analysed water body")})
+    table = pd.DataFrame(rows).sort_values("length_km", ascending=False)
+    assert_response_blind([c for c in table.columns if c != "name"],
+                          "load_major_rivers")
+
+    keep = [f for f, r in zip(raw.get("features", []), rows) if r["selected"]]
+    if not keep:
+        return None, table, used
+
+    to_crs = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform
+    geom = shapely.ops.unary_union(
+        [shapely.ops.transform(to_crs, shapely.geometry.shape(f["geometry"]))
+         for f in keep])
+    return geom, table, used
+
+
+RIVER_SELECTION = pd.DataFrame()
+RIVER_LAYER_SOURCE = None
+_river_geom = None
+if HAVE_SHAPELY:
+    try:
+        _river_geom, RIVER_SELECTION, RIVER_LAYER_SOURCE = load_major_rivers(
+            RIVER_VECTOR_CANDIDATES, RIVER_MAJOR_MIN_LENGTH_KM,
+            RIVER_MAJOR_MAX_GULF_DIST_KM, PANEL_CRS)
+    except Exception as _exc:
+        print(f"Major-river layer could not be read ({_exc}).")
+
+if _river_geom is not None:
+    _pts = shapely.points(CELL_STATIC["x_km"].to_numpy(dtype=float) * 1000.0,
+                          CELL_STATIC["y_km"].to_numpy(dtype=float) * 1000.0)
+    CELL_STATIC["dist_majriver_local_m"] = shapely.distance(_pts, _river_geom)
+    _sel = RIVER_SELECTION[RIVER_SELECTION["selected"]]
+    print(f"Major-river layer: {RIVER_LAYER_SOURCE}")
+    print(f"  {len(_sel)} of {len(RIVER_SELECTION)} named watercourses qualify "
+          f"(mapped course >= {RIVER_MAJOR_MIN_LENGTH_KM:g} km AND within "
+          f"{RIVER_MAJOR_MAX_GULF_DIST_KM:g} km of the analysed water body):")
+    for _r in _sel.itertuples():
+        print(f"    {_r.name:<24s} {_r.length_km:8.1f} km course, "
+              f"{_r.dist_to_gulf_km:6.2f} km from the gulf")
+    _new = CELL_STATIC["dist_majriver_local_m"]
+    print(f"\n  dist_majriver_local_m over {len(CELL_STATIC):,} cells: "
+          f"min={_new.min():,.0f} median={_new.median():,.0f} "
+          f"max={_new.max():,.0f} m")
+    if "dist_majriver_m" in CELL_STATIC.columns:
+        _old = pd.to_numeric(CELL_STATIC["dist_majriver_m"], errors="coerce")
+        print(f"  panel dist_majriver_m (HydroSHEDS RIV_ORD <= 7):        "
+              f"min={_old.min():,.0f} median={_old.median():,.0f} "
+              f"max={_old.max():,.0f} m")
+        print(f"  Spearman rank correlation between the two: "
+              f"{_new.corr(_old, method='spearman'):.3f}")
+        print("  The HydroSHEDS column spans a factor of "
+              f"{_old.max() / max(_old.min(), 1e-9):,.0f}; the mapped-network "
+              f"column spans a factor of {_new.max() / max(_new.min(), 1e-9):,.0f}. "
+              "A covariate that cannot separate cells cannot define regions.")
+    register("major_river_selection", RIVER_SELECTION, "provenance")
+else:
+    _why = ("shapely/pyproj unavailable" if not HAVE_SHAPELY
+            else f"no layer found in {RIVER_VECTOR_CANDIDATES}"
+            if RIVER_LAYER_SOURCE is None else
+            f"no watercourse in {RIVER_LAYER_SOURCE} met "
+            f"length >= {RIVER_MAJOR_MIN_LENGTH_KM:g} km and gulf distance <= "
+            f"{RIVER_MAJOR_MAX_GULF_DIST_KM:g} km")
+    _msg = (f"*** Major-river layer NOT used ({_why}). Falling back to the "
+            "panel's dist_majriver_m, which is the HydroSHEDS RIV_ORD <= 7 "
+            "column that put 100% of this AOI inside a 5 km river cut and "
+            "collapsed the regionalisation to one region. §7c will catch that "
+            "and substitute a quantile, but the covariate itself is still the "
+            "weak one. Put winam_major_rivers.geojson somewhere in "
+            "RIVER_VECTOR_CANDIDATES to use the mapped network. ***")
+    if REQUIRE_LOCAL_RIVER_VECTOR:
+        raise RuntimeError(_msg)
+    print(_msg)
+    if len(RIVER_SELECTION):
+        register("major_river_selection", RIVER_SELECTION, "provenance")
+
 REGION_COVARIATES, COVARIATE_CHOICE = resolve_region_covariates(
     CELL_STATIC, REGION_COVARIATE_PREFERENCE)
 display(COVARIATE_CHOICE)
@@ -2140,13 +2355,24 @@ REPO_THRESHOLD_SEARCH = pd.DataFrame([
     {"quantity": "what counts as a MAJOR river",
      "repository_precedent": "EE_RIVER_MAJOR_MAX_ORD = 7 (HydroSHEDS RIV_ORD; lower = larger river)",
      "found": True,
-     "used_here": "defines dist_majriver_m, which is the river-distance covariate"},
+     "used_here": (
+         "SUPERSEDED for this AOI. RIV_ORD <= 7 places every eligible Winam "
+         "Gulf cell within 3,746 m of a 'major river', so dist_majriver_m spans "
+         "a factor of ~50 and cannot separate a river-influenced bay from open "
+         "water. §7a-ii instead measures dist_majriver_local_m against a mapped "
+         "river network (KEN_Rivers, ILRI/OCHA Kenya, 1:250,000), selecting "
+         f"named watercourses with a mapped course >= "
+         f"{RIVER_MAJOR_MIN_LENGTH_KM:g} km that come within "
+         f"{RIVER_MAJOR_MAX_GULF_DIST_KM:g} km of the analysed water body. The "
+         "panel column remains the documented fallback")},
     {"quantity": "river-influence distance",
      "repository_precedent": "openness_index is built on a 5 km circular kernel "
                              "(ee.Kernel.circle(5000, 'meters')) - the project's "
                              "established local-influence length scale",
      "found": True,
-     "used_here": "REGION_THRESHOLDS['river_dist_m'] = 5000 m, reusing that scale"},
+     "used_here": ("REGION_THRESHOLDS['river_dist_m'] = 5000 m, reusing that "
+                   "scale — but §7c checks it against this AOI's own "
+                   "distribution before it is allowed to define a class")},
     {"quantity": "littoral / shoreline distance",
      "repository_precedent": "EE_CATCHMENT_BUFFER_M = 2000 m, the local "
                              "catchment-influence buffer used for the land-cover, "
@@ -2406,6 +2632,17 @@ if len(MERGE_LOG):
     display(MERGE_LOG)
 else:
     print("\nNo component needed merging.")
+
+if "action" in MERGE_LOG.columns and (MERGE_LOG["action"] == "merge_incomplete").any():
+    _inc = MERGE_LOG[MERGE_LOG["action"] == "merge_incomplete"].iloc[0]
+    raise RuntimeError(
+        "REGIONALISATION DID NOT CONVERGE: " + str(_inc["reason"]) + ".\n"
+        "  Merging disposes of one component per iteration, so a partition that "
+        "shatters into many small components needs a proportionally larger "
+        "budget. The units left behind are single cells and slivers, not "
+        "regions, and §9's size gates would drop them along with their area.\n"
+        "  Raise max_iter in merge_small_components, or coarsen the partition "
+        "(a larger MIN_REGION_CELLS, or fewer classes).")
 
 CLASS_SHARES = (ASSIGNMENTS.groupby("region_type")
                 .agg(n_cells=("grid_id", "size"),
