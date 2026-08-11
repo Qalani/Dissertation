@@ -2,10 +2,10 @@
 
 ``winam_wh_regional_hierarchical_driver_model.ipynb`` divides Winam Gulf into
 fixed, ecologically meaningful regions, builds ONE water-hyacinth series per
-region, and fits a hierarchical dynamic model to the region x month panel. Its
-helper cells are pure numpy/pandas (plus PyMC for the model builder), so they are
-executed here straight out of the notebook JSON — the tests cannot drift from the
-code they describe.
+region, and fits a dynamic panel regression to the region x month panel. Every
+cell is pure numpy / pandas / statsmodels, so they are executed here straight out
+of the notebook JSON — the tests cannot drift from the code they describe, and
+the whole suite runs in seconds.
 
 What is pinned:
 
@@ -34,9 +34,14 @@ What is pinned:
 * **variance decomposition splits exactly by month**, and a driver with one
   gulf-wide value per month has no within-month regional variance — the property
   the whole ``temporal_only`` label rests on;
-* **the likelihood sees only the observation index**: changing the response at a
-  region-month outside it cannot change the model's log-probability, which is
-  what makes the placeholder zeros safe;
+* **the estimator sees only the observation index**: changing the response at a
+  region-month outside it cannot change a coefficient;
+* **lags are CALENDAR lags**: an excluded month breaks the chain rather than
+  letting a three-month-old value pass for "last month", and every candidate AR
+  order is fitted on identical rows so their AICc values are comparable;
+* **month-clustered standard errors**: a gulf-wide driver copied across regions
+  gets an interval reflecting the number of MONTHS, not region-months — the
+  claim §10 makes, enforced by the estimator rather than asserted in prose;
 * **region-macro skill weights every region equally**, so one large region
   cannot carry the score.
 """
@@ -920,188 +925,185 @@ def test_region_macro_skill_weights_regions_equally(ns):
     assert macro == pytest.approx(0.5)
 
 
+
 # ---------------------------------------------------------------------------
-# The model: what the likelihood can and cannot see
+# The estimator: what the regression can and cannot see
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
-def model_ns(ns):
-    pytest.importorskip("pymc")
-    import pymc as pm
-    import pytensor.tensor as pt
-
+def est(ns):
+    """The §12 estimator, executed straight out of the notebook."""
+    import statsmodels.api as sm
+    import time as _time
     space = dict(ns)
-    space.update({"pm": pm, "pt": pt, "HAVE_PYMC": True, "time": __import__("time"),
-                  "FAST_MODE": True,
-                  "RANDOM_SLOPE_PARAMETERISATION": "centred",
-                  "HIERARCHY_PARAMETERISATION": "centred",
-                  "SAMPLING": dict(draws=10, tune=10, chains=2, cores=1,
-                                   target_accept=0.9, random_seed=0),
-                  "PRIORS": {"mu_alpha_sd": 1.5, "sigma_alpha": 1.0,
-                             "beta_sd": 0.5, "sigma_b": 0.25, "season_sd": 0.5,
-                             "trend_sd": 0.25, "sigma_g": 0.5,
-                             "sigma_lambda": 0.3, "sigma_u": 0.4,
-                             "sigma_eps": 0.5, "rho_a": 2.0, "rho_b": 2.0}})
-    exec(compile(_defs(_cell("# 12. Model builder"),
-                       ["make_model_data", "build_regional_model"]),
-                 "<model>", "exec"), space)
+    space.update({"sm": sm, "time": _time, "AR_MAX_LAGS": 2, "AR_MAX_ITER": 25,
+                  "HDI_PROB": 0.95})
+    exec(compile(_defs(_cell("# 12. The estimator"),
+                       ["make_model_data", "calendar_acf", "calendar_ljung_box",
+                        "residual_frame_from_fit", "aicc_from", "gaussian_llf",
+                        "lag_row_index", "ar_estimation_rows", "panel_design",
+                        "estimate_ar_coeffs", "quasi_difference", "fit_panel_ar",
+                        "coef_frame"]), "<est>", "exec"), space)
     return space
 
 
-def _toy_model_data(model_ns, R=4, T=18, K=2, seed=0):
+def _sim_panel(est, R=6, T=60, betas=(0.40, -0.25), rho=0.0, seed=0,
+           month_effect=0.0, drop=()):
+    """A region x month panel with KNOWN driver slopes."""
     rng = np.random.default_rng(seed)
+    K = len(betas)
     X = rng.normal(size=(R, T, K))
-    Y = rng.normal(size=(R, T))
-    mask = rng.random((R, T)) > 0.3
-    Y = np.where(mask, Y, np.nan)
-    season = np.c_[np.sin(np.arange(T)), np.cos(np.arange(T))]
-    tt = (np.arange(T) - T / 2) / T
-    return model_ns["make_model_data"](
-        X, Y, mask, season, tt, [f"R{i:02d}" for i in range(R)],
-        [f"d{k}" for k in range(K)])
-
-
-@pytest.mark.parametrize("common_state", ["ar1", "randomwalk", "none"])
-def test_every_shared_state_structure_builds_and_has_a_finite_logp(model_ns,
-                                                                   common_state):
-    data = _toy_model_data(model_ns)
-    m = model_ns["build_regional_model"](data, drivers=True,
-                                         common_state=common_state,
-                                         regional_ar="common")
-    lp = float(m.compile_logp()(m.initial_point()))
-    assert np.isfinite(lp)
-
-
-@pytest.mark.parametrize("regional_ar", ["common", "per_region", "none"])
-def test_every_regional_ar_mode_builds(model_ns, regional_ar):
-    data = _toy_model_data(model_ns)
-    m = model_ns["build_regional_model"](data, drivers=True, common_state="ar1",
-                                         regional_ar=regional_ar)
-    assert np.isfinite(float(m.compile_logp()(m.initial_point())))
-
-
-def test_the_likelihood_sees_exactly_the_observation_index(model_ns):
-    data = _toy_model_data(model_ns)
-    m = model_ns["build_regional_model"](data, drivers=True, common_state="ar1",
-                                         regional_ar="common")
-    observed = m["y"].eval() if hasattr(m["y"], "eval") else None
-    assert len(data["y_obs"]) == int(data["obs_mask"].sum())
-    assert observed is None or len(observed) == len(data["y_obs"])
-
-
-def test_a_missing_region_month_cannot_change_the_log_probability(model_ns):
-    """The property that makes the placeholder zeros safe."""
-    data = _toy_model_data(model_ns)
-    m1 = model_ns["build_regional_model"](data, drivers=True, common_state="ar1",
-                                          regional_ar="common")
-    lp1 = float(m1.compile_logp()(m1.initial_point()))
-
-    # Vandalise the response AND the predictors wherever the mask is False.
-    Y2 = data["Y"].copy()
-    X2 = data["X"].copy()
-    off = ~data["obs_mask"]
-    Y2[off] = 1e6
-    X2[off] = 1e6
-    d2 = model_ns["make_model_data"](X2, Y2, data["obs_mask"], data["season"],
-                                     data["tt"], data["region_ids"],
-                                     data["driver_terms"])
-    m2 = model_ns["build_regional_model"](d2, drivers=True, common_state="ar1",
-                                          regional_ar="common")
-    lp2 = float(m2.compile_logp()(m2.initial_point()))
-    assert lp1 == pytest.approx(lp2), (
-        "a region-month outside the observation index changed the likelihood")
-
-
-def test_the_null_model_has_no_driver_coefficient(model_ns):
-    data = _toy_model_data(model_ns)
-    m = model_ns["build_regional_model"](data, drivers=False, common_state="ar1",
-                                         regional_ar="common")
-    assert "beta" not in {v.name for v in m.free_RVs + m.deterministics}
-
-
-def test_stationary_ar_parameters_are_bounded_in_the_unit_interval(model_ns):
-    import pymc as pm
-    data = _toy_model_data(model_ns)
-    m = model_ns["build_regional_model"](data, drivers=True, common_state="ar1",
-                                         regional_ar="common")
-    draws = pm.draw([m["rho_g"], m["rho_u"]], draws=200, random_seed=0)
-    for arr in draws:
-        arr = np.asarray(arr)
-        assert (arr > 0).all() and (arr < 1).all()
-
-
-@pytest.mark.parametrize("parameterisation", ["centred", "noncentred"])
-def test_both_random_slope_parameterisations_build(model_ns, parameterisation):
-    """The ladder switches between them, so both must be constructible."""
-    rng = np.random.default_rng(4)
-    R, T = 4, 18
-    data = model_ns["make_model_data"](
-        rng.normal(size=(R, T, 2)), rng.normal(size=(R, T)),
-        np.ones((R, T), bool),
-        np.c_[np.sin(np.arange(T)), np.cos(np.arange(T))], np.arange(T) / T,
-        [f"R{i:02d}" for i in range(R)], ["d0", "d1"],
-        random_slope_terms=["d0"])
-    m = model_ns["build_regional_model"](
-        data, drivers=True, common_state="ar1", regional_ar="common",
-        use_random_slopes=True,
-        random_slope_parameterisation=parameterisation)
-    names = {v.name for v in m.free_RVs + m.deterministics}
-    assert "b" in names and "sigma_b" in names
-    assert ("b_z" in names) == (parameterisation == "noncentred")
-    assert np.isfinite(float(m.compile_logp()(m.initial_point())))
-
-
-@pytest.mark.parametrize("parameterisation", ["centred", "noncentred"])
-def test_both_hierarchy_parameterisations_build(model_ns, parameterisation):
-    """alpha_r and lambda_r have two parameterisations; the ladder switches them."""
-    data = _toy_model_data(model_ns)
-    m = model_ns["build_regional_model"](
-        data, drivers=True, common_state="ar1", regional_ar="common",
-        hierarchy_parameterisation=parameterisation)
-    names = {v.name for v in m.free_RVs + m.deterministics}
-    assert "alpha" in names and "lam" in names
-    assert ("alpha_z" in names) == (parameterisation == "noncentred")
-    assert ("lam_z" in names) == (parameterisation == "noncentred")
-    assert np.isfinite(float(m.compile_logp()(m.initial_point())))
-
-
-def test_the_two_hierarchy_parameterisations_are_the_same_model(model_ns):
-    """Switching parameterisation is a geometry change, not a model change."""
-    import pymc as pm
-    data = _toy_model_data(model_ns, R=3, T=10, K=1, seed=7)
-    draws = {}
-    for how in ("centred", "noncentred"):
-        m = model_ns["build_regional_model"](
-            data, drivers=True, common_state="none", regional_ar="none",
-            include_trend=False, hierarchy_parameterisation=how)
-        with m:
-            pr = pm.sample_prior_predictive(draws=4000, random_seed=3)
-        draws[how] = pr.prior["alpha"].to_numpy().ravel()
-    a, b = draws["centred"], draws["noncentred"]
-    assert abs(a.mean() - b.mean()) < 0.15
-    assert abs(a.std() - b.std()) / max(b.std(), 1e-9) < 0.15
-
-
-def test_random_slopes_are_only_built_when_asked_for(model_ns):
-    rng = np.random.default_rng(3)
-    R, T, K = 4, 18, 2
-    X = rng.normal(size=(R, T, K))
-    Y = rng.normal(size=(R, T))
+    season = np.c_[np.sin(2 * np.pi * np.arange(T) / 12),
+                   np.cos(2 * np.pi * np.arange(T) / 12)]
+    alpha = np.linspace(-1.0, 1.0, R)
+    shared = rng.normal(scale=month_effect, size=T) if month_effect else np.zeros(T)
+    Y = np.zeros((R, T))
+    for r in range(R):
+        e = np.zeros(T)
+        v = rng.normal(scale=0.25, size=T)
+        for t in range(T):
+            e[t] = (rho * e[t - 1] if t else 0.0) + v[t]
+        Y[r] = alpha[r] + X[r] @ np.array(betas) + shared + e
     mask = np.ones((R, T), bool)
-    season = np.c_[np.sin(np.arange(T)), np.cos(np.arange(T))]
-    data = model_ns["make_model_data"](
-        X, Y, mask, season, np.arange(T) / T,
-        [f"R{i:02d}" for i in range(R)], ["d0", "d1"],
-        random_slope_terms=["d0"])
-    on = model_ns["build_regional_model"](data, drivers=True, common_state="ar1",
-                                          regional_ar="common",
-                                          use_random_slopes=True)
-    off = model_ns["build_regional_model"](data, drivers=True, common_state="ar1",
-                                           regional_ar="common",
-                                           use_random_slopes=False)
-    names_on = {v.name for v in on.free_RVs + on.deterministics}
-    names_off = {v.name for v in off.free_RVs + off.deterministics}
-    assert "b" in names_on and "sigma_b" in names_on
-    assert "b" not in names_off and "sigma_b" not in names_off
+    for t in drop:
+        mask[:, t] = False
+    return est["make_model_data"](X, Y, mask, season, np.arange(T) / T,
+                                  [f"R{i:02d}" for i in range(R)],
+                                  [f"d{k}" for k in range(K)])
+
+
+def test_the_estimator_recovers_known_driver_slopes(est):
+    data = _sim_panel(est, betas=(0.40, -0.25))
+    rows, lagx = est["ar_estimation_rows"](data["obs_r"], data["obs_t"], 2)
+    fit = est["fit_panel_ar"](data, p=0, rows=rows, lag_index=lagx)
+    assert float(fit["params"]["d0"]) == pytest.approx(0.40, abs=0.05)
+    assert float(fit["params"]["d1"]) == pytest.approx(-0.25, abs=0.05)
+
+
+def test_region_intercepts_are_recovered_without_a_global_constant(est):
+    """Each dummy's coefficient IS that region's intercept, with no baseline."""
+    data = _sim_panel(est, R=5, betas=(0.3,))
+    rows, lagx = est["ar_estimation_rows"](data["obs_r"], data["obs_t"], 2)
+    fit = est["fit_panel_ar"](data, p=0, rows=rows, lag_index=lagx)
+    got = [float(fit["params"][f"alpha[R{i:02d}]"]) for i in range(5)]
+    assert got == pytest.approx(list(np.linspace(-1.0, 1.0, 5)), abs=0.08)
+    assert "const" not in fit["names"] and "Intercept" not in fit["names"]
+
+
+def test_the_ar_order_is_recovered_by_aicc(est):
+    """AR(1) errors must beat independent errors on AICc.
+
+    Generated with no driver signal, because §13 selects the order on the
+    NO-DRIVER model: what has to be recoverable is the persistence of the error
+    process itself.
+    """
+    data = _sim_panel(est, betas=(0.0, 0.0), rho=0.7, seed=5)
+    rows, lagx = est["ar_estimation_rows"](data["obs_r"], data["obs_t"], 2)
+    aicc = {p: est["fit_panel_ar"](data, p=p, drivers=False, rows=rows,
+                                   lag_index=lagx)["aicc"]
+            for p in (0, 1, 2)}
+    assert min(aicc, key=aicc.get) in (1, 2), aicc
+    assert aicc[1] < aicc[0], aicc
+    fit1 = est["fit_panel_ar"](data, p=1, drivers=False, rows=rows, lag_index=lagx)
+    assert float(fit1["rho"][0]) == pytest.approx(0.7, abs=0.12)
+
+
+def test_every_ar_candidate_is_fitted_on_identical_rows(est):
+    """AICc across orders is only comparable on a matched sample."""
+    data = _sim_panel(est, drop=(10, 11, 30))
+    rows, lagx = est["ar_estimation_rows"](data["obs_r"], data["obs_t"], 2)
+    ns_obs = {p: est["fit_panel_ar"](data, p=p, drivers=False, rows=rows,
+                                     lag_index=lagx)["n_obs"] for p in (0, 1, 2)}
+    assert len(set(ns_obs.values())) == 1, ns_obs
+
+
+def test_the_lag_is_a_calendar_lag_not_the_previous_observed_row(est):
+    """A month with no map breaks the chain instead of shortening it."""
+    data = _sim_panel(est, T=24, drop=(12,))
+    idx = est["lag_row_index"](data["obs_r"], data["obs_t"], 1)
+    pos = {(int(r), int(t)): i for i, (r, t)
+           in enumerate(zip(data["obs_r"], data["obs_t"]))}
+    for i, (r, t) in enumerate(zip(data["obs_r"], data["obs_t"])):
+        if int(t) == 13:                       # month 12 was excluded
+            assert idx[i] == -1
+        elif (int(r), int(t) - 1) in pos:
+            assert data["obs_t"][idx[i]] == int(t) - 1
+            assert data["obs_r"][idx[i]] == int(r)
+
+
+def test_the_null_and_full_models_use_identical_rows(est):
+    data = _sim_panel(est, drop=(5, 20))
+    rows, lagx = est["ar_estimation_rows"](data["obs_r"], data["obs_t"], 2)
+    a = est["fit_panel_ar"](data, p=1, drivers=False, rows=rows, lag_index=lagx)
+    b = est["fit_panel_ar"](data, p=1, drivers=True, rows=rows, lag_index=lagx)
+    assert a["n_obs"] == b["n_obs"]
+    assert np.array_equal(a["rows"], b["rows"])
+    assert not any(n.startswith("d") for n in a["names"])
+    assert any(n.startswith("d") for n in b["names"])
+
+
+def test_month_clustering_widens_the_interval_on_a_gulf_wide_driver(est):
+    """The whole point of §10, made operational.
+
+    A driver with ONE gulf-wide value per month is copied across regions. Those
+    copies are rows, not information. Treating them as independent shrinks the
+    standard error by roughly sqrt(R); clustering on calendar month is what
+    stops the regional design being credited with replication it does not have.
+    """
+    rng = np.random.default_rng(11)
+    R, T = 8, 60
+    gulf_wide = rng.normal(size=T)               # one value per month
+    X = np.repeat(gulf_wide[None, :, None], R, axis=0)   # copied to every region
+    season = np.c_[np.sin(2 * np.pi * np.arange(T) / 12),
+                   np.cos(2 * np.pi * np.arange(T) / 12)]
+    shared = rng.normal(scale=0.8, size=T)       # regions move together
+    Y = (np.linspace(-1, 1, R)[:, None] + 0.4 * X[:, :, 0] + shared[None, :]
+         + rng.normal(scale=0.25, size=(R, T)))
+    data = est["make_model_data"](X, Y, np.ones((R, T), bool), season,
+                                  np.arange(T) / T,
+                                  [f"R{i:02d}" for i in range(R)], ["d0"])
+    rows, lagx = est["ar_estimation_rows"](data["obs_r"], data["obs_t"], 2)
+    clustered = est["fit_panel_ar"](data, p=0, rows=rows, lag_index=lagx,
+                                    cluster_on="month")
+    naive = est["fit_panel_ar"](data, p=0, rows=rows, lag_index=lagx,
+                                cluster_on=None)
+    assert clustered["n_clusters"] < clustered["n_obs"]
+    # the naive interval is far too narrow: it counted R copies as R observations
+    assert float(clustered["se"]["d0"]) > 2.0 * float(naive["se"]["d0"])
+
+
+def test_the_estimation_sample_reports_the_rows_the_lags_cost(est):
+    data = _sim_panel(est, T=40, drop=(5, 6, 20))
+    rows, _ = est["ar_estimation_rows"](data["obs_r"], data["obs_t"], 2)
+    assert int(rows.sum()) < len(data["y_obs"])
+    # every retained row has both calendar lags present
+    lag1 = est["lag_row_index"](data["obs_r"], data["obs_t"], 1)
+    lag2 = est["lag_row_index"](data["obs_r"], data["obs_t"], 2)
+    assert (lag1[rows] >= 0).all() and (lag2[rows] >= 0).all()
+
+
+def test_calendar_ljung_box_drops_lags_with_no_calendar_pairs(est):
+    """Degrees of freedom must count only the lags that had pairs to measure."""
+    v = np.array([1.0, -1.0, 0.5, -0.5, 1.2])
+    months = np.array([0, 1, 2, 40, 41])       # lag 3+ has no pairs at all
+    out = est["calendar_ljung_box"](v, months, lags=6)
+    assert out["df"] <= 3, out
+    assert np.isfinite(out["p_value"])
+
+
+def test_a_missing_region_month_cannot_change_the_estimate(est):
+    """Values outside the observation index must not reach the fit."""
+    data = _sim_panel(est, drop=(7,))
+    rows, lagx = est["ar_estimation_rows"](data["obs_r"], data["obs_t"], 2)
+    a = est["fit_panel_ar"](data, p=1, rows=rows, lag_index=lagx)
+    Y2 = data["Y"].copy()
+    Y2[:, 7] = 999.0                            # an excluded month
+    d2 = est["make_model_data"](data["X"], Y2, data["obs_mask"], data["season"],
+                                data["tt"], data["region_ids"],
+                                data["driver_terms"])
+    r2, l2 = est["ar_estimation_rows"](d2["obs_r"], d2["obs_t"], 2)
+    b = est["fit_panel_ar"](d2, p=1, rows=r2, lag_index=l2)
+    assert float(a["params"]["d0"]) == pytest.approx(float(b["params"]["d0"]))
+
 
 
 # ---------------------------------------------------------------------------
