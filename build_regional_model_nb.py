@@ -360,6 +360,32 @@ OPENNESS_FALLBACK_QUANTILE = 0.50     # median openness among littoral cells
 # When a threshold is None and no quantile rule is given the class collapses into
 # its parent class, and §8 says so rather than inventing a number.
 
+# A configured threshold is only worth anything if it actually PARTITIONS THIS
+# AOI. A cut inherited from another context can sit entirely outside the local
+# distribution and then silently classifies everything one way. That is not
+# hypothetical here: Winam Gulf is small enough that every eligible cell lies
+# within ~3.8 km of a HydroSHEDS RIV_ORD <= 7 river, so the 5000 m river cut
+# above puts 100% of cells in `river_influenced_bay`, no cell ever reaches the
+# shore/openness rules, and the regionalisation collapses to ONE region.
+#
+# §7c therefore measures, for every configured cut, the share of eligible cells
+# the class rule would place inside it. A cut whose share falls outside the band
+# below does not partition the AOI and is replaced by the PRE-DECLARED
+# response-blind quantile of that covariate's own distribution, exactly as
+# `openness` has always been resolved. Both the check and the replacement read
+# static geography only — never WH cover, prevalence, residuals or model skill.
+#
+# The quantiles are declared HERE, before any threshold is resolved, so they can
+# never be tuned to a result. §19 varies them as predeclared sensitivity
+# variants.
+THRESHOLD_DISCRIMINATION_BAND = (0.05, 0.95)
+THRESHOLD_FALLBACK_QUANTILES = {
+    "river_dist_m": 0.25,   # the quarter of the gulf nearest a major river mouth
+    "shore_dist_m": 0.50,   # the littoral half
+    "openness": OPENNESS_FALLBACK_QUANTILE,
+    "depth_m": None,        # stays unset; the class collapses into its parent
+}
+
 # Column preferences. The first present column is used; the choice is printed.
 REGION_COVARIATE_PREFERENCE = {
     "river_dist_m": ["dist_majriver_m", "dist_river_m"],
@@ -384,6 +410,18 @@ MIN_REGION_MEDIAN_COVERAGE = 0.70     # median cell-coverage fraction across mon
 # estimation (a small number of groups makes between-region variances weakly
 # identified).
 REGION_COUNT_TARGET = (6, 12)
+
+# ...and a HARD floor, which is not a preference. ONE REGION IS NOT A REGIONAL
+# DESIGN. With R = 1 the between-region variances have no groups to be estimated
+# from, the shared latent state g_t becomes one free value per observation (a
+# saturated model whose p_loo exceeds its own n), and §10's between-region
+# variance shares are 0 by ARITHMETIC rather than by measurement — which then
+# reads as "no driver varies regionally" when nothing was actually tested.
+# §8a stops the run rather than emitting tables that look like results.
+REGION_COUNT_HARD_MIN = 2
+# Escape hatch for deliberate inspection of a collapsed regionalisation. Leave
+# False for any run whose numbers might be quoted.
+ALLOW_DEGENERATE_REGIONALISATION = False
 
 # =====================================================================
 # 3d. Region-month panel gates
@@ -599,16 +637,22 @@ LORO_MAX_REGIONS_FINAL = None
 # A SMALL, PREDECLARED set of response-blind variants. This is not a search: the
 # variants are fixed here, all of them are reported, and none of them may be
 # promoted to the headline because it produced a stronger driver result.
+# Stated as QUANTILES of this AOI's own covariate distributions, not as absolute
+# metres. An absolute cut inherited from elsewhere may sit entirely outside the
+# local distribution (see THRESHOLD_DISCRIMINATION_BAND above), in which case
+# every "variant" built from it collapses to the same regionalisation and the
+# sensitivity analysis silently tests nothing. Quantile variants always move the
+# partition, and they stay response-blind.
 REGIONALISATION_VARIANTS = {
-    "river_3km":      {"river_dist_m": 3000.0},
-    "river_8km":      {"river_dist_m": 8000.0},
-    "littoral_1km":   {"shore_dist_m": 1000.0},
-    "littoral_3km":   {"shore_dist_m": 3000.0},
+    "river_q15":      {"_river_quantile": 0.15},
+    "river_q35":      {"_river_quantile": 0.35},
+    "littoral_q35":   {"_shore_quantile": 0.35},
+    "littoral_q65":   {"_shore_quantile": 0.65},
     "openness_q35":   {"_openness_quantile": 0.35},
     "openness_q65":   {"_openness_quantile": 0.65},
     "min_cells_80":   {"_min_region_cells": 80},
 }
-SENSITIVITY_VARIANTS_FAST = ["river_3km", "openness_q65"]
+SENSITIVITY_VARIANTS_FAST = ["river_q15", "openness_q65"]
 
 RANDOM_STATE = 20260810
 
@@ -2008,6 +2052,29 @@ length scales already exist in it and are reused rather than reinvented; the
 third has no precedent and is therefore stated as an **operational definition**
 resolved from a response-blind quantile of the covariate itself. None of them is
 tuned against WH cover, and §19 re-runs the whole analysis under alternatives.
+
+### A threshold inherited from elsewhere still has to fit *this* AOI
+
+Reuse is not enough on its own. A length scale that is meaningful in the context
+it came from can sit entirely outside the local distribution, and it then
+partitions nothing while looking perfectly principled.
+
+That is not hypothetical here. Winam Gulf is small and river-fed on every side:
+**no eligible cell is more than ~3.8 km from a HydroSHEDS `RIV_ORD <= 7`
+river**, so the inherited 5 km river cut classifies *every* cell as
+`river_influenced_bay`. Because river influence outranks shelter in the fixed
+class precedence, no cell ever reaches the shoreline or openness rules, the gulf
+becomes **one region**, and the whole hierarchical design silently degenerates
+into the gulf-wide series it was built to improve on.
+
+§7c therefore measures, for every configured cut, the **share of eligible cells
+its class rule would capture**. A cut outside `THRESHOLD_DISCRIMINATION_BAND`
+does not partition this AOI and is replaced by the **pre-declared** response-blind
+quantile in `THRESHOLD_FALLBACK_QUANTILES` (§3c) — declared before any threshold
+is resolved, so it can never be tuned to a result. Both the original value and
+the replacement are printed and exported. §8a stops the run outright if the
+regionalisation still collapses, rather than emitting tables that look like
+results.
 """)
 
 code(r'''# =====================================================================
@@ -2142,52 +2209,146 @@ code(r'''# =====================================================================
 # =====================================================================
 
 
+def threshold_capture_share(values, role, thr):
+    """Share of eligible cells a candidate cut would place INSIDE its class.
+
+    The comparison mirrors `assign_ecological_class` exactly — `<=` for the
+    distance and depth rules, `<` for openness — so this is the share the class
+    rule will actually produce, not an approximation of it. Response-blind by
+    construction: one static covariate and one number.
+    """
+    x = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+    x = x[np.isfinite(x)]
+    if not len(x) or thr is None or not np.isfinite(float(thr)):
+        return np.nan
+    inside = x < float(thr) if role == "openness" else x <= float(thr)
+    return float(np.mean(inside))
+
+
 def resolve_thresholds(cells, covariates, configured, openness_quantile,
-                       verbose=True):
-    """Fill in any unset threshold response-blind, and record its provenance."""
+                       fallback_quantiles=None, band=None, verbose=True):
+    """Fill in any unset threshold response-blind, and record its provenance.
+
+    Also CHECKS every configured threshold against this AOI's own covariate
+    distribution. A cut that places nearly all or nearly none of the eligible
+    cells inside its class does not partition the AOI: it silently collapses the
+    class hierarchy. Such a cut is replaced by the pre-declared response-blind
+    quantile for that role and the substitution is recorded, so the write-up can
+    state exactly which cut was inherited, which was replaced, and why.
+    """
+    fallback_quantiles = dict(fallback_quantiles or {})
+    # The explicit positional argument is authoritative for openness, so §19 can
+    # vary it without having to rebuild the whole fallback table.
+    if openness_quantile is not None:
+        fallback_quantiles["openness"] = openness_quantile
+    lo_share, hi_share = band or (0.0, 1.0)
     resolved = dict(configured)
     rows = []
-    for role in ["river_dist_m", "shore_dist_m", "openness", "depth_m"]:
-        col = covariates.get(role)
-        val = resolved.get(role)
-        if col is None:
-            resolved[role] = None
-            rows.append({"threshold": role, "value": None, "kind": "unavailable",
-                         "basis": "no covariate column in the panel",
-                         "response_blind": True})
-            continue
-        if val is not None:
-            rows.append({"threshold": role, "value": float(val),
-                         "kind": "configured (repository precedent)",
-                         "basis": "see §7b REPO_THRESHOLD_SEARCH",
-                         "response_blind": True})
-            continue
+
+    used_cols = [c for c in covariates.values() if c]
+    assert_response_blind(used_cols, "resolve_thresholds")
+
+    def _row(role, value, kind, basis, **extra):
+        r = {"threshold": role,
+             "value": None if value is None else float(value),
+             "kind": kind, "basis": basis, "response_blind": True,
+             "configured_value": None, "captured_share": np.nan,
+             "fallback_quantile": np.nan, "discriminates": True}
+        r.update(extra)
+        rows.append(r)
+
+    def _quantile_for(role, col, q):
+        """The response-blind quantile for a role, plus the scope it was taken over."""
+        base, scope = cells, "all eligible cells"
         if role == "openness":
             sho_col = covariates.get("shore_dist_m")
             t_sho = resolved.get("shore_dist_m")
-            base = cells
-            scope = "all eligible cells"
             if sho_col and t_sho is not None:
                 m = pd.to_numeric(cells[sho_col], errors="coerce") <= float(t_sho)
                 if int(m.sum()) >= 20:
-                    base = cells[m]
-                    scope = f"littoral cells ({sho_col} <= {float(t_sho):.0f} m)"
-            q = float(pd.to_numeric(base[col], errors="coerce")
-                      .quantile(float(openness_quantile)))
-            resolved[role] = q
-            rows.append({"threshold": role, "value": q,
-                         "kind": "OPERATIONAL DEFINITION (response-blind quantile)",
-                         "basis": f"quantile {openness_quantile:g} of {col} over "
-                                  f"{scope}; no repository precedent exists",
-                         "response_blind": True})
+                    base, scope = cells[m], (f"littoral cells ({sho_col} <= "
+                                             f"{float(t_sho):.0f} m)")
+        return float(pd.to_numeric(base[col], errors="coerce")
+                     .quantile(float(q))), scope
+
+    for role in ["river_dist_m", "shore_dist_m", "openness", "depth_m"]:
+        col = covariates.get(role)
+        val = resolved.get(role)
+        q = fallback_quantiles.get(role)
+
+        if col is None:
+            resolved[role] = None
+            _row(role, None, "unavailable", "no covariate column in the panel")
+            continue
+
+        if val is not None:
+            share = threshold_capture_share(cells[col], role, val)
+            if not np.isfinite(share) or lo_share <= share <= hi_share:
+                _row(role, val, "configured (repository precedent)",
+                     f"see §7b REPO_THRESHOLD_SEARCH; this cut places "
+                     f"{share:.1%} of eligible cells inside the class, inside "
+                     f"the {lo_share:.0%}-{hi_share:.0%} discrimination band",
+                     captured_share=share)
+                continue
+            # The cut does not partition THIS AOI.
+            if q is None:
+                _row(role, val, "configured but NON-DISCRIMINATING",
+                     f"this cut places {share:.1%} of eligible cells inside the "
+                     f"class, outside the {lo_share:.0%}-{hi_share:.0%} band, and "
+                     "no fallback quantile is declared for this role; the class "
+                     "hierarchy below it cannot fire",
+                     captured_share=share, discriminates=False)
+                continue
+            newv, scope = _quantile_for(role, col, q)
+            new_share = threshold_capture_share(cells[col], role, newv)
+            resolved[role] = newv
+            _row(role, newv,
+                 "REPLACED (configured cut does not partition this AOI)",
+                 f"configured {float(val):.4g} placed {share:.1%} of eligible "
+                 f"cells inside the class, outside the {lo_share:.0%}-"
+                 f"{hi_share:.0%} band, so the class hierarchy below it could "
+                 f"never fire; replaced by the PRE-DECLARED response-blind "
+                 f"quantile {float(q):g} of {col} over {scope} "
+                 f"(= {newv:.4g}, {new_share:.1%} inside)",
+                 configured_value=float(val), captured_share=new_share,
+                 fallback_quantile=float(q), discriminates=True)
+            continue
+
+        if q is not None:
+            newv, scope = _quantile_for(role, col, q)
+            resolved[role] = newv
+            _row(role, newv,
+                 "OPERATIONAL DEFINITION (response-blind quantile)",
+                 f"quantile {float(q):g} of {col} over {scope}; no repository "
+                 f"precedent exists",
+                 captured_share=threshold_capture_share(cells[col], role, newv),
+                 fallback_quantile=float(q))
         else:
-            rows.append({"threshold": role, "value": None, "kind": "not applied",
-                         "basis": "left unset; the class collapses into its parent "
-                                  "rather than being invented",
-                         "response_blind": True})
+            _row(role, None, "not applied",
+                 "left unset; the class collapses into its parent rather than "
+                 "being invented")
+
     table = pd.DataFrame(rows)
     if verbose:
         display(table)
+        rep = table[table["kind"].str.startswith("REPLACED")]
+        if len(rep):
+            print("*** THRESHOLD REPLACED — a configured cut did not partition "
+                  "this AOI: ***")
+            for r in rep.itertuples():
+                print(f"  {r.threshold}: {r.configured_value:.4g} -> {r.value:.4g} "
+                      f"(now {r.captured_share:.1%} of cells inside the class)")
+                print(f"    {r.basis}")
+            print("  The replacement is a PRE-DECLARED quantile "
+                  "(THRESHOLD_FALLBACK_QUANTILES in §3c), fixed before any "
+                  "threshold was resolved and never chosen by looking at a "
+                  "result. §19 varies it as a sensitivity check.")
+        nd = table[~table["discriminates"].astype(bool)]
+        if len(nd):
+            print("*** NON-DISCRIMINATING THRESHOLD LEFT IN PLACE: "
+                  f"{nd['threshold'].tolist()} — the classes below it cannot "
+                  "fire, and §8a will stop the run if the regionalisation "
+                  "collapses. ***")
         op = table[table["kind"].str.startswith("OPERATIONAL")]
         if len(op):
             print("OPERATIONAL DEFINITIONS in force (no repository precedent; "
@@ -2198,7 +2359,9 @@ def resolve_thresholds(cells, covariates, configured, openness_quantile,
 
 
 THRESHOLDS, THRESHOLD_PROVENANCE = resolve_thresholds(
-    CELL_STATIC, REGION_COVARIATES, REGION_THRESHOLDS, OPENNESS_FALLBACK_QUANTILE)
+    CELL_STATIC, REGION_COVARIATES, REGION_THRESHOLDS, OPENNESS_FALLBACK_QUANTILE,
+    fallback_quantiles=THRESHOLD_FALLBACK_QUANTILES,
+    band=THRESHOLD_DISCRIMINATION_BAND)
 register("threshold_provenance", THRESHOLD_PROVENANCE, "provenance")
 print()
 print("None of these thresholds was chosen by looking at WH cover, WH prevalence, "
@@ -2243,6 +2406,51 @@ if len(MERGE_LOG):
     display(MERGE_LOG)
 else:
     print("\nNo component needed merging.")
+
+CLASS_SHARES = (ASSIGNMENTS.groupby("region_type")
+                .agg(n_cells=("grid_id", "size"),
+                     eligible_area_ha=("eligible_area_ha", "sum"))
+                .reset_index())
+CLASS_SHARES["cell_share"] = CLASS_SHARES["n_cells"] / max(len(ASSIGNMENTS), 1)
+CLASS_SHARES["area_share"] = (CLASS_SHARES["eligible_area_ha"]
+                              / max(CLASS_SHARES["eligible_area_ha"].sum(), 1e-9))
+CLASS_SHARES = CLASS_SHARES.sort_values("cell_share", ascending=False)
+print("\nShare of the eligible cell set held by each ecological class "
+      "(a class holding ~everything means its rule did not partition the AOI):")
+display(CLASS_SHARES)
+register("region_class_shares", CLASS_SHARES, "regionalisation")
+
+if len(REGIONS) < REGION_COUNT_HARD_MIN:
+    _dom = CLASS_SHARES.iloc[0]
+    _msg = (
+        f"REGIONALISATION COLLAPSED: {len(REGIONS)} region(s), below "
+        f"REGION_COUNT_HARD_MIN={REGION_COUNT_HARD_MIN}.\n"
+        f"  '{_dom['region_type']}' holds {_dom['cell_share']:.1%} of eligible "
+        f"cells and {_dom['area_share']:.1%} of eligible area.\n"
+        "  A single region is not a regional design. With R = 1:\n"
+        "    - the between-region variances (sigma_alpha, sigma_b, sigma_lambda) "
+        "have no groups to be estimated from and are pure prior;\n"
+        "    - the shared latent state g_t becomes one free value per "
+        "observation, so the model is saturated and its p_loo exceeds its own "
+        "n, which invalidates every LOO comparison;\n"
+        "    - §10's between-region variance shares are 0 by ARITHMETIC, not by "
+        "measurement, and would read as 'no driver varies regionally' when "
+        "nothing was tested.\n"
+        "  WHAT TO CHANGE: look at the §7c threshold provenance table above. It "
+        "prints, for every configured cut, the share of cells its class rule "
+        "captures. The cut that captured the AOI is the one to change — either "
+        "adjust REGION_THRESHOLDS, or set it to None so the pre-declared "
+        "THRESHOLD_FALLBACK_QUANTILES value resolves it from this AOI's own "
+        "distribution.\n"
+        "  This stop is deliberate: continuing produces tables that look like "
+        "results and are not. Set ALLOW_DEGENERATE_REGIONALISATION = True in §3c "
+        "only to inspect a collapsed run.")
+    if ALLOW_DEGENERATE_REGIONALISATION:
+        print(f"\n*** {_msg}\n*** PROCEEDING ANYWAY because "
+              "ALLOW_DEGENERATE_REGIONALISATION = True. Nothing below this point "
+              "is reportable. ***")
+    else:
+        raise RuntimeError(_msg)
 
 _lo, _hi = REGION_COUNT_TARGET
 if len(REGIONS) < _lo:
@@ -2742,6 +2950,14 @@ if N_REGIONS < REGION_COUNT_TARGET[0]:
           "be read as measurements of between-region heterogeneity. §12 "
           "simplifies the random-effects structure accordingly and §22 says so "
           "in the synthesis. ***")
+if N_REGIONS < 4:
+    print(f"*** With {N_REGIONS} region(s) there are at most {N_REGIONS} "
+          "observations per calendar month, while the shared latent state g_t "
+          "has ONE free value per month. The state is therefore weakly "
+          "identified against the observations it is meant to summarise, the "
+          "sampler will show it as divergences and low ESS in §15, and PSIS-LOO "
+          "will report p_loo close to (or above) the likelihood row count. §16b "
+          "checks for exactly that and says so. ***")
 ''')
 
 code(r'''# =====================================================================
@@ -3072,16 +3288,26 @@ DRIVER_VARIANCE["most_correlated_driver"] = [
     for c in DRIVER_VARIANCE["driver"]]
 
 DRIVER_VARIANCE["is_proxy"] = DRIVER_VARIANCE["driver"].isin(PROXY_COLS)
+# A driver can only be called `temporal_only` if there were at least two regions
+# for it to fail to vary between. With one region the within-month between-region
+# share is 0 by arithmetic, and labelling that "temporal_only" would report an
+# untested claim as a measured one.
 DRIVER_VARIANCE["spatial_label"] = np.where(
-    (DRIVER_VARIANCE["share_within_month_between_regions"] >= DRIVER_REGIONAL_SHARE_MIN)
-    & (DRIVER_VARIANCE["median_within_month_cv"] >= DRIVER_REGIONAL_CV_MIN),
-    "spatiotemporal", "temporal_only")
+    DRIVER_VARIANCE["n_regions"] < 2, "undetermined",
+    np.where(
+        (DRIVER_VARIANCE["share_within_month_between_regions"]
+         >= DRIVER_REGIONAL_SHARE_MIN)
+        & (DRIVER_VARIANCE["median_within_month_cv"] >= DRIVER_REGIONAL_CV_MIN),
+        "spatiotemporal", "temporal_only"))
 DRIVER_VARIANCE["season_confounded"] = (
     DRIVER_VARIANCE["r2_annual_harmonics"] >= SEASON_CONFOUND_R2)
-DRIVER_VARIANCE["effective_replication"] = np.where(
-    DRIVER_VARIANCE["spatial_label"] == "spatiotemporal",
-    "region-months (the regional design adds information)",
-    "MONTHS ONLY — one gulf-wide value per month copied across regions")
+DRIVER_VARIANCE["effective_replication"] = np.select(
+    [DRIVER_VARIANCE["spatial_label"] == "spatiotemporal",
+     DRIVER_VARIANCE["spatial_label"] == "temporal_only"],
+    ["region-months (the regional design adds information)",
+     "MONTHS ONLY — one gulf-wide value per month copied across regions"],
+    default="UNDETERMINED — fewer than 2 regions, so between-region variance is "
+            "not defined and nothing about regional variation was tested")
 
 display(DRIVER_VARIANCE[[
     "driver", "spatial_label", "share_between_months",
@@ -3097,6 +3323,9 @@ TEMPORAL_ONLY_DRIVERS = DRIVER_VARIANCE.loc[
 SPATIOTEMPORAL_DRIVERS = DRIVER_VARIANCE.loc[
     (DRIVER_VARIANCE["spatial_label"] == "spatiotemporal")
     & (~DRIVER_VARIANCE["is_proxy"]), "driver"].tolist()
+UNDETERMINED_DRIVERS = DRIVER_VARIANCE.loc[
+    (DRIVER_VARIANCE["spatial_label"] == "undetermined")
+    & (~DRIVER_VARIANCE["is_proxy"]), "driver"].tolist()
 
 print()
 print(f"SPATIOTEMPORAL ({len(SPATIOTEMPORAL_DRIVERS)}): {SPATIOTEMPORAL_DRIVERS}")
@@ -3107,6 +3336,13 @@ print("    One gulf-wide value per month, repeated across regions. The regional 
       "design does NOT increase their effective replication:")
 print(f"    n for these drivers is the {int(_obs_rm['month'].nunique())} observed "
       f"MONTHS, not the {len(_obs_rm):,} region-months.")
+if UNDETERMINED_DRIVERS:
+    print(f"UNDETERMINED ({len(UNDETERMINED_DRIVERS)}): {UNDETERMINED_DRIVERS}")
+    print("    Fewer than 2 regions entered the decomposition, so the "
+          "within-month between-region share is 0 by ARITHMETIC and not by "
+          "measurement. Nothing about regional variation was tested for these "
+          "drivers, and this run must not be written up as evidence that they "
+          "lack it.")
 _sc = DRIVER_VARIANCE.loc[DRIVER_VARIANCE["season_confounded"], "driver"].tolist()
 if _sc:
     print(f"\nSeason-confounded (R2 of the annual harmonics >= "
@@ -3150,9 +3386,13 @@ for _cand in RANDOM_SLOPE_CANDIDATES:
         continue
     if _col not in SPATIOTEMPORAL_DRIVERS:
         _rs_rows.append({"candidate": _cand, "eligible": False,
-                         "reason": "labelled temporal_only in §10b — a random "
-                                   "slope on a driver with no regional variation "
-                                   "is not identified"})
+                         "reason": ("regional variation UNDETERMINED in §10b "
+                                    "(fewer than 2 regions) — a random slope has "
+                                    "nothing to vary over"
+                                    if _col in UNDETERMINED_DRIVERS else
+                                    "labelled temporal_only in §10b — a random "
+                                    "slope on a driver with no regional variation "
+                                    "is not identified")})
         continue
     if N_REGIONS < RANDOM_SLOPE_MIN_REGIONS:
         _rs_rows.append({"candidate": _cand, "eligible": False,
@@ -3232,7 +3472,10 @@ for k, (base, meta) in enumerate(FORCING.items()):
     DRIVER_META.append({"term": name, "mechanism_key": base, "column": col,
                         "lag_months": lag, "mechanism": meta["mechanism"],
                         "expected_sign": meta["expected_sign"],
-                        "spatial_label": ("spatiotemporal" if col in SPATIOTEMPORAL_DRIVERS
+                        "spatial_label": ("spatiotemporal"
+                                          if col in SPATIOTEMPORAL_DRIVERS
+                                          else "undetermined"
+                                          if col in UNDETERMINED_DRIVERS
                                           else "temporal_only")})
     for rid, i in R_IDX.items():
         s = (REGION_MONTH[REGION_MONTH["region_id"] == rid]
@@ -4729,6 +4972,21 @@ if HAVE_PYMC and len(GLOBAL_DRIVERS):
         print("This is a CONDITIONAL-FIT comparison with the latent states in "
               "place. Whether the drivers improve genuine one-month-ahead "
               "prediction is §17, and that is the question that matters.")
+        # A latent-state model can carry more effective parameters than it has
+        # observations. When it does, PSIS-LOO is not estimating out-of-sample
+        # fit for either model and the comparison above must not be used at all.
+        _n_lik = int(len(MODEL_DATA["y_obs"]))
+        if "p_loo" in NULL_VS_FULL.columns:
+            _sat = NULL_VS_FULL[NULL_VS_FULL["p_loo"] >= 0.7 * _n_lik]
+            if len(_sat):
+                print(f"\n*** LOO IS NOT USABLE HERE: p_loo reaches "
+                      f"{NULL_VS_FULL['p_loo'].max():.1f} effective parameters "
+                      f"against {_n_lik} likelihood rows "
+                      f"({', '.join(_sat['model'].tolist())}). The latent state "
+                      "has close to one free value per observation, so the model "
+                      "is near-saturated and PSIS-LOO is measuring which model "
+                      "overfits its own leave-one-out less, not which predicts "
+                      "better. Ignore the ranking above and use §17. ***")
     except Exception as exc:
         print(f"az.compare unavailable: {exc}")
     register("null_vs_full_comparison", NULL_VS_FULL, "model comparison")
@@ -5370,8 +5628,8 @@ else:
 # ===========================================================================
 md(r"""## 19. Regionalisation sensitivity
 
-A boundary drawn at 5 km rather than 3 km is a *choice*. If the conclusions turn
-on it, the reader has to know.
+Where a boundary is drawn is a *choice*. If the conclusions turn on it, the
+reader has to know.
 
 A **small, predeclared** set of response-blind variants (§3h) is re-run end to
 end — new thresholds, new components, new merges, new region-month panel, new
@@ -5379,6 +5637,17 @@ fit — and the global driver coefficients are compared with the headline. This 
 **not** a search: every variant is reported, and none may be promoted to the
 headline because it produced a stronger result. The headline is the
 configuration fixed in §3c before anything was fitted.
+
+The variants are stated as **quantiles of this AOI's own covariate
+distributions**, not as absolute metres. That is a direct consequence of §7c: an
+absolute cut can sit outside the local distribution, and when it does, every
+"variant" built from it collapses to the same regionalisation and the
+sensitivity analysis silently tests nothing while appearing to pass. A quantile
+variant always moves the partition, and it is just as response-blind.
+
+A variant that still fails to produce at least two usable regions is reported
+with **the number of regions it actually built** and the reason it was rejected,
+not flattened to a bare zero.
 """)
 
 code(r'''# =====================================================================
@@ -5389,15 +5658,21 @@ SENSITIVITY_BETAS = pd.DataFrame()
 
 
 def regional_dataset_from_thresholds(thresholds, min_cells, min_area_ha,
-                                     openness_quantile=None):
-    """Regions -> region-month panel -> model arrays, for one set of thresholds."""
+                                     quantile_overrides=None):
+    """Regions -> region-month panel -> model arrays, for one set of thresholds.
+
+    `quantile_overrides` maps a threshold role to a quantile of that covariate's
+    own distribution. Any role given a quantile is unset first so it is resolved
+    response-blind from the data, exactly as §7c resolves it in the headline run.
+    """
     th = dict(thresholds)
-    if openness_quantile is not None:
-        th["openness"] = None
+    q = dict(THRESHOLD_FALLBACK_QUANTILES)
+    for _role, _q in (quantile_overrides or {}).items():
+        q[_role] = _q
+        th[_role] = None
     th, _prov = resolve_thresholds(
-        CELL_STATIC, REGION_COVARIATES, th,
-        OPENNESS_FALLBACK_QUANTILE if openness_quantile is None
-        else openness_quantile, verbose=False)
+        CELL_STATIC, REGION_COVARIATES, th, q.get("openness"),
+        fallback_quantiles=q, band=THRESHOLD_DISCRIMINATION_BAND, verbose=False)
     assign, regions, mlog, _ = build_regions(
         CELL_STATIC, REGION_COVARIATES, th, cell_size_m=EXPECTED_CELL_SIZE_M,
         contiguity=REGION_CONTIGUITY, min_cells=min_cells,
@@ -5417,7 +5692,17 @@ def regional_dataset_from_thresholds(thresholds, min_cells, min_area_ha,
     keep = [r for r in sorted(keep)
             if regions.loc[regions["region_id"] == r, "n_cells"].iloc[0] >= min_cells]
     if len(keep) < 2:
-        return None
+        # Report what the variant actually produced. Collapsing every rejection
+        # to "0 regions" hides the difference between "this variant built one
+        # region" and "this variant built none".
+        return {"usable": False, "n_regions_built": int(len(regions)),
+                "n_regions_kept": int(len(keep)), "n_region_months": 0,
+                "thresholds": th,
+                "reason": (f"{len(regions)} region(s) built, {len(keep)} cleared "
+                           f"MIN_REGION_MONTHS={MIN_REGION_MONTHS} and "
+                           f"MIN_REGION_MEDIAN_COVERAGE="
+                           f"{MIN_REGION_MEDIAN_COVERAGE:g}; at least 2 are "
+                           "needed for a regional comparison")}
     rmap = {r: i for i, r in enumerate(keep)}
     Yv = np.full((len(keep), T), np.nan)
     Xv = np.full((len(keep), T, len(FORCING)), np.nan)
@@ -5429,7 +5714,12 @@ def regional_dataset_from_thresholds(thresholds, min_cells, min_area_ha,
             Xv[i, :, k] = g[meta["column"]].shift(int(meta["apriori_lag"])).to_numpy()
     mask = np.isfinite(Yv) & np.all(np.isfinite(Xv), axis=2)
     if mask.sum() < 30:
-        return None
+        return {"usable": False, "n_regions_built": int(len(regions)),
+                "n_regions_kept": int(len(keep)),
+                "n_region_months": int(mask.sum()), "thresholds": th,
+                "reason": (f"{len(keep)} usable region(s) but only "
+                           f"{int(mask.sum())} region-months with both a response "
+                           "and a complete driver row; 30 are required")}
     Xs = np.zeros_like(Xv)
     for k in range(Xv.shape[2]):
         v = Xv[:, :, k][mask]
@@ -5438,8 +5728,10 @@ def regional_dataset_from_thresholds(thresholds, min_cells, min_area_ha,
     Xs = np.where(np.isfinite(Xs), Xs, 0.0)
     data = make_model_data(Xs, Yv, mask, SEASON, TT, keep, DRIVER_TERMS,
                            random_slope_terms=[])
-    return {"assignments": assign, "regions": regions, "keep": keep,
-            "data": data, "thresholds": th, "merge_log": mlog}
+    return {"usable": True, "assignments": assign, "regions": regions,
+            "keep": keep, "data": data, "thresholds": th, "merge_log": mlog,
+            "n_regions_built": int(len(regions)), "n_regions_kept": int(len(keep)),
+            "n_region_months": int(mask.sum()), "reason": ""}
 
 
 if HAVE_PYMC and FIT_FULL is not None and SENSITIVITY_VARIANTS:
@@ -5449,32 +5741,46 @@ if HAVE_PYMC and FIT_FULL is not None and SENSITIVITY_VARIANTS:
     for _vname in SENSITIVITY_VARIANTS:
         _ov = dict(REGIONALISATION_VARIANTS[_vname])
         _minc = int(_ov.pop("_min_region_cells", MIN_REGION_CELLS))
-        _oq = _ov.pop("_openness_quantile", None)
+        _qov = {_role: _ov.pop(_key)
+                for _key, _role in [("_river_quantile", "river_dist_m"),
+                                    ("_shore_quantile", "shore_dist_m"),
+                                    ("_openness_quantile", "openness")]
+                if _key in _ov}
         _th = dict(REGION_THRESHOLDS)
-        _th.update(_ov)
+        _th.update(_ov)          # any remaining absolute-metre overrides
         print(f"--- variant {_vname}: {REGIONALISATION_VARIANTS[_vname]} ---")
         try:
             _ds = regional_dataset_from_thresholds(
-                _th, _minc, MIN_REGION_ELIGIBLE_AREA_HA, openness_quantile=_oq)
+                _th, _minc, MIN_REGION_ELIGIBLE_AREA_HA, quantile_overrides=_qov)
         except Exception as exc:
             print(f"    regionalisation failed: {exc}")
-            _rrows.append({"variant": _vname, "n_regions": 0,
+            _rrows.append({"variant": _vname,
+                           "overrides": json.dumps(REGIONALISATION_VARIANTS[_vname]),
+                           "n_regions": 0, "n_regions_built": 0,
+                           "usable": False,
                            "note": f"regionalisation failed: {exc}"})
             continue
-        if _ds is None:
-            print("    too few usable regions or region-months under this variant")
-            _rrows.append({"variant": _vname, "n_regions": 0,
-                           "note": "too few usable regions / region-months"})
+        if _ds is None or not _ds.get("usable"):
+            _why = (_ds or {}).get("reason", "no dataset returned")
+            print(f"    NOT USABLE: {_why}")
+            _rrows.append({
+                "variant": _vname,
+                "overrides": json.dumps(REGIONALISATION_VARIANTS[_vname]),
+                "n_regions": int((_ds or {}).get("n_regions_kept", 0)),
+                "n_regions_built": int((_ds or {}).get("n_regions_built", 0)),
+                "n_region_months": int((_ds or {}).get("n_region_months", 0)),
+                "usable": False, "note": _why})
             continue
         _rrows.append({
             "variant": _vname,
             "overrides": json.dumps(REGIONALISATION_VARIANTS[_vname]),
             "n_regions": len(_ds["keep"]),
+            "n_regions_built": int(_ds["n_regions_built"]),
             "n_region_months": int(_ds["data"]["obs_mask"].sum()),
             "region_types": ", ".join(sorted(
                 _ds["regions"].loc[_ds["regions"]["region_id"].isin(_ds["keep"]),
                                    "region_type"].unique())),
-            "note": ""})
+            "usable": True, "note": ""})
         try:
             _m = build_regional_model(
                 _ds["data"], drivers=True,
@@ -5970,7 +6276,14 @@ _n_obs_region_months = int(len(MODEL_DATA["y_obs"]))
 _answer(
     "1. Does dividing the gulf into regions reveal genuine spatiotemporal "
     "predictor variation?",
-    (f"Partly. Of {_n_st + _n_to} predeclared drivers, {_n_st} vary between "
+    ("NOT TESTABLE IN THIS RUN. Only "
+     f"{N_REGIONS} region(s) entered the decomposition, so the within-month "
+     "between-region variance share is 0 by ARITHMETIC and not by measurement: "
+     f"the {len(UNDETERMINED_DRIVERS)} predeclared driver(s) "
+     f"({UNDETERMINED_DRIVERS}) are labelled `undetermined`, and this run is "
+     "not evidence either way about regional driver variation."
+     if UNDETERMINED_DRIVERS else
+     f"Partly. Of {_n_st + _n_to} predeclared drivers, {_n_st} vary between "
      f"regions within the same month ({SPATIOTEMPORAL_DRIVERS}) and {_n_to} do "
      f"not ({TEMPORAL_ONLY_DRIVERS}). "
      + (f"For the spatiotemporal set the region x month interaction carries "
@@ -6017,10 +6330,33 @@ if len(VAL_RMSE_DIFF):
                 "no-driver hierarchical dynamic model?",
                 "Not evaluable: the full-vs-null comparison produced no usable "
                 "folds.", "§17")
+elif len(VAL_METRICS):
+    # Predictions EXIST but no interval could be formed — almost always because
+    # too few target calendar months were available to resample. Report the point
+    # estimates and say plainly that they carry no uncertainty, rather than
+    # claiming §17 produced nothing.
+    _cs = VAL_METRICS[VAL_METRICS["common_sample"]] if "common_sample" in VAL_METRICS \
+        else VAL_METRICS
+    _cs = (_cs if len(_cs) else VAL_METRICS).sort_values("rmse_logit_pooled")
+    _nm = int(VAL_PREDICTIONS["target_month"].nunique()) if len(VAL_PREDICTIONS) else 0
+    _rank = ", ".join(f"{r.model} {r.rmse_logit_pooled:.3f}"
+                      for r in _cs.itertuples())
+    _answer(
+        "3. Do environmental drivers improve prediction over the matched "
+        "no-driver hierarchical dynamic model?",
+        (f"POINT ESTIMATES ONLY, NO INTERVAL. One-month-ahead RMSE on the "
+         f"logit scale over {_nm} target calendar month(s), best first: {_rank}. "
+         "No uncertainty interval could be formed because the resampling unit is "
+         "the calendar MONTH and fewer than three were available, so this "
+         "ordering is not evidence of a difference — a lower point estimate on a "
+         "handful of months is not an improvement. Raise VAL_MAX_ORIGINS (or set "
+         "FAST_MODE = False) for an interval."),
+        "§17c VAL_METRICS")
 else:
     _answer("3. Do environmental drivers improve prediction over the matched "
             "no-driver hierarchical dynamic model?",
-            "Not evaluated in this run (§17 did not produce predictions).", "§17")
+            "Not evaluated in this run (§17 produced no predictions at all).",
+            "§17")
 
 if len(GLOBAL_DRIVERS):
     _sup = GLOBAL_DRIVERS[GLOBAL_DRIVERS["verdict"] == "supported"]
@@ -6207,9 +6543,28 @@ _assert("regional cell membership is fixed through time",
         "covariates", "§8a")
 _assert("regions were built without any response information",
         True, "assert_response_blind is called inside assign_ecological_class, "
-              "merge_small_components, static_cell_table and "
-              "resolve_region_covariates; it raises on any response-like column",
-        "§5a")
+              "merge_small_components, static_cell_table, "
+              "resolve_region_covariates and resolve_thresholds; it raises on "
+              "any response-like column", "§5a")
+_assert("the regionalisation actually partitions the AOI",
+        N_REGIONS >= REGION_COUNT_HARD_MIN,
+        f"{N_REGIONS} usable region(s), hard minimum "
+        f"{REGION_COUNT_HARD_MIN}; below it the between-region variances have no "
+        "groups, the shared latent state is saturated, and §10's regional "
+        "variance shares are 0 by arithmetic rather than by measurement",
+        "§8a")
+_assert("every threshold in force discriminates on this AOI",
+        bool(THRESHOLD_PROVENANCE["discriminates"].astype(bool).all()),
+        "; ".join(
+            f"{r.threshold}: {r.kind}"
+            + ("" if np.isnan(r.captured_share)
+               else f" ({r.captured_share:.1%} of cells inside)")
+            for r in THRESHOLD_PROVENANCE.itertuples()),
+        "§7c")
+_assert("no driver is called temporal_only on the strength of a single region",
+        not (len(UNDETERMINED_DRIVERS) and N_REGIONS >= 2),
+        f"undetermined: {UNDETERMINED_DRIVERS}" if UNDETERMINED_DRIVERS
+        else "every driver's spatial label rests on >= 2 regions", "§10b")
 _assert("WH cover is WH area divided by VALID CLASSIFIED area",
         bool(np.allclose(
             REGION_MONTH.loc[REGION_MONTH["observed"], "wh_cover"],

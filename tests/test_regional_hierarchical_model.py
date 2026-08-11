@@ -106,6 +106,9 @@ def ns():
                  "<panel>", "exec"), space)
     exec(compile(_defs(_cell("# 10b. Variance decomposition"),
                        ["decompose_driver_variance"]), "<var>", "exec"), space)
+    exec(compile(_defs(_cell("# 7c. Resolve the thresholds"),
+                       ["threshold_capture_share", "resolve_thresholds"]),
+                 "<thr>", "exec"), space)
     exec(compile(_defs(_cell("# 17c. Skill, by region"),
                        ["_rmse", "_mae", "skill_table"]), "<skill>", "exec"),
          space)
@@ -553,6 +556,124 @@ def test_the_month_split_is_exact(ns):
     assert out["month_split_sums_to_one"] == pytest.approx(0.0, abs=1e-9)
     assert (out["share_between_months"]
             + out["share_within_month_between_regions"]) == pytest.approx(1.0)
+
+
+def test_one_region_is_undetermined_not_temporal_only(ns):
+    """With a single region the between-region share is 0 by ARITHMETIC.
+
+    The first run of the notebook regionalised the whole gulf into one region and
+    then reported all five drivers as `temporal_only` — an untested claim dressed
+    as a measured one. `n_regions` must therefore be carried out of the
+    decomposition so §10b can label that case `undetermined`.
+    """
+    rng = np.random.default_rng(3)
+    out = ns["decompose_driver_variance"](
+        _driver_frame({"R01": rng.normal(size=12)}), "x")
+    assert out["n_regions"] == 1
+    assert out["share_within_month_between_regions"] == pytest.approx(0.0, abs=1e-9)
+    # ...and with two regions that genuinely differ, it is a real measurement.
+    shared = rng.normal(size=12)
+    out2 = ns["decompose_driver_variance"](
+        _driver_frame({"R01": shared - 2.0, "R02": shared + 2.0}), "x")
+    assert out2["n_regions"] == 2
+    assert out2["share_within_month_between_regions"] > 0.2
+
+
+# ---------------------------------------------------------------------------
+# Threshold discrimination — the failure that collapsed the first run
+# ---------------------------------------------------------------------------
+def _threshold_cells(n=400, seed=7):
+    """A cell set whose river distances all fall BELOW the configured 5 km cut.
+
+    This is Winam Gulf's real pathology: `dist_majriver_m` maxes out at 3,746 m
+    against `REGION_THRESHOLDS['river_dist_m'] = 5000`, so the river rule claims
+    every cell and no other class rule can ever fire.
+    """
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame({
+        "grid_id": [f"g{i:05d}" for i in range(n)],
+        "dist_majriver_m": rng.uniform(77.0, 3746.0, n),
+        "dist_shore_m": rng.uniform(57.0, 10989.0, n),
+        "openness_index": rng.uniform(13.0, 98.2, n),
+        "depth_m": rng.uniform(0.0, 41.6, n),
+    })
+
+
+_COV = {"river_dist_m": "dist_majriver_m", "shore_dist_m": "dist_shore_m",
+        "openness": "openness_index", "depth_m": "depth_m"}
+_FALLBACK = {"river_dist_m": 0.25, "shore_dist_m": 0.50, "openness": 0.50,
+             "depth_m": None}
+
+
+def test_capture_share_mirrors_the_class_rule(ns):
+    """The share reported must be the share `assign_ecological_class` produces."""
+    cells = _threshold_cells()
+    share = ns["threshold_capture_share"](cells["dist_majriver_m"],
+                                          "river_dist_m", 5000.0)
+    assert share == pytest.approx(1.0)
+    # openness uses `<`, the distance rules use `<=` — exactly as the class rule does
+    edge = pd.Series([1.0, 2.0, 3.0])
+    assert ns["threshold_capture_share"](edge, "openness", 2.0) == pytest.approx(1 / 3)
+    assert ns["threshold_capture_share"](edge, "shore_dist_m", 2.0) == pytest.approx(2 / 3)
+
+
+def test_a_non_discriminating_cut_is_replaced_by_the_declared_quantile(ns):
+    cells = _threshold_cells()
+    resolved, table = ns["resolve_thresholds"](
+        cells, _COV, {"river_dist_m": 5000.0, "shore_dist_m": 2000.0,
+                      "openness": None, "depth_m": None},
+        0.50, fallback_quantiles=_FALLBACK, band=(0.05, 0.95), verbose=False)
+    row = table.set_index("threshold").loc["river_dist_m"]
+    assert row["kind"].startswith("REPLACED")
+    assert row["configured_value"] == 5000.0
+    # the replacement is the PRE-DECLARED quantile, computed from the data
+    assert resolved["river_dist_m"] == pytest.approx(
+        float(cells["dist_majriver_m"].quantile(0.25)))
+    # and it now actually partitions the AOI
+    assert 0.05 <= row["captured_share"] <= 0.95
+    assert bool(row["response_blind"]) is True
+
+
+def test_a_discriminating_cut_is_left_alone(ns):
+    """The guard must not touch a threshold that already partitions the AOI."""
+    cells = _threshold_cells()
+    resolved, table = ns["resolve_thresholds"](
+        cells, _COV, {"river_dist_m": 1000.0, "shore_dist_m": 2000.0,
+                      "openness": None, "depth_m": None},
+        0.50, fallback_quantiles=_FALLBACK, band=(0.05, 0.95), verbose=False)
+    row = table.set_index("threshold").loc["river_dist_m"]
+    assert row["kind"] == "configured (repository precedent)"
+    assert resolved["river_dist_m"] == 1000.0
+
+
+def test_the_collapsed_regionalisation_is_reproduced_and_then_fixed(ns):
+    """End to end: the real distribution collapses to one class, then does not."""
+    cells = _threshold_cells(n=600)
+    collapsed, _ = ns["resolve_thresholds"](
+        cells, _COV, {"river_dist_m": 5000.0, "shore_dist_m": 2000.0,
+                      "openness": None, "depth_m": None},
+        0.50, verbose=False)          # no band -> the first run's behaviour
+    klass = ns["assign_ecological_class"](cells, _COV, collapsed)
+    assert set(klass["region_type"]) == {"river_influenced_bay"}
+
+    fixed, _ = ns["resolve_thresholds"](
+        cells, _COV, {"river_dist_m": 5000.0, "shore_dist_m": 2000.0,
+                      "openness": None, "depth_m": None},
+        0.50, fallback_quantiles=_FALLBACK, band=(0.05, 0.95), verbose=False)
+    klass2 = ns["assign_ecological_class"](cells, _COV, fixed)
+    assert len(set(klass2["region_type"])) >= 3
+
+
+def test_a_threshold_with_no_declared_fallback_is_flagged_not_silently_kept(ns):
+    cells = _threshold_cells()
+    _, table = ns["resolve_thresholds"](
+        cells, _COV, {"river_dist_m": 5000.0, "shore_dist_m": 2000.0,
+                      "openness": None, "depth_m": None},
+        0.50, fallback_quantiles={"openness": 0.50}, band=(0.05, 0.95),
+        verbose=False)
+    row = table.set_index("threshold").loc["river_dist_m"]
+    assert row["kind"] == "configured but NON-DISCRIMINATING"
+    assert bool(row["discriminates"]) is False
 
 
 # ---------------------------------------------------------------------------
