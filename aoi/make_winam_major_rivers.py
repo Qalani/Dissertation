@@ -50,6 +50,7 @@ USAGE
 
 Requires `pyshp`, `shapely` and `pyproj` (no GDAL, no Earth Engine).
 """
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -177,6 +178,11 @@ def main(shp_path):
           f"{len(features):,} kept, {skipped:,} below "
           f"{KEEP_MIN_LENGTH_KM} km or outside the clip.")
     print(f"Wrote {OUT} ({OUT.stat().st_size / 1e6:.2f} MB)")
+    digest = hashlib.sha256(OUT.read_bytes()).hexdigest()
+    print(f"sha256 {digest}")
+    print("  -> commit this file, then set RIVER_LAYER_EXPECTED_SHA256 to that "
+          "digest\n     and RIVER_VECTOR_REFS[0] to the commit SHA, in the "
+          "regional notebook's §3c.")
     print("\nLongest courses that reach within 1 km of the analysed water body:")
     near = [f["properties"] for f in features
             if f["properties"]["dist_to_gulf_km"] <= 1.0][:15]

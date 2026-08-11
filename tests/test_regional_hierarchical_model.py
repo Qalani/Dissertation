@@ -837,6 +837,41 @@ def test_the_layer_digest_identifies_the_bytes_actually_read(ns, tmp_path):
     assert sha == hashlib.sha256(payload.encode()).hexdigest()
 
 
+@pytest.mark.skipif(not _HAVE_SHAPELY, reason="shapely>=2 / pyproj not installed")
+def test_the_pinned_digest_matches_the_committed_layer():
+    """RIVER_LAYER_EXPECTED_SHA256 must describe the layer actually in the repo.
+
+    A pin that does not match what is committed is worse than no pin: every run
+    would report a mismatch and the check would be trained away as noise.
+    """
+    import hashlib
+    import re
+    cfg = _cell("# 3c. Regionalisation")
+    m = re.search(r'RIVER_LAYER_EXPECTED_SHA256 = \(\s*"([0-9a-f]{64})"', cfg)
+    assert m, "RIVER_LAYER_EXPECTED_SHA256 is not a 64-char hex digest"
+    layer = (REPO / "aoi" / "winam_major_rivers.geojson").read_bytes()
+    assert m.group(1) == hashlib.sha256(layer).hexdigest()
+
+
+def test_the_river_layer_ref_is_pinned_to_an_immutable_commit():
+    """The first ref must be a commit SHA, not a branch.
+
+    A branch resolves to whatever it points at today, so a run that reads it is
+    reproducible only until someone touches the layer. A deleted branch would
+    also silently stop resolving.
+    """
+    import re
+    cfg = _cell("# 3c. Regionalisation")
+    m = re.search(r"RIVER_VECTOR_REFS = \[(.*?)\]", cfg, re.S)
+    assert m, "RIVER_VECTOR_REFS not found"
+    refs = re.findall(r'"([^"]+)"', m.group(1))
+    assert refs, "RIVER_VECTOR_REFS is empty"
+    assert re.fullmatch(r"[0-9a-f]{40}", refs[0]), (
+        f"first ref {refs[0]!r} is not a 40-char commit SHA")
+    # no stale feature branches left behind once they have merged
+    assert not [r for r in refs if r.startswith("claude/")], refs
+
+
 def test_the_river_layer_is_fetched_from_github_by_default():
     """The notebook must not require the layer to be staged by hand."""
     cfg = _cell("# 3c. Regionalisation")
