@@ -215,6 +215,132 @@ def test_lag_does_not_reach_across_an_excluded_month(ns):
     assert feb["rain_lag1"] == pytest.approx(10.0)
 
 
+def test_plotting_grid_breaks_the_line_across_a_long_gap(ns):
+    """A 17-month hole must plot as absent data, not as a measured decline.
+
+    The record opens with a lone 2017-06 observation and resumes at 2018-12.
+    Plotted straight off a frame of observed months only, those two points are
+    adjacent rows and matplotlib joins them with a straight line through 17
+    months that were never measured.
+    """
+    months = pd.to_datetime(["2017-06-01"]) .append(
+        pd.date_range("2018-12-01", "2019-02-01", freq="MS"))
+    x, y = ns["on_calendar_grid"](pd.Series(months), pd.Series([0.011, 0.097, 0.074, 0.030]))
+    assert len(x) == 21                                  # 2017-06 .. 2019-02
+    # Every month between the two observed stretches is NaN, which is what
+    # breaks the line; the observed values themselves are untouched.
+    assert np.isnan(y[1:18]).all()
+    assert np.isfinite(y).sum() == 4
+    assert y[0] == pytest.approx(0.011)
+    assert y[18:].tolist() == pytest.approx([0.097, 0.074, 0.030])
+
+
+def test_plotting_grid_breaks_a_single_missing_month_too(ns):
+    """No interpolation: a skipped month never gets an invented point/marker."""
+    months = pd.to_datetime(["2020-01-01", "2020-02-01", "2020-04-01"])
+    x, y = ns["on_calendar_grid"](pd.Series(months), pd.Series([1.0, 2.0, 4.0]))
+    assert len(x) == 4
+    assert np.isnan(y[2])                     # March, not the 3.0 an interpolator would draw
+    assert y[[0, 1, 3]].tolist() == [1.0, 2.0, 4.0]
+
+
+# ---------------------------------------------------------------------------
+# Dashed connectors across the unobserved stretches
+# ---------------------------------------------------------------------------
+
+def test_gap_bridges_span_only_the_unobserved_stretches(ns):
+    """One connector per gap, from the last observed month to the first after."""
+    months = pd.to_datetime(["2017-06-01"]).append(
+        pd.date_range("2018-12-01", "2019-02-01", freq="MS")).append(
+        pd.to_datetime(["2019-04-01"]))
+    gx, gy = ns["gap_bridges"](pd.Series(months), pd.Series([0.011, 0.097, 0.074, 0.030, 0.05]))
+    # Two gaps: the 17-month 2017-2018 hole and the single missing 2019-03.
+    # Each contributes an endpoint pair plus a NaT/NaN separator.
+    assert len(gx) == 6
+    assert list(gx[:2]) == [pd.Timestamp("2017-06-01"), pd.Timestamp("2018-12-01")]
+    assert pd.isna(gx[2]) and np.isnan(gy[2])
+    assert list(gx[3:5]) == [pd.Timestamp("2019-02-01"), pd.Timestamp("2019-04-01")]
+    # The connectors carry the OBSERVED endpoint values, nothing invented.
+    assert gy[:2].tolist() == pytest.approx([0.011, 0.097])
+    assert gy[3:5].tolist() == pytest.approx([0.030, 0.05])
+
+
+def test_gap_bridges_are_empty_on_an_unbroken_run(ns):
+    """Nothing to dash when every calendar month is present."""
+    months = pd.date_range("2020-01-01", periods=5, freq="MS")
+    gx, gy = ns["gap_bridges"](pd.Series(months), pd.Series([1.0, 2.0, 3.0, 4.0, 5.0]))
+    assert len(gx) == 0 and len(gy) == 0
+
+
+def test_gap_bridges_need_two_observations_to_span_anything(ns):
+    """A single observed month has no gap to bridge, and must not raise."""
+    gx, _ = ns["gap_bridges"](pd.Series(pd.to_datetime(["2017-06-01"])), pd.Series([0.011]))
+    assert len(gx) == 0
+    gx, _ = ns["gap_bridges"](pd.Series([], dtype="datetime64[ns]"), pd.Series([], dtype=float))
+    assert len(gx) == 0
+
+
+def test_plot_with_gaps_draws_solid_data_and_dashed_connectors(ns):
+    """The solid line holds the data; the dashes only span what was not measured."""
+    plt = pytest.importorskip("matplotlib.pyplot")
+    pytest.importorskip("matplotlib").use("Agg")
+    months = pd.to_datetime(["2020-01-01", "2020-02-01", "2020-05-01"])
+    _fig, ax = plt.subplots()
+    line = ns["plot_with_gaps"](ax, pd.Series(months), pd.Series([1.0, 2.0, 5.0]),
+                                marker="o", lw=1.2, color="tab:green", label="observed")
+    solid, dashed = ax.lines
+    assert solid is line
+    assert solid.get_linestyle() == "-" and dashed.get_linestyle() == "--"
+    # The dashes inherit the colour, carry no marker, and stay out of the legend.
+    assert dashed.get_color() == solid.get_color()
+    assert dashed.get_marker() in (None, "None", "")
+    assert solid.get_label() == "observed" and dashed.get_label().startswith("_")
+    # The solid line spans the whole grid with the gap left as NaN; the dashed
+    # line spans only Feb->May, so the data itself is never drawn as measured
+    # across March and April.
+    assert len(solid.get_xdata()) == 5
+    assert np.isnan(np.asarray(solid.get_ydata(), dtype=float)[[2, 3]]).all()
+    _dy = np.asarray(dashed.get_ydata(), dtype=float)
+    assert _dy[np.isfinite(_dy)].tolist() == [2.0, 5.0]
+    plt.close(_fig)
+
+
+def test_plot_with_gaps_adds_no_second_line_when_nothing_is_missing(ns):
+    """A gapless series stays a single plain line — no stray dashed artist."""
+    plt = pytest.importorskip("matplotlib.pyplot")
+    pytest.importorskip("matplotlib").use("Agg")
+    months = pd.date_range("2020-01-01", periods=4, freq="MS")
+    _fig, ax = plt.subplots()
+    ns["plot_with_gaps"](ax, pd.Series(months), pd.Series([1.0, 2.0, 3.0, 4.0]))
+    assert len(ax.lines) == 1
+    plt.close(_fig)
+
+
+def test_plotting_grid_normalises_and_sorts_before_gridding(ns):
+    """Out-of-order, mid-month timestamps still land on the right grid slots."""
+    months = pd.to_datetime(["2020-03-17", "2020-01-09"])
+    x, y = ns["on_calendar_grid"](pd.Series(months), pd.Series([3.0, 1.0]))
+    assert list(x) == list(pd.date_range("2020-01-01", "2020-03-01", freq="MS"))
+    assert y[0] == 1.0 and np.isnan(y[1]) and y[2] == 3.0
+
+
+def test_plotting_grid_survives_an_empty_series(ns):
+    """A specification with no evaluated months must not blow up the figure."""
+    x, y = ns["on_calendar_grid"](pd.Series([], dtype="datetime64[ns]"),
+                                  pd.Series([], dtype=float))
+    assert len(x) == 0 and len(y) == 0
+
+
+def test_plotting_grid_ignores_the_frames_row_index(ns):
+    """Call sites pass filtered/sorted frames, whose indices are not 0..n-1."""
+    frame = pd.DataFrame({
+        "month": pd.to_datetime(["2020-01-01", "2020-02-01", "2020-04-01"]),
+        "y": [1.0, 2.0, 4.0]}, index=[7, 3, 11])
+    x, y = ns["on_calendar_grid"](frame["month"], frame["y"])
+    assert len(x) == 4
+    assert y[[0, 1, 3]].tolist() == [1.0, 2.0, 4.0]
+
+
 def test_zero_lag_leaves_the_column_name_alone(ns):
     monthly = pd.DataFrame({"month": pd.date_range("2020-01-01", periods=4, freq="MS"),
                             "rain": [1.0, 2.0, 3.0, 4.0]})

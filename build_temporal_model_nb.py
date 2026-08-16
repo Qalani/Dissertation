@@ -748,6 +748,69 @@ def reindex_calendar_months(monthly):
     return out
 
 
+def on_calendar_grid(months, values):
+    """Put a month/value pair on an unbroken monthly grid, for PLOTTING.
+
+    A line plot joins consecutive rows, so a frame that holds only the observed
+    months draws a solid segment across every unobserved stretch — the
+    2017-07..2018-11 gap in this record becomes a confident-looking line through
+    17 months that were never measured. Re-indexing onto every calendar month
+    between the first and last point makes each absent month NaN, which
+    matplotlib leaves as a break in the line.
+
+    No value is ever interpolated, so no marker is drawn where there is no
+    observation. `plot_with_gaps` fills the breaks with a dashed connector.
+
+    Returns ``(months, values)`` so it can be splatted into ``ax.plot``.
+    """
+    m = to_month_start(pd.Series(months).reset_index(drop=True))
+    v = pd.to_numeric(pd.Series(values).reset_index(drop=True), errors="coerce")
+    s = pd.Series(v.to_numpy(dtype=float), index=pd.DatetimeIndex(m)).sort_index()
+    s = s[~s.index.duplicated(keep="first")]
+    if s.empty:
+        return pd.DatetimeIndex([]), np.array([], dtype=float)
+    grid = pd.date_range(s.index.min(), s.index.max(), freq="MS")
+    out = s.reindex(grid)
+    return out.index, out.to_numpy(dtype=float)
+
+
+def gap_bridges(months, values):
+    """Straight connectors spanning each run of unobserved months.
+
+    Each segment runs from the last observed month before a gap to the first
+    observed month after it. Segments are NaT/NaN-separated so a single
+    ``ax.plot`` draws every bridge without also joining one gap to the next.
+    """
+    x, y = on_calendar_grid(months, values)
+    observed = np.flatnonzero(np.isfinite(y))
+    xs, ys = [], []
+    for a, b in zip(observed[:-1], observed[1:]):
+        if b - a > 1:                      # at least one unobserved month between
+            xs += [x[a], x[b], pd.NaT]
+            ys += [y[a], y[b], np.nan]
+    return pd.DatetimeIndex(xs), np.array(ys, dtype=float)
+
+
+def plot_with_gaps(ax, months, values, **kw):
+    """Draw a monthly series solid, dashing the stretches with no observation.
+
+    A SOLID segment joins consecutive calendar months. A DASHED segment spans
+    months that were never measured: it is drawn only to keep the eye on the
+    series, and there is no data underneath it. Markers land on observed months
+    only, so a dashed run never carries a point that was not measured.
+
+    The dashes follow the solid line's colour and carry no legend entry, so one
+    call per series still produces one legend handle. Returns that solid line.
+    """
+    x, y = on_calendar_grid(months, values)
+    line, = ax.plot(x, y, **kw)
+    gx, gy = gap_bridges(months, values)
+    if len(gx):
+        ax.plot(gx, gy, ls="--", lw=0.9 * line.get_linewidth(),
+                color=line.get_color(), alpha=0.55, zorder=line.get_zorder())
+    return line
+
+
 def add_season_terms(monthly, n_harmonics=2):
     """Fourier terms for the annual cycle: sin/cos at 1..n cycles per year."""
     out = monthly.copy()
@@ -2780,14 +2843,23 @@ code('''# =====================================================================
 obs = monthly[monthly["y"].notna()].copy()
 
 fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
-axes[0].plot(monthly["month"], monthly["y_raw"], marker="o", ms=3, lw=1.2, color="tab:green")
+# Every panel is drawn solid between consecutive calendar months and DASHED
+# across months with no observation. The record opens with a lone 2017-06
+# observation and then nothing until 2018-12; that stretch must read as absent
+# data, not as a measured decline.
+plot_with_gaps(axes[0], monthly["month"], monthly["y_raw"],
+               marker="o", ms=3, lw=1.2, color="tab:green")
 axes[0].set_ylabel(RESPONSE_COL)
 axes[0].set_title(f"AOI water-hyacinth extent — {RESPONSE_COL} "
-                  f"({N_OBSERVED} observed months)")
-axes[1].plot(monthly["month"], monthly["y"], marker="o", ms=3, lw=1.2, color="tab:blue")
+                  f"({N_OBSERVED} observed months; dashed spans the "
+                  f"{N_GRID - N_OBSERVED} months with no observation)")
+plot_with_gaps(axes[1], monthly["month"], monthly["y"],
+               marker="o", ms=3, lw=1.2, color="tab:blue")
 axes[1].set_ylabel(f"y ({RESPONSE_INFO['transform']})")
-axes[2].plot(monthly["month"], monthly.get("coverage_fraction", pd.Series(index=monthly.index)),
-             marker="o", ms=3, lw=1.0, color="tab:grey", label="coverage")
+plot_with_gaps(axes[2], monthly["month"],
+               monthly.get("coverage_fraction",
+                           pd.Series(index=monthly.index, dtype=float)),
+               marker="o", ms=3, lw=1.0, color="tab:grey", label="coverage")
 axes[2].axhline(MIN_MONTHLY_COVERAGE_FRACTION, color="red", ls="--", lw=1,
                 label=f"threshold {MIN_MONTHLY_COVERAGE_FRACTION:.0%}")
 axes[2].set_ylabel("classified\\ncoverage"); axes[2].set_xlabel("Month")
@@ -3475,8 +3547,12 @@ if _res is not None:
 
     _fitted = pd.Series(np.asarray(_res.fittedvalues, dtype=float))
     fig, ax = plt.subplots(figsize=(11, 3.4))
-    ax.plot(fit_df["month"], fit_df["y"], marker="o", ms=3, lw=1.2, label="observed")
-    ax.plot(fit_df["month"], _fitted, lw=1.6, color="tab:red", label="fitted (M3, in-sample)")
+    # `fit_df` holds only complete-case months, so both lines are dashed across
+    # the months the model never saw rather than run solid straight through them.
+    plot_with_gaps(ax, fit_df["month"], fit_df["y"],
+                   marker="o", ms=3, lw=1.2, label="observed")
+    plot_with_gaps(ax, fit_df["month"], _fitted,
+                   lw=1.6, color="tab:red", label="fitted (M3, in-sample)")
     ax.set_ylabel(f"{RESPONSE_INFO['transform']}({RESPONSE_COL})")
     ax.set_title("Observed vs in-sample fit — NOT a skill estimate (see §16)")
     ax.legend(fontsize=8); ax.grid(alpha=0.3)
@@ -4473,10 +4549,14 @@ else:
         _obs = (CV_PREDICTIONS[CV_PREDICTIONS["specification"] == _pick[-1]]
                 .sort_values("month"))
         fig, ax = plt.subplots(figsize=(11, 3.8))
-        ax.plot(_obs["month"], _obs["y"], "k-o", ms=4, lw=1.4, label="observed")
+        # The title promises that gaps are months with no observation, so the
+        # lines have to be dashed there for that to be true.
+        plot_with_gaps(ax, _obs["month"], _obs["y"], color="k", ls="-", marker="o",
+                       ms=4, lw=1.4, label="observed")
         for s in _pick:
             g = CV_PREDICTIONS[CV_PREDICTIONS["specification"] == s].sort_values("month")
-            ax.plot(g["month"], g["yhat"], lw=1.4, alpha=0.85, marker=".", label=s)
+            plot_with_gaps(ax, g["month"], g["yhat"], lw=1.4, alpha=0.85,
+                           marker=".", label=s)
         for f in CV_FOLDS:
             ax.axvspan(f["test_window_start"],
                        f["test_window_end"] + pd.offsets.MonthEnd(1),
@@ -4484,7 +4564,8 @@ else:
         ax.set_xlabel("held-out month (calendar date; shaded = a rolling-origin test window)")
         ax.set_ylabel(f"{RESPONSE_INFO['transform']}({RESPONSE_COL})")
         ax.set_title(f"Held-out predictions — {CV_DESIGN}\\n"
-                     f"{_n_common} evaluated months; gaps are months with no observation")
+                     f"{_n_common} evaluated months; dashed spans months with "
+                     f"no observation")
         ax.xaxis.set_major_locator(mdates.AutoDateLocator())
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
         for lbl in ax.get_xticklabels():
@@ -5230,7 +5311,8 @@ if SS_READY:
         axes[0].set_title(f"Standardized innovation ACF — null {SS_SELECTED}\\n"
                           f"calendar-lag Ljung-Box p = {_dg['ljung_box_p']:.3g}")
         axes[0].set_xlabel("lag (calendar months)")
-        axes[1].plot(_inn_sel["month"], _inn_sel["std_innovation"], "o-", ms=3, lw=1)
+        plot_with_gaps(axes[1], _inn_sel["month"], _inn_sel["std_innovation"],
+                       marker="o", ls="-", ms=3, lw=1)
         axes[1].axhline(0, color="k", lw=0.8)
         for _b in (-2, 2):
             axes[1].axhline(_b, color="red", ls=":", lw=1)
@@ -5973,15 +6055,15 @@ else:
         "target_month")
     if len(_obs):
         fig, ax = plt.subplots(figsize=(11.5, 3.8))
-        ax.plot(_obs["target_month"], _obs["y_transformed"], "k-o", ms=4, lw=1.4,
-                label="observed")
+        plot_with_gaps(ax, _obs["target_month"], _obs["y_transformed"],
+                       color="k", ls="-", marker="o", ms=4, lw=1.4, label="observed")
         for _s, _c in (("null state-space (season+trend+persistence)", "tab:purple"),
                        ("full state-space (+ lagged drivers)", "tab:green"),
                        ("literal persistence (y_{t-1}, unfitted)", "tab:orange")):
             _g = _P[_P["specification"] == _s].sort_values("target_month")
             if len(_g):
-                ax.plot(_g["target_month"], _g["yhat_transformed"], lw=1.3, marker=".",
-                        alpha=0.85, color=_c, label=_s)
+                plot_with_gaps(ax, _g["target_month"], _g["yhat_transformed"],
+                               lw=1.3, marker=".", alpha=0.85, color=_c, label=_s)
         ax.set_xlabel("target month (each point is a separate expanding-window refit)")
         ax.set_ylabel(f"{RESPONSE_INFO['transform']}({RESPONSE_COL})")
         ax.set_title("One-calendar-month-ahead forecasts, expanding origin")
