@@ -215,6 +215,60 @@ def test_lag_does_not_reach_across_an_excluded_month(ns):
     assert feb["rain_lag1"] == pytest.approx(10.0)
 
 
+def test_plotting_grid_breaks_the_line_across_a_long_gap(ns):
+    """A 17-month hole must plot as absent data, not as a measured decline.
+
+    The record opens with a lone 2017-06 observation and resumes at 2018-12.
+    Plotted straight off a frame of observed months only, those two points are
+    adjacent rows and matplotlib joins them with a straight line through 17
+    months that were never measured.
+    """
+    months = pd.to_datetime(["2017-06-01"]) .append(
+        pd.date_range("2018-12-01", "2019-02-01", freq="MS"))
+    x, y = ns["on_calendar_grid"](pd.Series(months), pd.Series([0.011, 0.097, 0.074, 0.030]))
+    assert len(x) == 21                                  # 2017-06 .. 2019-02
+    # Every month between the two observed stretches is NaN, which is what
+    # breaks the line; the observed values themselves are untouched.
+    assert np.isnan(y[1:18]).all()
+    assert np.isfinite(y).sum() == 4
+    assert y[0] == pytest.approx(0.011)
+    assert y[18:].tolist() == pytest.approx([0.097, 0.074, 0.030])
+
+
+def test_plotting_grid_breaks_a_single_missing_month_too(ns):
+    """No interpolation: a skipped month never gets an invented point/marker."""
+    months = pd.to_datetime(["2020-01-01", "2020-02-01", "2020-04-01"])
+    x, y = ns["on_calendar_grid"](pd.Series(months), pd.Series([1.0, 2.0, 4.0]))
+    assert len(x) == 4
+    assert np.isnan(y[2])                     # March, not the 3.0 an interpolator would draw
+    assert y[[0, 1, 3]].tolist() == [1.0, 2.0, 4.0]
+
+
+def test_plotting_grid_normalises_and_sorts_before_gridding(ns):
+    """Out-of-order, mid-month timestamps still land on the right grid slots."""
+    months = pd.to_datetime(["2020-03-17", "2020-01-09"])
+    x, y = ns["on_calendar_grid"](pd.Series(months), pd.Series([3.0, 1.0]))
+    assert list(x) == list(pd.date_range("2020-01-01", "2020-03-01", freq="MS"))
+    assert y[0] == 1.0 and np.isnan(y[1]) and y[2] == 3.0
+
+
+def test_plotting_grid_survives_an_empty_series(ns):
+    """A specification with no evaluated months must not blow up the figure."""
+    x, y = ns["on_calendar_grid"](pd.Series([], dtype="datetime64[ns]"),
+                                  pd.Series([], dtype=float))
+    assert len(x) == 0 and len(y) == 0
+
+
+def test_plotting_grid_ignores_the_frames_row_index(ns):
+    """Call sites pass filtered/sorted frames, whose indices are not 0..n-1."""
+    frame = pd.DataFrame({
+        "month": pd.to_datetime(["2020-01-01", "2020-02-01", "2020-04-01"]),
+        "y": [1.0, 2.0, 4.0]}, index=[7, 3, 11])
+    x, y = ns["on_calendar_grid"](frame["month"], frame["y"])
+    assert len(x) == 4
+    assert y[[0, 1, 3]].tolist() == [1.0, 2.0, 4.0]
+
+
 def test_zero_lag_leaves_the_column_name_alone(ns):
     monthly = pd.DataFrame({"month": pd.date_range("2020-01-01", periods=4, freq="MS"),
                             "rain": [1.0, 2.0, 3.0, 4.0]})

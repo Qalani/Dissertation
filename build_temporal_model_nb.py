@@ -748,6 +748,33 @@ def reindex_calendar_months(monthly):
     return out
 
 
+def on_calendar_grid(months, values):
+    """Put a month/value pair on an unbroken monthly grid, for PLOTTING.
+
+    A line plot joins consecutive rows, so a frame that holds only the observed
+    months draws a straight segment across every unobserved stretch — the
+    2017-07..2018-11 gap in this record becomes a confident-looking line through
+    17 months that were never measured. Matplotlib breaks a line at NaN, so
+    re-indexing onto every calendar month between the first and last point turns
+    each absent month back into a visible gap.
+
+    Every missing month breaks the line, so a long gap and a single skipped
+    month are both shown rather than drawn through, and no interpolated point is
+    ever invented (which would also draw a marker where there is no observation).
+
+    Returns ``(months, values)`` so it can be splatted into ``ax.plot``.
+    """
+    m = to_month_start(pd.Series(months).reset_index(drop=True))
+    v = pd.to_numeric(pd.Series(values).reset_index(drop=True), errors="coerce")
+    s = pd.Series(v.to_numpy(dtype=float), index=pd.DatetimeIndex(m)).sort_index()
+    s = s[~s.index.duplicated(keep="first")]
+    if s.empty:
+        return pd.DatetimeIndex([]), np.array([], dtype=float)
+    grid = pd.date_range(s.index.min(), s.index.max(), freq="MS")
+    out = s.reindex(grid)
+    return out.index, out.to_numpy(dtype=float)
+
+
 def add_season_terms(monthly, n_harmonics=2):
     """Fourier terms for the annual cycle: sin/cos at 1..n cycles per year."""
     out = monthly.copy()
@@ -2780,13 +2807,23 @@ code('''# =====================================================================
 obs = monthly[monthly["y"].notna()].copy()
 
 fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
-axes[0].plot(monthly["month"], monthly["y_raw"], marker="o", ms=3, lw=1.2, color="tab:green")
+# Every panel is drawn on the unbroken calendar grid, so an unobserved month is
+# a break in the line rather than a straight segment across it. The record opens
+# with a lone 2017-06 observation and then nothing until 2018-12; that stretch
+# must read as absent data, not as a measured decline.
+axes[0].plot(*on_calendar_grid(monthly["month"], monthly["y_raw"]),
+             marker="o", ms=3, lw=1.2, color="tab:green")
 axes[0].set_ylabel(RESPONSE_COL)
 axes[0].set_title(f"AOI water-hyacinth extent — {RESPONSE_COL} "
-                  f"({N_OBSERVED} observed months)")
-axes[1].plot(monthly["month"], monthly["y"], marker="o", ms=3, lw=1.2, color="tab:blue")
+                  f"({N_OBSERVED} observed months, {N_GRID - N_OBSERVED} gap months "
+                  f"shown as breaks)")
+axes[1].plot(*on_calendar_grid(monthly["month"], monthly["y"]),
+             marker="o", ms=3, lw=1.2, color="tab:blue")
 axes[1].set_ylabel(f"y ({RESPONSE_INFO['transform']})")
-axes[2].plot(monthly["month"], monthly.get("coverage_fraction", pd.Series(index=monthly.index)),
+axes[2].plot(*on_calendar_grid(
+                 monthly["month"],
+                 monthly.get("coverage_fraction",
+                             pd.Series(index=monthly.index, dtype=float))),
              marker="o", ms=3, lw=1.0, color="tab:grey", label="coverage")
 axes[2].axhline(MIN_MONTHLY_COVERAGE_FRACTION, color="red", ls="--", lw=1,
                 label=f"threshold {MIN_MONTHLY_COVERAGE_FRACTION:.0%}")
@@ -3475,8 +3512,12 @@ if _res is not None:
 
     _fitted = pd.Series(np.asarray(_res.fittedvalues, dtype=float))
     fig, ax = plt.subplots(figsize=(11, 3.4))
-    ax.plot(fit_df["month"], fit_df["y"], marker="o", ms=3, lw=1.2, label="observed")
-    ax.plot(fit_df["month"], _fitted, lw=1.6, color="tab:red", label="fitted (M3, in-sample)")
+    # `fit_df` holds only complete-case months, so plot it on the calendar grid:
+    # otherwise both lines run straight across every month the model never saw.
+    ax.plot(*on_calendar_grid(fit_df["month"], fit_df["y"]),
+            marker="o", ms=3, lw=1.2, label="observed")
+    ax.plot(*on_calendar_grid(fit_df["month"], _fitted),
+            lw=1.6, color="tab:red", label="fitted (M3, in-sample)")
     ax.set_ylabel(f"{RESPONSE_INFO['transform']}({RESPONSE_COL})")
     ax.set_title("Observed vs in-sample fit — NOT a skill estimate (see §16)")
     ax.legend(fontsize=8); ax.grid(alpha=0.3)
@@ -4473,10 +4514,14 @@ else:
         _obs = (CV_PREDICTIONS[CV_PREDICTIONS["specification"] == _pick[-1]]
                 .sort_values("month"))
         fig, ax = plt.subplots(figsize=(11, 3.8))
-        ax.plot(_obs["month"], _obs["y"], "k-o", ms=4, lw=1.4, label="observed")
+        # The title promises that gaps are months with no observation, so the
+        # lines have to be drawn on the calendar grid for that to be true.
+        ax.plot(*on_calendar_grid(_obs["month"], _obs["y"]), "k-o", ms=4, lw=1.4,
+                label="observed")
         for s in _pick:
             g = CV_PREDICTIONS[CV_PREDICTIONS["specification"] == s].sort_values("month")
-            ax.plot(g["month"], g["yhat"], lw=1.4, alpha=0.85, marker=".", label=s)
+            ax.plot(*on_calendar_grid(g["month"], g["yhat"]), lw=1.4, alpha=0.85,
+                    marker=".", label=s)
         for f in CV_FOLDS:
             ax.axvspan(f["test_window_start"],
                        f["test_window_end"] + pd.offsets.MonthEnd(1),
@@ -5230,7 +5275,8 @@ if SS_READY:
         axes[0].set_title(f"Standardized innovation ACF — null {SS_SELECTED}\\n"
                           f"calendar-lag Ljung-Box p = {_dg['ljung_box_p']:.3g}")
         axes[0].set_xlabel("lag (calendar months)")
-        axes[1].plot(_inn_sel["month"], _inn_sel["std_innovation"], "o-", ms=3, lw=1)
+        axes[1].plot(*on_calendar_grid(_inn_sel["month"], _inn_sel["std_innovation"]),
+                     marker="o", ls="-", ms=3, lw=1)
         axes[1].axhline(0, color="k", lw=0.8)
         for _b in (-2, 2):
             axes[1].axhline(_b, color="red", ls=":", lw=1)
@@ -5973,15 +6019,15 @@ else:
         "target_month")
     if len(_obs):
         fig, ax = plt.subplots(figsize=(11.5, 3.8))
-        ax.plot(_obs["target_month"], _obs["y_transformed"], "k-o", ms=4, lw=1.4,
-                label="observed")
+        ax.plot(*on_calendar_grid(_obs["target_month"], _obs["y_transformed"]),
+                "k-o", ms=4, lw=1.4, label="observed")
         for _s, _c in (("null state-space (season+trend+persistence)", "tab:purple"),
                        ("full state-space (+ lagged drivers)", "tab:green"),
                        ("literal persistence (y_{t-1}, unfitted)", "tab:orange")):
             _g = _P[_P["specification"] == _s].sort_values("target_month")
             if len(_g):
-                ax.plot(_g["target_month"], _g["yhat_transformed"], lw=1.3, marker=".",
-                        alpha=0.85, color=_c, label=_s)
+                ax.plot(*on_calendar_grid(_g["target_month"], _g["yhat_transformed"]),
+                        lw=1.3, marker=".", alpha=0.85, color=_c, label=_s)
         ax.set_xlabel("target month (each point is a separate expanding-window refit)")
         ax.set_ylabel(f"{RESPONSE_INFO['transform']}({RESPONSE_COL})")
         ax.set_title("One-calendar-month-ahead forecasts, expanding origin")
